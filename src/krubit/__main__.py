@@ -79,31 +79,38 @@ async def _database_command(args: argparse.Namespace, settings: Settings) -> int
 
 async def _run_bot(settings: Settings) -> int:
     twitch_session: aiohttp.ClientSession | None = None
+    twitch_connector: aiohttp.TCPConnector | None = None
     connector: aiohttp.TCPConnector | None = None
     store: SQLiteStore | None = None
     bot: KrubitBot | None = None
     twitch = None
-    if settings.live_signals_enabled:
-        client_id, client_secret = settings.require_twitch_credentials()
-        twitch_session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=system_ssl_context())
-        )
-        twitch = TwitchHelixClient(twitch_session, client_id, client_secret)
+    primary_error: BaseException | None = None
     try:
+        if settings.live_signals_enabled:
+            client_id, client_secret = settings.require_twitch_credentials()
+            twitch_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+            twitch_session = aiohttp.ClientSession(connector=twitch_connector)
+            twitch = TwitchHelixClient(twitch_session, client_id, client_secret)
         store = await SQLiteStore.open(settings.database_path)
         await store.initialize()
         connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         bot = KrubitBot(settings, FoundationService(store), connector=connector, twitch=twitch)
         await bot.start(settings.require_token())
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if bot is not None:
-            await bot.close()
-        elif connector is not None:
-            await connector.close()
-        if store is not None:
-            await store.close()
-        if twitch_session is not None:
-            await twitch_session.close()
+        cleanup_error: BaseException | None = None
+        for resource in (bot, store, connector, twitch_session, twitch_connector):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
     return 0
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ import discord
 import pytest
 from discord import app_commands
 
+import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
 from krubit.discord.bot import KrubitBot
@@ -126,4 +128,145 @@ async def test_bot_uses_presence_intent_while_twitch_remains_optional(tmp_path: 
         assert bot.intents.presences is True
     finally:
         await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_closes_every_resource_when_twitch_constructor_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[str] = []
+
+    class FakeConnector:
+        async def close(self) -> None:
+            closed.append("connector")
+
+    class FakeSession:
+        def __init__(self, *, connector: FakeConnector) -> None:
+            self.connector = connector
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    def fail_twitch(session: FakeSession, client_id: str, client_secret: str) -> object:
+        raise RuntimeError("constructor failure")
+
+    def connector_factory(**kwargs: object) -> FakeConnector:
+        return FakeConnector()
+
+    monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(cli, "TwitchHelixClient", fail_twitch)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        twitch_client_id="client",
+        twitch_client_secret="secret",
+        live_signals_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="constructor failure"):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    assert closed == ["session", "connector"]
+
+
+@pytest.mark.asyncio
+async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[str] = []
+
+    class FakeStore:
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            closed.append("store")
+
+    class FakeConnector:
+        async def close(self) -> None:
+            closed.append("connector")
+
+    class FakeBot:
+        def __init__(self, *args: object, connector: FakeConnector, **kwargs: object) -> None:
+            self.connector = connector
+
+        async def start(self, token: str) -> None:
+            raise RuntimeError("start failure")
+
+        async def close(self) -> None:
+            closed.append("bot")
+            raise RuntimeError("close failure")
+
+    async def open_store(path: Path) -> FakeStore:
+        return FakeStore()
+
+    def connector_factory(**kwargs: object) -> FakeConnector:
+        return FakeConnector()
+
+    monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
+    monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli, "KrubitBot", FakeBot)
+    settings = Settings(application_id=123, database_path=tmp_path / "krubit.db", bot_token="token")
+
+    with pytest.raises(RuntimeError, match="start failure"):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    assert closed == ["bot", "store", "connector"]
+
+
+@pytest.mark.asyncio
+async def test_enabled_live_runtime_loop_is_cancelled_by_bot_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class OfflineTwitch:
+        async def get_stream(self, login: str) -> object:
+            raise AssertionError("reconciliation should not contact Twitch")
+
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(
+            application_id=123,
+            database_path=tmp_path / "krubit.db",
+            live_signals_enabled=True,
+        ),
+        FoundationService(store),
+        twitch=OfflineTwitch(),  # type: ignore[arg-type]
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def sync() -> None:
+        return None
+
+    async def ready() -> None:
+        return None
+
+    async def reconcile(guilds: object) -> int:
+        entered.set()
+        await release.wait()
+        return 0
+
+    monkeypatch.setattr(bot.tree, "sync", sync)
+    monkeypatch.setattr(bot, "wait_until_ready", ready)
+    monkeypatch.setattr(
+        bot._live_runtime,  # pyright: ignore[reportPrivateUsage]
+        "reconcile_all",
+        reconcile,
+    )
+    try:
+        await bot.setup_hook()
+        await entered.wait()
+        task = bot.live_signal_reconciliation.get_task()
+        assert task is not None and not task.done()
+
+        await bot.close()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+        assert bot.daily_health_summary.get_task() is not None
+    finally:
+        release.set()
         await store.close()
