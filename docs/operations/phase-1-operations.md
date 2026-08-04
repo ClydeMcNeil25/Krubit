@@ -18,7 +18,7 @@ The launcher reads only Krubit's approved variables from the workspace master `.
 ```dotenv
 DISCORD_KRUBIT_APPLICATION_ID=
 DISCORD_KRUBIT_BOT_TOKEN=
-KRUBIT_DATABASE_PATH=D:/Dropbox/05 Software Development/Krubot/data/krubit.db
+KRUBIT_DATABASE_PATH=D:/Dropbox/05 Software Development/Krubit/data/krubit.db
 KRUBIT_STAFF_CHANNEL_ID=
 ```
 

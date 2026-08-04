@@ -56,5 +56,9 @@ foreach ($name in $requiredNames) {
 }
 
 Set-Location -LiteralPath $projectPath
-& uv run python -m krubit @KrubitArguments
+$pythonPath = Join-Path $projectPath ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $pythonPath)) {
+    throw "Krubit's virtual-environment Python is missing: $pythonPath"
+}
+& $pythonPath -m krubit @KrubitArguments
 exit $LASTEXITCODE
