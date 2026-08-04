@@ -12,7 +12,7 @@ _ASSIGNMENT_SECRET = re.compile(
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
 _SENSITIVE_KEY = re.compile(
-    r"(?i)^(api[_ -]?key|bot[_ -]?token|access[_ -]?token|password|secret)$"
+    r"(?i)^(api[_ -]?key|bot[_ -]?token|access[_ -]?token|token|password|secret)$"
 )
 
 

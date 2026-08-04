@@ -45,6 +45,12 @@ def test_redact_removes_plain_values_under_sensitive_keys() -> None:
     }
 
 
+def test_redact_removes_plain_values_under_generic_token_key() -> None:
+    assert redact({"integration": {"token": "plain-value"}}) == {
+        "integration": {"token": "[REDACTED]"}
+    }
+
+
 def test_guild_event_rejects_blank_event_id() -> None:
     with pytest.raises(ValueError, match="event_id"):
         GuildEvent(
