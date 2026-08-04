@@ -50,3 +50,17 @@ class DiffItem:
 class SnapshotDiff:
     direction: str
     items: tuple[DiffItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HealthFinding:
+    code: str
+    severity: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class HealthReport:
+    status: str
+    findings: tuple[HealthFinding, ...]
+    checked_at: datetime

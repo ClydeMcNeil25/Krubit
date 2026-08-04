@@ -1,0 +1,109 @@
+"""Factual operational health classification without community recommendations."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import cast
+
+from krubit.domain.companion import HealthFinding, HealthReport, SnapshotRecord
+from krubit.domain.models import JSONValue
+
+_SEVERITY = {"healthy": 0, "limited": 1, "warning": 2, "critical": 3}
+
+
+def _dict(value: JSONValue | None) -> dict[str, JSONValue]:
+    return cast(dict[str, JSONValue], value) if isinstance(value, dict) else {}
+
+
+def _strings(value: JSONValue | None) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in cast(list[object], value) if isinstance(item, str)]
+
+
+def _report(findings: list[HealthFinding], checked_at: datetime) -> HealthReport:
+    findings.sort(key=lambda item: (-_SEVERITY[item.severity], item.code))
+    status = findings[0].severity if findings else "healthy"
+    return HealthReport(status=status, findings=tuple(findings), checked_at=checked_at)
+
+
+def _permission_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
+    permissions = _dict(snapshot.content.get("bot_permissions"))
+    missing = _strings(permissions.get("missing_required"))
+    return [
+        HealthFinding(
+            "missing_required_permission",
+            "warning",
+            f"Missing required Discord permission: {name}.",
+        )
+        for name in missing
+    ]
+
+
+def _integration_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
+    findings: list[HealthFinding] = []
+    for issue in snapshot.coverage:
+        code_section = {
+            "automod_rules": "automod",
+            "webhooks": "webhook",
+        }.get(issue.section, issue.section)
+        severity = "limited" if issue.status == "limited" else "warning"
+        findings.append(
+            HealthFinding(
+                f"limited_{code_section}_coverage",
+                severity,
+                f"{issue.section} coverage is {issue.status}: {issue.detail}.",
+            )
+        )
+    configured = _dict(snapshot.content.get("configured_channel"))
+    if configured and configured.get("present") is False:
+        findings.append(
+            HealthFinding(
+                "configured_channel_missing",
+                "warning",
+                f"Configured channel {configured.get('id')} is not present.",
+            )
+        )
+    return findings
+
+
+class HealthService:
+    def server_health(
+        self,
+        snapshot: SnapshotRecord | None,
+        *,
+        now: datetime,
+        database_healthy: bool,
+        gateway_ready: bool,
+    ) -> HealthReport:
+        findings: list[HealthFinding] = []
+        if not database_healthy:
+            findings.append(
+                HealthFinding("database_unavailable", "critical", "Snapshot database unavailable.")
+            )
+        if not gateway_ready:
+            findings.append(
+                HealthFinding("gateway_unavailable", "critical", "Discord gateway is not ready.")
+            )
+        if snapshot is None:
+            findings.append(
+                HealthFinding("snapshot_missing", "critical", "No configuration snapshot exists.")
+            )
+            return _report(findings, now)
+        findings.extend(_permission_findings(snapshot))
+        findings.extend(_integration_findings(snapshot))
+        if now - snapshot.captured_at > timedelta(hours=26):
+            findings.append(
+                HealthFinding(
+                    "snapshot_stale",
+                    "warning",
+                    f"Latest snapshot was captured at {snapshot.captured_at.isoformat()}.",
+                )
+            )
+        return _report(findings, now)
+
+    def permission_health(self, snapshot: SnapshotRecord) -> HealthReport:
+        return _report(_permission_findings(snapshot), snapshot.captured_at)
+
+    def integration_health(self, snapshot: SnapshotRecord) -> HealthReport:
+        return _report(_integration_findings(snapshot), snapshot.captured_at)
