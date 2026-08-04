@@ -4,8 +4,12 @@ from datetime import UTC, datetime
 import pytest
 
 from krubit.domain.live_signals import (
+    LiveSignalAction,
+    LiveSignalPlan,
+    LiveSignalSession,
     LiveSignalStatus,
     StreamingObservation,
+    TwitchLookup,
     TwitchStream,
     normalize_twitch_channel,
     provisional_session_key,
@@ -74,6 +78,49 @@ def test_twitch_stream_bounds_external_text() -> None:
             started_at=now(),
             thumbnail_url="https://example.test/preview.jpg",
         )
+
+
+def test_domain_enums_reject_raw_strings() -> None:
+    with pytest.raises(ValueError, match="kind must be a TwitchLookupKind"):
+        TwitchLookup("offline")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="status must be a LiveSignalStatus"):
+        LiveSignalSession(
+            guild_id=111,
+            session_key="session-1",
+            member_id=222,
+            twitch_login="krucialstudios",
+            twitch_url="https://twitch.tv/krucialstudios",
+            status="live",  # type: ignore[arg-type]
+            detected_at=now(),
+        )
+
+
+def test_live_signal_plan_requires_immutable_supported_actions() -> None:
+    with pytest.raises(ValueError, match="actions must be a tuple"):
+        LiveSignalPlan(111, "session-1", [LiveSignalAction.ANNOUNCE])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="actions must contain LiveSignalAction values"):
+        LiveSignalPlan(111, "session-1", ("announce",))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://twitch.tv//krucialstudios",
+        "https://twitch.tv/krucialstudios//",
+        "https://twitch.tv/krucialstudios/extra",
+    ],
+)
+def test_normalize_twitch_channel_rejects_extra_path_delimiters(url: str) -> None:
+    assert normalize_twitch_channel(url) is None
+
+
+def test_twitch_url_is_bounded_including_query_and_fragment() -> None:
+    over_limit_url = "https://twitch.tv/krucialstudios?" + "x" * 2_016
+
+    assert len(over_limit_url) == 2_049
+    assert normalize_twitch_channel(over_limit_url) is None
+    with pytest.raises(ValueError, match="twitch_url exceeds 2048 characters"):
+        StreamingObservation(111, 222, "krucialstudios", over_limit_url, None, now())
 
 
 def observation_for_test() -> StreamingObservation:

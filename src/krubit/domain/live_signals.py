@@ -10,6 +10,7 @@ from re import fullmatch
 from urllib.parse import urlsplit
 
 _TWITCH_LOGIN_PATTERN = r"[a-zA-Z0-9_]{1,25}"
+_TWITCH_URL_MAX_LENGTH = 2_048
 _RESERVED_TWITCH_PATHS = frozenset({"directory", "downloads", "jobs", "p", "settings", "videos"})
 
 
@@ -53,16 +54,18 @@ def _require_text(name: str, value: str, *, limit: int) -> None:
 
 def normalize_twitch_channel(url: str) -> str | None:
     """Return the canonical Twitch login for a supported channel URL."""
+    if len(url) > _TWITCH_URL_MAX_LENGTH:
+        return None
     try:
         parsed = urlsplit(url)
     except ValueError:
         return None
     if parsed.scheme != "https" or parsed.hostname not in {"twitch.tv", "www.twitch.tv"}:
         return None
-    path = parsed.path.strip("/")
-    if "/" in path or fullmatch(_TWITCH_LOGIN_PATTERN, path) is None:
+    match = fullmatch(rf"/({_TWITCH_LOGIN_PATTERN})/?", parsed.path)
+    if match is None:
         return None
-    login = path.lower()
+    login = match.group(1).lower()
     return None if login in _RESERVED_TWITCH_PATHS else login
 
 
@@ -80,6 +83,7 @@ class StreamingObservation:
         _require_positive_id("member_id", self.member_id)
         if fullmatch(_TWITCH_LOGIN_PATTERN, self.twitch_login) is None:
             raise ValueError("twitch_login must be a valid Twitch login")
+        _require_text("twitch_url", self.twitch_url, limit=_TWITCH_URL_MAX_LENGTH)
         if normalize_twitch_channel(self.twitch_url) != self.twitch_login.lower():
             raise ValueError("twitch_url must match twitch_login")
         if self.activity_started_at is not None:
@@ -115,6 +119,8 @@ class TwitchLookup:
     unavailable_reason: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.kind) is not TwitchLookupKind:
+            raise ValueError("kind must be a TwitchLookupKind")
         if self.kind is TwitchLookupKind.LIVE and self.stream is None:
             raise ValueError("a live Twitch lookup requires a stream")
         if self.kind is not TwitchLookupKind.LIVE and self.stream is not None:
@@ -164,8 +170,11 @@ class LiveSignalSession:
         _require_positive_id("member_id", self.member_id)
         if fullmatch(_TWITCH_LOGIN_PATTERN, self.twitch_login) is None:
             raise ValueError("twitch_login must be a valid Twitch login")
+        _require_text("twitch_url", self.twitch_url, limit=_TWITCH_URL_MAX_LENGTH)
         if normalize_twitch_channel(self.twitch_url) != self.twitch_login.lower():
             raise ValueError("twitch_url must match twitch_login")
+        if type(self.status) is not LiveSignalStatus:
+            raise ValueError("status must be a LiveSignalStatus")
         _require_aware(self.detected_at)
         for timestamp in (
             self.presence_started_at,
@@ -195,6 +204,10 @@ class LiveSignalPlan:
     def __post_init__(self) -> None:
         _require_positive_id("guild_id", self.guild_id)
         _require_text("session_key", self.session_key, limit=64)
+        if type(self.actions) is not tuple:
+            raise ValueError("actions must be a tuple")
+        if not all(type(action) is LiveSignalAction for action in self.actions):
+            raise ValueError("actions must contain LiveSignalAction values")
 
 
 def provisional_session_key(observation: StreamingObservation) -> str:
