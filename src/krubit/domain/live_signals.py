@@ -206,6 +206,11 @@ class LiveSignalPlan:
     session_key: str
     actions: tuple[LiveSignalAction, ...]
     stream: TwitchStream | None = None
+    member_id: int | None = None
+    role_id: int | None = None
+    announcement_channel_id: int | None = None
+    announcement_message_id: int | None = None
+    delivery_attempt: int | None = None
 
     def __post_init__(self) -> None:
         _require_positive_id("guild_id", self.guild_id)
@@ -214,6 +219,16 @@ class LiveSignalPlan:
             raise ValueError("actions must be a tuple")
         if not all(type(action) is LiveSignalAction for action in self.actions):
             raise ValueError("actions must contain LiveSignalAction values")
+        for name, identifier in (
+            ("member_id", self.member_id),
+            ("role_id", self.role_id),
+            ("announcement_channel_id", self.announcement_channel_id),
+            ("announcement_message_id", self.announcement_message_id),
+        ):
+            if identifier is not None:
+                _require_positive_id(name, identifier)
+        if self.delivery_attempt is not None and self.delivery_attempt <= 0:
+            raise ValueError("delivery_attempt must be positive")
 
 
 def provisional_session_key(observation: StreamingObservation) -> str:

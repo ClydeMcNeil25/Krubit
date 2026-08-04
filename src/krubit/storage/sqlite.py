@@ -58,6 +58,7 @@ class LiveSignalDelivery:
     delivery_key: str
     session_key: str
     status: str
+    attempt: int
     channel_id: int | None
     message_id: int | None
 
@@ -182,6 +183,7 @@ class SQLiteStore:
                 delivery_key TEXT NOT NULL,
                 session_key TEXT NOT NULL,
                 status TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
                 channel_id INTEGER,
                 message_id INTEGER,
                 created_at TEXT NOT NULL,
@@ -200,6 +202,15 @@ class SQLiteStore:
             );
             """
         )
+        columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
+        delivery_columns = {str(row["name"]) for row in await columns_cursor.fetchall()}
+        if "attempt" not in delivery_columns:
+            await self._connection.execute(
+                """
+                ALTER TABLE live_signal_deliveries
+                ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0)
+                """
+            )
         await self._connection.commit()
 
     async def close(self) -> None:
@@ -482,24 +493,53 @@ class SQLiteStore:
     async def claim_live_delivery(
         self, guild_id: int, delivery_key: str, session_key: str
     ) -> bool:
+        attempt = await self.claim_live_delivery_attempt(guild_id, delivery_key, session_key)
+        return attempt is not None
+
+    async def claim_live_delivery_attempt(
+        self, guild_id: int, delivery_key: str, session_key: str
+    ) -> int | None:
+        """Claim a delivery and return its monotonically increasing attempt identity."""
         _require_guild_id(guild_id)
         now = datetime.now(UTC).isoformat()
-        cursor = await self._connection.execute(
-            """
-            INSERT INTO live_signal_deliveries (
-                guild_id, delivery_key, session_key, status, channel_id, message_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, 'claimed', NULL, NULL, ?, ?)
-            ON CONFLICT(guild_id, delivery_key) DO UPDATE SET
-                session_key = excluded.session_key,
-                status = 'claimed',
-                updated_at = excluded.updated_at
-            WHERE live_signal_deliveries.status = 'failed'
-            """,
-            (guild_id, delivery_key, session_key, now, now),
-        )
-        await self._connection.commit()
-        return cursor.rowcount == 1
+        await self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._connection.execute(
+                """
+                SELECT status, attempt FROM live_signal_deliveries
+                WHERE guild_id = ? AND delivery_key = ?
+                """,
+                (guild_id, delivery_key),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await self._connection.execute(
+                    """
+                    INSERT INTO live_signal_deliveries (
+                        guild_id, delivery_key, session_key, status, attempt, channel_id,
+                        message_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'claimed', 1, NULL, NULL, ?, ?)
+                    """,
+                    (guild_id, delivery_key, session_key, now, now),
+                )
+                attempt = 1
+            elif str(row["status"]) == "failed":
+                attempt = int(row["attempt"]) + 1
+                await self._connection.execute(
+                    """
+                    UPDATE live_signal_deliveries
+                    SET session_key = ?, status = 'claimed', attempt = ?, updated_at = ?
+                    WHERE guild_id = ? AND delivery_key = ?
+                    """,
+                    (session_key, attempt, now, guild_id, delivery_key),
+                )
+            else:
+                attempt = None
+            await self._connection.commit()
+            return attempt
+        except BaseException:
+            await self._connection.rollback()
+            raise
 
     async def get_live_delivery(
         self, guild_id: int, delivery_key: str
@@ -508,7 +548,7 @@ class SQLiteStore:
         _require_guild_id(guild_id)
         cursor = await self._connection.execute(
             """
-            SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+            SELECT guild_id, delivery_key, session_key, status, attempt, channel_id, message_id
             FROM live_signal_deliveries
             WHERE guild_id = ? AND delivery_key = ?
             """,
@@ -531,7 +571,7 @@ class SQLiteStore:
         try:
             source_cursor = await self._connection.execute(
                 """
-                SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+                SELECT guild_id, delivery_key, session_key, status, attempt, channel_id, message_id
                 FROM live_signal_deliveries
                 WHERE guild_id = ? AND delivery_key = ?
                 """,
@@ -539,7 +579,7 @@ class SQLiteStore:
             )
             destination_cursor = await self._connection.execute(
                 """
-                SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+                SELECT guild_id, delivery_key, session_key, status, attempt, channel_id, message_id
                 FROM live_signal_deliveries
                 WHERE guild_id = ? AND delivery_key = ?
                 """,
@@ -567,12 +607,14 @@ class SQLiteStore:
                 await self._connection.execute(
                     """
                     UPDATE live_signal_deliveries
-                    SET session_key = ?, status = ?, channel_id = ?, message_id = ?, updated_at = ?
+                    SET session_key = ?, status = ?, attempt = ?, channel_id = ?, message_id = ?,
+                        updated_at = ?
                     WHERE guild_id = ? AND delivery_key = ?
                     """,
                     (
                         session_key,
                         retained.status,
+                        retained.attempt,
                         retained.channel_id,
                         retained.message_id,
                         datetime.now(UTC).isoformat(),
@@ -608,17 +650,30 @@ class SQLiteStore:
         status: str,
         channel_id: int | None,
         message_id: int | None,
-    ) -> None:
+        attempt: int | None = None,
+    ) -> bool:
         _require_guild_id(guild_id)
-        await self._connection.execute(
-            """
+        if attempt is not None and attempt <= 0:
+            raise ValueError("attempt must be positive")
+        query = """
             UPDATE live_signal_deliveries
             SET status = ?, channel_id = ?, message_id = ?, updated_at = ?
             WHERE guild_id = ? AND delivery_key = ?
-            """,
-            (status, channel_id, message_id, datetime.now(UTC).isoformat(), guild_id, delivery_key),
+        """
+        params: tuple[object, ...] = (
+            status,
+            channel_id,
+            message_id,
+            datetime.now(UTC).isoformat(),
+            guild_id,
+            delivery_key,
         )
+        if attempt is not None:
+            query += " AND attempt = ?"
+            params += (attempt,)
+        cursor = await self._connection.execute(query, params)
         await self._connection.commit()
+        return cursor.rowcount == 1
 
     async def record_live_check(
         self,
@@ -654,6 +709,21 @@ class SQLiteStore:
         )
         await self._connection.commit()
 
+    async def latest_live_check_result(self, guild_id: int) -> str | None:
+        """Return only the newest redacted Twitch-check classification for a guild."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT result FROM live_signal_checks
+            WHERE guild_id = ?
+            ORDER BY checked_at DESC, check_id DESC
+            LIMIT 1
+            """,
+            (guild_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row["result"]) if row is not None else None
+
     @staticmethod
     def _live_signal_config_from_row(row: aiosqlite.Row | None) -> LiveSignalConfig | None:
         if row is None:
@@ -676,6 +746,7 @@ class SQLiteStore:
             delivery_key=str(row["delivery_key"]),
             session_key=str(row["session_key"]),
             status=str(row["status"]),
+            attempt=int(row["attempt"]),
             channel_id=_optional_int(row["channel_id"]),
             message_id=_optional_int(row["message_id"]),
         )

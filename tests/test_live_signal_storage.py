@@ -312,6 +312,98 @@ async def test_delivery_identity_merge_preserves_a_claim_so_stream_enrichment_ca
 
 
 @pytest.mark.asyncio
+async def test_delivery_attempt_increments_on_retry_and_rejects_stale_completion(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session())
+        first = await store.claim_live_delivery_attempt(111, "provisional:session-1", "session-1")
+        assert first == 1
+        assert await store.complete_live_delivery(
+            111,
+            "provisional:session-1",
+            status="failed",
+            channel_id=444,
+            message_id=None,
+            attempt=first,
+        ) is True
+        second = await store.claim_live_delivery_attempt(111, "provisional:session-1", "session-1")
+
+        assert second == 2
+        assert await store.complete_live_delivery(
+            111,
+            "provisional:session-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=first,
+        ) is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_adds_delivery_attempt_to_existing_phase_two_table(tmp_path: Path) -> None:
+    database = tmp_path / "krubit.db"
+    async with aiosqlite.connect(database) as connection:
+        await connection.execute(
+            """
+            CREATE TABLE live_signal_deliveries (
+                guild_id INTEGER NOT NULL,
+                delivery_key TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, delivery_key)
+            )
+            """
+        )
+        await connection.execute(
+            """
+            INSERT INTO live_signal_deliveries VALUES
+            (111, 'stream:existing', 'session-1', 'succeeded', 444, 1001, 'old', 'old')
+            """
+        )
+        await connection.commit()
+
+    store = await SQLiteStore.open(database)
+    try:
+        await store.initialize()
+        delivery = await store.get_live_delivery(111, "stream:existing")
+        assert delivery is not None and delivery.attempt == 1 and delivery.message_id == 1001
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_latest_live_check_result_is_guild_scoped(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.record_live_check(
+            111, "first", "session-1", result="live", detail={}, checked_at=NOW
+        )
+        await store.record_live_check(
+            111,
+            "second",
+            "session-1",
+            result="unavailable",
+            detail={"reason": "timeout"},
+            checked_at=NOW + timedelta(minutes=1),
+        )
+
+        assert await store.latest_live_check_result(111) == "unavailable"
+        assert await store.latest_live_check_result(222) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_live_check_details_are_redacted_before_storage(tmp_path: Path) -> None:
     store = await SQLiteStore.open(tmp_path / "krubit.db")
     try:

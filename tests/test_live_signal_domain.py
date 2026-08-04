@@ -102,6 +102,23 @@ def test_live_signal_plan_requires_immutable_supported_actions() -> None:
         LiveSignalPlan(111, "session-1", ("announce",))  # type: ignore[arg-type]
 
 
+def test_live_signal_plan_carries_immutable_execution_targets() -> None:
+    plan = LiveSignalPlan(
+        111,
+        "session-1",
+        (LiveSignalAction.REMOVE_ROLE,),
+        member_id=222,
+        role_id=333,
+        delivery_attempt=2,
+    )
+
+    assert plan.member_id == 222
+    assert plan.role_id == 333
+    assert plan.delivery_attempt == 2
+    with pytest.raises(ValueError, match="delivery_attempt must be positive"):
+        LiveSignalPlan(111, "session-1", (), delivery_attempt=0)
+
+
 @pytest.mark.parametrize(
     "url",
     [

@@ -47,6 +47,22 @@ class HangingTwitch:
         raise AssertionError("unreachable")
 
 
+class BlockingUnavailableTwitch:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def get_stream(self, login: str) -> TwitchLookup:
+        self.calls += 1
+        if self.calls == 1:
+            return TwitchLookup(TwitchLookupKind.LIVE, stream())
+        if self.calls == 2:
+            self.started.set()
+            await self.release.wait()
+        return TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
+
+
 @pytest.fixture
 async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
     value = await SQLiteStore.open(tmp_path / "krubit.db")
@@ -120,8 +136,14 @@ async def test_live_recovery_edits_existing_announcement_without_a_second_ping(
                     TwitchLookup(TwitchLookupKind.LIVE, stream())]),
     )
     initial = await service.observe(observation(), now=NOW)
+    assert initial.delivery_attempt == 1
     await service.record_delivery_result(
-        111, initial.session_key, status="succeeded", channel_id=444, message_id=1001
+        111,
+        initial.session_key,
+        status="succeeded",
+        channel_id=444,
+        message_id=1001,
+        attempt=initial.delivery_attempt,
     )
 
     recovered = await service.observe(observation(), now=NOW + timedelta(minutes=1))
@@ -232,8 +254,14 @@ async def test_failed_provisional_delivery_retries_once_under_the_stream_identit
         FakeTwitch([unavailable, TwitchLookup(TwitchLookupKind.LIVE, stream())]),
     )
     initial = await service.observe(observation(), now=NOW)
+    assert initial.delivery_attempt == 1
     await service.record_delivery_result(
-        111, initial.session_key, status="failed", channel_id=444, message_id=None
+        111,
+        initial.session_key,
+        status="failed",
+        channel_id=444,
+        message_id=None,
+        attempt=initial.delivery_attempt,
     )
 
     retried = await service.observe(observation(), now=NOW + timedelta(minutes=1))
@@ -274,7 +302,7 @@ async def test_results_require_existing_sessions_and_supported_outcomes(store: S
         )
     with pytest.raises(ValueError, match="status must be succeeded or failed"):
         await service.record_delivery_result(
-            111, "missing", status="unknown", channel_id=444, message_id=None
+            111, "missing", status="unknown", channel_id=444, message_id=None, attempt=1
         )
 
 
@@ -285,7 +313,12 @@ async def test_delivery_result_requires_a_durable_claim(store: SQLiteStore) -> N
 
     with pytest.raises(ValueError, match="delivery claim does not exist"):
         await service.record_delivery_result(
-            111, plan.session_key, status="succeeded", channel_id=444, message_id=1001
+            111,
+            plan.session_key,
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=1,
         )
 
 
@@ -299,3 +332,174 @@ async def test_status_and_integration_health_are_guild_scoped(store: SQLiteStore
     assert await service.status(222) == ()
     assert await service.integration_health(111) == "limited"
     assert await service.integration_health(222) == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_observe_offline_ends_an_owned_degraded_session_and_returns_its_role(
+    store: SQLiteStore,
+) -> None:
+    service = LiveSignalService(
+        store,
+        FakeTwitch(
+            [
+                TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout"),
+                TwitchLookup(TwitchLookupKind.OFFLINE),
+            ]
+        ),
+    )
+    initial = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, initial.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+
+    offline = await service.observe(observation(), now=NOW + timedelta(minutes=1))
+
+    assert offline.actions == (LiveSignalAction.REMOVE_ROLE,)
+    assert offline.role_id == 333
+    saved = await store.get_live_session(111, initial.session_key)
+    assert saved is not None and saved.status is LiveSignalStatus.ENDED
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cannot_overwrite_a_concurrent_presence_end(
+    store: SQLiteStore,
+) -> None:
+    twitch = BlockingUnavailableTwitch()
+    service = LiveSignalService(store, twitch)
+    initial = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, initial.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+
+    reconciliation = asyncio.create_task(service.reconcile(111, now=NOW + timedelta(minutes=1)))
+    await twitch.started.wait()
+    ending = asyncio.create_task(service.presence_ended(111, 222, now=NOW + timedelta(minutes=2)))
+    await asyncio.sleep(0)
+    twitch.release.set()
+    await asyncio.gather(reconciliation, ending)
+
+    saved = await store.get_live_session(111, initial.session_key)
+    assert saved is not None and saved.presence_active is False
+    assert saved.missing_since == NOW + timedelta(minutes=2)
+    expiry = await service.reconcile(111, now=NOW + timedelta(minutes=7))
+    assert expiry[0].actions == (LiveSignalAction.REMOVE_ROLE,)
+
+
+@pytest.mark.asyncio
+async def test_results_require_the_configured_role_and_channel(store: SQLiteStore) -> None:
+    service = LiveSignalService(store, FakeTwitch([TwitchLookup(TwitchLookupKind.UNAVAILABLE)]))
+    plan = await service.observe(observation(), now=NOW)
+
+    with pytest.raises(ValueError, match="configured streaming role"):
+        await service.record_role_result(
+            111, plan.session_key, role_id=999, assigned_by_krubit=True, status="succeeded"
+        )
+    with pytest.raises(ValueError, match="configured notification channel"):
+        await service.record_delivery_result(
+            111,
+            plan.session_key,
+            status="failed",
+            channel_id=999,
+            message_id=None,
+            attempt=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_results_reject_a_guild_without_live_signal_configuration(tmp_path: Path) -> None:
+    unconfigured = await SQLiteStore.open(tmp_path / "unconfigured.db")
+    await unconfigured.initialize()
+    try:
+        service = LiveSignalService(
+            unconfigured,
+            FakeTwitch([TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")]),
+        )
+        plan = await service.observe(observation(), now=NOW)
+
+        with pytest.raises(ValueError, match="configured streaming role"):
+            await service.record_role_result(
+                111, plan.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+            )
+    finally:
+        await unconfigured.close()
+
+
+@pytest.mark.asyncio
+async def test_removal_plan_keeps_the_original_role_after_configuration_changes(
+    store: SQLiteStore,
+) -> None:
+    service = LiveSignalService(
+        store,
+        FakeTwitch(
+            [
+                TwitchLookup(TwitchLookupKind.LIVE, stream()),
+                TwitchLookup(TwitchLookupKind.OFFLINE),
+            ]
+        ),
+    )
+    initial = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, initial.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    await store.set_live_signal_config(LiveSignalConfig(111, 777, 666, NOW + timedelta(minutes=1)))
+
+    plans = await service.reconcile(111, now=NOW + timedelta(minutes=2))
+
+    assert plans[0].actions == (LiveSignalAction.REMOVE_ROLE,)
+    assert plans[0].role_id == 333
+
+
+@pytest.mark.asyncio
+async def test_stale_delivery_completion_cannot_overwrite_a_reclaimed_attempt(
+    store: SQLiteStore,
+) -> None:
+    unavailable = TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
+    service = LiveSignalService(
+        store,
+        FakeTwitch([unavailable, TwitchLookup(TwitchLookupKind.LIVE, stream())]),
+    )
+    initial = await service.observe(observation(), now=NOW)
+    assert initial.delivery_attempt == 1
+    await service.record_delivery_result(
+        111,
+        initial.session_key,
+        status="failed",
+        channel_id=444,
+        message_id=None,
+        attempt=initial.delivery_attempt,
+    )
+    retried = await service.observe(observation(), now=NOW + timedelta(minutes=1))
+    assert retried.delivery_attempt == 2
+
+    with pytest.raises(ValueError, match="stale delivery attempt"):
+        await service.record_delivery_result(
+            111,
+            initial.session_key,
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=initial.delivery_attempt,
+        )
+    delivery = await store.get_live_delivery(111, "stream:stream-1")
+    assert delivery is not None and delivery.status == "claimed" and delivery.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_integration_health_uses_the_latest_twitch_check(store: SQLiteStore) -> None:
+    service = LiveSignalService(
+        store,
+        FakeTwitch(
+            [
+                TwitchLookup(TwitchLookupKind.LIVE, stream()),
+                TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout"),
+                TwitchLookup(TwitchLookupKind.LIVE, stream()),
+            ]
+        ),
+    )
+    await service.observe(observation(), now=NOW)
+    await service.reconcile(111, now=NOW + timedelta(minutes=1))
+    assert await service.integration_health(111) == "limited"
+
+    await service.reconcile(111, now=NOW + timedelta(minutes=2))
+
+    assert await service.integration_health(111) == "healthy"
