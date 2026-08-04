@@ -9,9 +9,12 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
+import aiohttp
+
 from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
 from krubit.discord.install import install_url
+from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
 from krubit.storage.sqlite import SQLiteStore
 
@@ -76,7 +79,8 @@ async def _database_command(args: argparse.Namespace, settings: Settings) -> int
 async def _run_bot(settings: Settings) -> int:
     store = await SQLiteStore.open(settings.database_path)
     await store.initialize()
-    bot = KrubitBot(settings, FoundationService(store))
+    connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+    bot = KrubitBot(settings, FoundationService(store), connector=connector)
     try:
         await bot.start(settings.require_token())
     finally:

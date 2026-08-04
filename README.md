@@ -31,3 +31,6 @@ uv run pyright
 See the [Phase 0 setup guide](docs/operations/phase-0-setup.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
+
+When using the workspace-level master `.env`, invoke Krubit through
+`scripts/invoke-krubit.ps1` so only Krubit's approved environment variables are loaded.

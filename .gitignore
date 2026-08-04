@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 dist/
+logs/
 data/
 *.db
 *.db-shm

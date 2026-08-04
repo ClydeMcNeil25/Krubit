@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import discord
+from aiohttp import BaseConnector
 from discord import app_commands
 
 from krubit.config import Settings
@@ -72,8 +73,18 @@ class FetchCommands(app_commands.Group):
 class KrubitBot(discord.Client):
     """Discord transport; community judgment remains outside this class."""
 
-    def __init__(self, settings: Settings, service: FoundationService) -> None:
-        super().__init__(intents=phase_zero_intents(), application_id=settings.application_id)
+    def __init__(
+        self,
+        settings: Settings,
+        service: FoundationService,
+        *,
+        connector: BaseConnector | None = None,
+    ) -> None:
+        super().__init__(
+            intents=phase_zero_intents(),
+            application_id=settings.application_id,
+            connector=connector,
+        )
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(FetchCommands(service))
         self._service = service

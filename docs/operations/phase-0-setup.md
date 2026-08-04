@@ -38,9 +38,21 @@ KRUBIT_DATABASE_PATH=data/krubit.db
 The application loads environment variables supplied to the process. It does not parse `.env`
 itself; use your deployment platform or shell to load the file without printing the token.
 
+For this workspace, the checked-in launcher reads only Krubit's three approved variables from
+`D:\Dropbox\05 Software Development\.env`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/invoke-krubit.ps1 init-db
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/invoke-krubit.ps1 run
+```
+
 If a Miniconda installation overrides `SSL_CERT_FILE` with a stale certificate bundle, dependency
 installation may fail with `UnknownIssuer`. Clear that override for the `uv` invocation and use
 `uv --system-certs sync --all-groups`; do not disable TLS verification.
+
+The Discord runtime uses Windows' native certificate store and retains `CERT_REQUIRED` plus
+hostname checking. It relaxes only Python 3.13's optional strict CA-extension flag for
+compatibility with the locally managed network certificate.
 
 ## Initialize and install
 
