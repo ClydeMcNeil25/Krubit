@@ -49,6 +49,9 @@ class FakeGuild:
         del channel_id
         return None
 
+    def get_role(self, role_id: int) -> SimpleNamespace | None:
+        return next((role for role in self.roles if role.id == role_id), None)
+
     async def webhooks(self) -> list[SimpleNamespace]:
         if self._forbidden:
             raise discord.Forbidden(cast(Any, FakeResponse()), "denied")
@@ -110,3 +113,35 @@ async def test_capture_inventory_identifies_unexpected_mutation_permissions() ->
 
     permissions = cast(dict[str, object], capture.content["bot_permissions"])
     assert permissions["unexpected_mutation"] == ["kick_members", "manage_guild"]
+
+
+@pytest.mark.asyncio
+async def test_capture_inventory_records_live_resource_ids_and_capability_facts() -> None:
+    granted = phase_zero_permissions()
+    granted.manage_roles = True
+    granted.mention_everyone = False
+    guild = FakeGuild((20, 10), granted=granted)
+    guild.me.top_role = guild.roles[0]
+
+    capture = await capture_inventory(
+        cast(discord.Guild, guild),
+        required_permissions=discord.Permissions(manage_roles=True, mention_everyone=True),
+        configured_channel_id=None,
+        live_channel_id=900,
+        streaming_role_id=20,
+        presence_intent=False,
+        twitch_credentials=False,
+        twitch_available=False,
+    )
+
+    live = cast(dict[str, object], capture.content["live_signal"])
+    assert live == {
+        "channel": {"id": "900", "present": False},
+        "role": {"id": "20", "present": True},
+        "presence_intent": False,
+        "twitch_credentials": False,
+        "twitch_available": False,
+        "manage_roles": True,
+        "role_hierarchy": False,
+        "mention_everyone": False,
+    }

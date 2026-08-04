@@ -82,7 +82,7 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
 
         assert {command.name for command in fetch.commands} == {
             "status", "test-card", "server-health", "changes",
-            "permissions", "integrations", "backup",
+            "permissions", "integrations", "backup", "live",
         }
         backup = cast(
             app_commands.Group,

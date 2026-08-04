@@ -13,8 +13,9 @@ from discord.ext import tasks
 from krubit.config import Settings
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
 from krubit.discord.events import guild_event
-from krubit.discord.install import phase_one_permissions, phase_two_intents
+from krubit.discord.install import phase_two_intents, phase_two_permissions
 from krubit.discord.inventory import InventoryCapture, capture_inventory
+from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.models import Card, CardField, GuildEvent
@@ -31,12 +32,26 @@ from krubit.services.snapshots import SnapshotService, compare_inventory
 
 
 class FetchCommands(app_commands.Group):
-    def __init__(self, service: FoundationService) -> None:
+    def __init__(
+        self,
+        service: FoundationService,
+        *,
+        live_service: LiveSignalService | None = None,
+        reconcile_callback: ReconcileCallback | None = None,
+        presence_intent: bool = False,
+        twitch_credentials: bool = False,
+        twitch_available: bool = False,
+    ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
         self._snapshots = SnapshotService(service.store)
         self._health = HealthService()
+        self._live_service = live_service
+        self._presence_intent = presence_intent
+        self._twitch_credentials = twitch_credentials
+        self._twitch_available = twitch_available
         self.add_command(BackupCommands(self))
+        self.add_command(LiveCommands(self, live_service, reconcile_callback))
 
     @property
     def snapshots(self) -> SnapshotService:
@@ -61,10 +76,16 @@ class FetchCommands(app_commands.Group):
         return interaction.guild, user.id
 
     async def capture(self, guild: discord.Guild) -> tuple[InventoryCapture, SnapshotRecord]:
+        config = await self._service.store.get_live_signal_config(guild.id)
         inventory = await capture_inventory(
             guild,
-            required_permissions=phase_one_permissions(),
+            required_permissions=phase_two_permissions(),
             configured_channel_id=None,
+            live_channel_id=config.channel_id if config else None,
+            streaming_role_id=config.role_id if config else None,
+            presence_intent=self._presence_intent,
+            twitch_credentials=self._twitch_credentials,
+            twitch_available=self._twitch_available,
         )
         snapshot = await self._snapshots.capture(guild.id, inventory, datetime.now(UTC))
         return inventory, snapshot
@@ -77,6 +98,7 @@ class FetchCommands(app_commands.Group):
         actor_id: int,
         embed: discord.Embed,
         detail: dict[str, str | bool | int],
+        view: discord.ui.View | None = None,
     ) -> None:
         if interaction.guild_id is None:
             raise RuntimeError("authorized interaction lost guild context")
@@ -87,7 +109,10 @@ class FetchCommands(app_commands.Group):
             actor_id=actor_id,
             detail=detail,
         )
-        await interaction.edit_original_response(embed=embed)
+        if view is None:
+            await interaction.edit_original_response(embed=embed)
+        else:
+            await interaction.edit_original_response(embed=embed, view=view)
 
     @app_commands.command(name="status", description="Fetch Krubit's Phase 1 status")
     @app_commands.guild_only()
@@ -295,7 +320,7 @@ class BackupCommands(app_commands.Group):
             )
             return
         inventory = await capture_inventory(
-            guild, required_permissions=phase_one_permissions(), configured_channel_id=None
+            guild, required_permissions=phase_two_permissions(), configured_channel_id=None
         )
         diff = await self._parent.snapshots.preview_restore(
             guild.id, target.snapshot_id, inventory
@@ -326,7 +351,6 @@ class KrubitBot(discord.Client):
             connector=connector,
         )
         self.tree = app_commands.CommandTree(self)
-        self.tree.add_command(FetchCommands(service))
         self._service = service
         self._boot_id = uuid4().hex
         self._settings = settings
@@ -341,6 +365,19 @@ class KrubitBot(discord.Client):
             service.store,
             live_signals,
             receipts=service,
+        )
+        self.tree.add_command(
+            FetchCommands(
+                service,
+                live_service=live_signals,
+                reconcile_callback=self._live_runtime.reconcile_guild,
+                presence_intent=self.intents.presences,
+                twitch_credentials=(
+                    settings.twitch_client_id is not None
+                    and settings.twitch_client_secret is not None
+                ),
+                twitch_available=live_runtime_enabled,
+            )
         )
 
     async def setup_hook(self) -> None:
@@ -399,10 +436,19 @@ class KrubitBot(discord.Client):
                 detail={"channel_id": channel_id, "reason": "staff_channel_not_writable"},
             )
         try:
+            config = await self._service.store.get_live_signal_config(guild.id)
             inventory = await capture_inventory(
                 guild,
-                required_permissions=phase_one_permissions(),
+                required_permissions=phase_two_permissions(),
                 configured_channel_id=channel_id,
+                live_channel_id=config.channel_id if config else None,
+                streaming_role_id=config.role_id if config else None,
+                presence_intent=self.intents.presences,
+                twitch_credentials=(
+                    self._settings.twitch_client_id is not None
+                    and self._settings.twitch_client_secret is not None
+                ),
+                twitch_available=self._live_runtime_enabled,
             )
             snapshot = await SnapshotService(self._service.store).capture(
                 guild.id, inventory, datetime.now(UTC)

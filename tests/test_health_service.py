@@ -12,6 +12,7 @@ def snapshot_with(
     coverage: tuple[CoverageIssue, ...] = (),
     configured_present: bool | None = None,
     unexpected_mutation: list[str] | None = None,
+    live_signal: dict[str, JSONValue] | None = None,
 ) -> SnapshotRecord:
     configured: dict[str, JSONValue] | None = (
         None
@@ -28,6 +29,7 @@ def snapshot_with(
             "unexpected_mutation": mutation_values,
         },
         "configured_channel": configured,
+        "live_signal": live_signal or {},
     }
     return SnapshotRecord(
         snapshot_id="snapshot:one",
@@ -126,3 +128,36 @@ def test_permission_health_warns_when_discord_role_grants_mutation_authority() -
     ]
     assert "ban_members" in report.findings[0].detail
     assert "manage_roles" in report.findings[1].detail
+
+
+def test_server_health_reports_each_missing_live_signal_fact_distinctly() -> None:
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(
+            captured_at=now,
+            live_signal={
+                "channel": {"id": "900", "present": False},
+                "role": {"id": "333", "present": False},
+                "presence_intent": False,
+                "twitch_credentials": False,
+                "twitch_available": False,
+                "manage_roles": False,
+                "role_hierarchy": False,
+                "mention_everyone": False,
+            },
+        ),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "live_channel_missing",
+        "live_manage_roles_missing",
+        "live_mention_everyone_missing",
+        "live_presence_intent_missing",
+        "live_role_hierarchy_missing",
+        "live_role_missing",
+        "live_twitch_credentials_missing",
+        "live_twitch_unavailable",
+    ]

@@ -96,6 +96,11 @@ async def capture_inventory(
     *,
     required_permissions: discord.Permissions,
     configured_channel_id: int | None,
+    live_channel_id: int | None = None,
+    streaming_role_id: int | None = None,
+    presence_intent: bool | None = None,
+    twitch_credentials: bool | None = None,
+    twitch_available: bool | None = None,
 ) -> InventoryCapture:
     """Capture deterministic facts and explicit access limitations for one guild."""
 
@@ -158,6 +163,43 @@ async def capture_inventory(
             "present": guild.get_channel(configured_channel_id) is not None,
         }
     )
+    live_signal: dict[str, JSONValue] | None = None
+    if any(
+        value is not None
+        for value in (
+            live_channel_id,
+            streaming_role_id,
+            presence_intent,
+            twitch_credentials,
+            twitch_available,
+        )
+    ):
+        role = guild.get_role(streaming_role_id) if streaming_role_id is not None else None
+        top_role = getattr(guild.me, "top_role", None)
+        role_hierarchy: bool | None = None
+        if role is not None and top_role is not None:
+            role_hierarchy = getattr(role, "position", -1) < getattr(top_role, "position", -1)
+        live_signal = {
+            "channel": (
+                None
+                if live_channel_id is None
+                else {
+                    "id": str(live_channel_id),
+                    "present": guild.get_channel(live_channel_id) is not None,
+                }
+            ),
+            "role": (
+                None
+                if streaming_role_id is None
+                else {"id": str(streaming_role_id), "present": role is not None}
+            ),
+            "presence_intent": presence_intent,
+            "twitch_credentials": twitch_credentials,
+            "twitch_available": twitch_available,
+            "manage_roles": bool(getattr(granted, "manage_roles", False)),
+            "role_hierarchy": role_hierarchy,
+            "mention_everyone": bool(getattr(granted, "mention_everyone", False)),
+        }
     bot_permissions: dict[str, JSONValue] = {
         "granted": str(granted.value),
         "required": required_values,
@@ -186,6 +228,8 @@ async def capture_inventory(
         "bot_permissions": bot_permissions,
         "configured_channel": configured,
     }
+    if live_signal is not None:
+        content["live_signal"] = live_signal
     return InventoryCapture(
         content=content,
         coverage=tuple(sorted(issues, key=lambda item: item.section)),

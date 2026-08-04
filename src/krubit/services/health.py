@@ -77,6 +77,79 @@ def _integration_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
     return findings
 
 
+def _live_signal_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
+    live = _dict(snapshot.content.get("live_signal"))
+    if not live:
+        return []
+    findings: list[HealthFinding] = []
+    channel = _dict(live.get("channel"))
+    role = _dict(live.get("role"))
+    if live.get("channel") is None:
+        findings.append(
+            HealthFinding(
+                "live_channel_unconfigured",
+                "warning",
+                "No live notification channel is configured.",
+            )
+        )
+    elif channel.get("present") is False:
+        channel_id = str(channel.get("id", "unknown"))
+        findings.append(
+            HealthFinding(
+                "live_channel_missing",
+                "warning",
+                f"Configured live notification channel {channel_id} is not present.",
+            )
+        )
+    if live.get("role") is None:
+        findings.append(
+            HealthFinding("live_role_unconfigured", "warning", "No streaming role is configured.")
+        )
+    elif role.get("present") is False:
+        role_id = str(role.get("id", "unknown"))
+        findings.append(
+            HealthFinding(
+                "live_role_missing",
+                "warning",
+                f"Configured streaming role {role_id} is not present.",
+            )
+        )
+    facts = (
+        (
+            "presence_intent",
+            "live_presence_intent_missing",
+            "Discord presence intent is not enabled.",
+        ),
+        (
+            "twitch_credentials",
+            "live_twitch_credentials_missing",
+            "Twitch credentials are not configured.",
+        ),
+        ("twitch_available", "live_twitch_unavailable", "Twitch integration is not available."),
+        (
+            "manage_roles",
+            "live_manage_roles_missing",
+            "Discord Manage Roles permission is not granted.",
+        ),
+        (
+            "role_hierarchy",
+            "live_role_hierarchy_missing",
+            "Streaming role is not below Krubit's top role.",
+        ),
+        (
+            "mention_everyone",
+            "live_mention_everyone_missing",
+            "Discord Mention Everyone permission is not granted.",
+        ),
+    )
+    findings.extend(
+        HealthFinding(code, "warning", detail)
+        for fact, code, detail in facts
+        if live.get(fact) is False
+    )
+    return findings
+
+
 class HealthService:
     def server_health(
         self,
@@ -102,6 +175,7 @@ class HealthService:
             return _report(findings, now)
         findings.extend(_permission_findings(snapshot))
         findings.extend(_integration_findings(snapshot))
+        findings.extend(_live_signal_findings(snapshot))
         if now - snapshot.captured_at > timedelta(hours=26):
             findings.append(
                 HealthFinding(
