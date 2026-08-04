@@ -562,13 +562,14 @@ class SQLiteStore:
         provisional_key: str,
         stream_key: str,
         session_key: str,
-    ) -> None:
+    ) -> int | None:
         """Atomically carry a provisional claim forward once Helix supplies a stream ID."""
         _require_guild_id(guild_id)
         if not provisional_key or not stream_key or not session_key:
             raise ValueError("delivery and session keys must not be blank")
         await self._connection.execute("BEGIN IMMEDIATE")
         try:
+            fresh_attempt: int | None = None
             source_cursor = await self._connection.execute(
                 """
                 SELECT guild_id, delivery_key, session_key, status, attempt, channel_id, message_id
@@ -604,6 +605,10 @@ class SQLiteStore:
                 )
             elif source is not None and provisional_key != stream_key and destination is not None:
                 retained = max((source, destination), key=self._delivery_priority)
+                attempt = max(source.attempt, destination.attempt)
+                if retained.status == "claimed":
+                    attempt += 1
+                    fresh_attempt = attempt
                 await self._connection.execute(
                     """
                     UPDATE live_signal_deliveries
@@ -614,9 +619,9 @@ class SQLiteStore:
                     (
                         session_key,
                         retained.status,
-                        retained.attempt,
-                        retained.channel_id,
-                        retained.message_id,
+                        attempt,
+                        None if fresh_attempt is not None else retained.channel_id,
+                        None if fresh_attempt is not None else retained.message_id,
                         datetime.now(UTC).isoformat(),
                         guild_id,
                         stream_key,
@@ -638,6 +643,7 @@ class SQLiteStore:
                     (session_key, datetime.now(UTC).isoformat(), guild_id, stream_key),
                 )
             await self._connection.commit()
+            return fresh_attempt
         except BaseException:
             await self._connection.rollback()
             raise
@@ -650,15 +656,15 @@ class SQLiteStore:
         status: str,
         channel_id: int | None,
         message_id: int | None,
-        attempt: int | None = None,
+        attempt: int,
     ) -> bool:
         _require_guild_id(guild_id)
-        if attempt is not None and attempt <= 0:
+        if attempt <= 0:
             raise ValueError("attempt must be positive")
         query = """
             UPDATE live_signal_deliveries
             SET status = ?, channel_id = ?, message_id = ?, updated_at = ?
-            WHERE guild_id = ? AND delivery_key = ?
+            WHERE guild_id = ? AND delivery_key = ? AND status = 'claimed' AND attempt = ?
         """
         params: tuple[object, ...] = (
             status,
@@ -667,10 +673,8 @@ class SQLiteStore:
             datetime.now(UTC).isoformat(),
             guild_id,
             delivery_key,
+            attempt,
         )
-        if attempt is not None:
-            query += " AND attempt = ?"
-            params += (attempt,)
         cursor = await self._connection.execute(query, params)
         await self._connection.commit()
         return cursor.rowcount == 1

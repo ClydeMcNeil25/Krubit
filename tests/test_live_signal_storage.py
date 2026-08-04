@@ -246,6 +246,7 @@ async def test_failed_delivery_can_be_claimed_again_for_retry(tmp_path: Path) ->
             status="failed",
             channel_id=444,
             message_id=None,
+            attempt=1,
         )
 
         assert await store.claim_live_delivery(111, "stream:abc", "session-1") is True
@@ -268,6 +269,7 @@ async def test_delivery_identity_merge_preserves_failed_retry_under_the_stream_k
             status="failed",
             channel_id=444,
             message_id=None,
+            attempt=1,
         )
 
         await store.merge_live_delivery_identity(
@@ -339,6 +341,85 @@ async def test_delivery_attempt_increments_on_retry_and_rejects_stale_completion
             channel_id=444,
             message_id=1001,
             attempt=first,
+        ) is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_rejects_late_completion_before_it_is_reclaimed(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session())
+        attempt = await store.claim_live_delivery_attempt(111, "provisional:session-1", "session-1")
+        assert attempt == 1
+        assert await store.complete_live_delivery(
+            111,
+            "provisional:session-1",
+            status="failed",
+            channel_id=444,
+            message_id=None,
+            attempt=attempt,
+        ) is True
+
+        assert await store.complete_live_delivery(
+            111,
+            "provisional:session-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=attempt,
+        ) is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_identity_collision_invalidates_callbacks_from_both_old_rows(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session())
+        provisional_attempt = await store.claim_live_delivery_attempt(
+            111, "provisional:session-1", "session-1"
+        )
+        assert provisional_attempt == 1
+        assert await store.claim_live_delivery_attempt(111, "stream:stream-1", "session-1") == 1
+
+        await store.merge_live_delivery_identity(
+            111, "provisional:session-1", "stream:stream-1", "session-1"
+        )
+
+        merged = await store.get_live_delivery(111, "stream:stream-1")
+        assert merged is not None and merged.status == "claimed" and merged.attempt == 2
+        assert await store.complete_live_delivery(
+            111,
+            "stream:stream-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=1,
+        ) is False
+        assert await store.complete_live_delivery(
+            111,
+            "stream:stream-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=2,
+        ) is True
+        assert await store.complete_live_delivery(
+            111,
+            "stream:stream-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1001,
+            attempt=2,
         ) is False
     finally:
         await store.close()
@@ -484,7 +565,7 @@ async def test_live_signal_methods_reject_nonpositive_guild_ids(tmp_path: Path) 
             await store.merge_live_delivery_identity(0, "provisional:a", "stream:a", "session-1")
         with pytest.raises(ValueError, match="guild_id must be positive"):
             await store.complete_live_delivery(
-                0, "stream:abc", status="failed", channel_id=None, message_id=None
+                0, "stream:abc", status="failed", channel_id=None, message_id=None, attempt=1
             )
         with pytest.raises(ValueError, match="guild_id must be positive"):
             await store.record_live_check(

@@ -20,7 +20,7 @@ from krubit.domain.models import JSONValue
 from krubit.integrations.twitch import TwitchClient
 from krubit.storage.sqlite import SQLiteStore
 
-_INITIAL_LOOKUP_TIMEOUT_SECONDS = 5
+_TWITCH_LOOKUP_TIMEOUT_SECONDS = 5
 _MISSING_EVIDENCE_GRACE = timedelta(minutes=5)
 _RESULT_STATUSES = frozenset({"succeeded", "failed"})
 
@@ -91,15 +91,16 @@ class LiveSignalService:
         if existing is not None:
             retry_attempt: int | None = None
             if existing.stream is None and saved.stream is not None:
-                await self._store.merge_live_delivery_identity(
+                retry_attempt = await self._store.merge_live_delivery_identity(
                     saved.guild_id,
                     _delivery_key(existing),
                     _delivery_key(saved),
                     saved.session_key,
                 )
-                retry_attempt = await self._store.claim_live_delivery_attempt(
-                    saved.guild_id, _delivery_key(saved), saved.session_key
-                )
+                if retry_attempt is None:
+                    retry_attempt = await self._store.claim_live_delivery_attempt(
+                        saved.guild_id, _delivery_key(saved), saved.session_key
+                    )
             actions: tuple[LiveSignalAction, ...] = ()
             if saved.announcement_message_id is not None and lookup.kind is TwitchLookupKind.LIVE:
                 actions = (LiveSignalAction.EDIT_ANNOUNCEMENT,)
@@ -139,55 +140,59 @@ class LiveSignalService:
         return self._plan(saved, ())
 
     async def reconcile(self, guild_id: int, *, now: datetime) -> tuple[LiveSignalPlan, ...]:
-        """Refresh every active session using caller-provided time and no sleeps."""
-        async with self._guild_lock(guild_id):
-            return await self._reconcile(guild_id, now=now)
-
-    async def _reconcile(self, guild_id: int, *, now: datetime) -> tuple[LiveSignalPlan, ...]:
+        """Refresh active sessions without holding the guild lock across Twitch I/O."""
         _require_aware("now", now)
+        async with self._guild_lock(guild_id):
+            snapshots = tuple(await self._store.list_active_live_sessions(guild_id))
         plans: list[LiveSignalPlan] = []
-        for session in await self._store.list_active_live_sessions(guild_id):
-            lookup = await self._lookup(session.twitch_login)
-            await self._record_lookup(session, lookup, now)
-            if lookup.kind is TwitchLookupKind.LIVE:
-                saved = await self._store.save_live_session(
-                    replace(
-                        session,
-                        status=LiveSignalStatus.LIVE,
-                        stream=lookup.stream,
-                        missing_since=None,
-                        last_twitch_at=now,
-                    )
-                )
+        for snapshot in snapshots:
+            lookup = await self._lookup(snapshot.twitch_login)
+            async with self._guild_lock(guild_id):
+                current = await self._store.get_live_session(guild_id, snapshot.session_key)
                 if (
-                    saved.announcement_message_id is not None
-                    and (
-                        session.status is not LiveSignalStatus.LIVE
-                        or session.stream != saved.stream
-                    )
+                    current is None
+                    or current.status is LiveSignalStatus.ENDED
+                    or current.ended_at is not None
+                    or current.twitch_login != snapshot.twitch_login
                 ):
-                    plans.append(self._plan(saved, (LiveSignalAction.EDIT_ANNOUNCEMENT,)))
-                continue
-            if lookup.kind is TwitchLookupKind.OFFLINE:
-                saved = await self._end(session, now)
-                plan = self._remove_role_plan(saved)
+                    continue
+                plan = await self._apply_reconciliation_lookup(current, lookup, now)
                 if plan is not None:
                     plans.append(plan)
-                continue
-            if session.presence_active:
-                await self._store.save_live_session(session)
-                continue
-            missing_since = session.missing_since or now
-            if now - missing_since < _MISSING_EVIDENCE_GRACE:
-                await self._store.save_live_session(
-                    replace(session, status=LiveSignalStatus.ENDING, missing_since=missing_since)
-                )
-                continue
-            saved = await self._end(session, now)
-            plan = self._remove_role_plan(saved)
-            if plan is not None:
-                plans.append(plan)
         return tuple(plans)
+
+    async def _apply_reconciliation_lookup(
+        self, session: LiveSignalSession, lookup: TwitchLookup, now: datetime
+    ) -> LiveSignalPlan | None:
+        await self._record_lookup(session, lookup, now)
+        if lookup.kind is TwitchLookupKind.LIVE:
+            saved = await self._store.save_live_session(
+                replace(
+                    session,
+                    status=LiveSignalStatus.LIVE,
+                    stream=lookup.stream,
+                    missing_since=None,
+                    last_twitch_at=now,
+                )
+            )
+            if (
+                saved.announcement_message_id is not None
+                and (session.status is not LiveSignalStatus.LIVE or session.stream != saved.stream)
+            ):
+                return self._plan(saved, (LiveSignalAction.EDIT_ANNOUNCEMENT,))
+            return None
+        if lookup.kind is TwitchLookupKind.OFFLINE:
+            return self._remove_role_plan(await self._end(session, now))
+        if session.presence_active:
+            await self._store.save_live_session(session)
+            return None
+        missing_since = session.missing_since or now
+        if now - missing_since < _MISSING_EVIDENCE_GRACE:
+            await self._store.save_live_session(
+                replace(session, status=LiveSignalStatus.ENDING, missing_since=missing_since)
+            )
+            return None
+        return self._remove_role_plan(await self._end(session, now))
 
     async def record_role_result(
         self,
@@ -330,7 +335,7 @@ class LiveSignalService:
 
     async def _initial_lookup(self, login: str) -> TwitchLookup:
         try:
-            async with asyncio.timeout(_INITIAL_LOOKUP_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_TWITCH_LOOKUP_TIMEOUT_SECONDS):
                 return await self._twitch.get_stream(login)
         except TimeoutError:
             return TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
@@ -339,7 +344,8 @@ class LiveSignalService:
 
     async def _lookup(self, login: str) -> TwitchLookup:
         try:
-            return await self._twitch.get_stream(login)
+            async with asyncio.timeout(_TWITCH_LOOKUP_TIMEOUT_SECONDS):
+                return await self._twitch.get_stream(login)
         except Exception:
             return TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="unavailable")
 

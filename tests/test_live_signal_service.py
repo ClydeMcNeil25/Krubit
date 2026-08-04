@@ -63,6 +63,20 @@ class BlockingUnavailableTwitch:
         return TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
 
 
+class NeverReturningReconciliationTwitch:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.calls = 0
+
+    async def get_stream(self, login: str) -> TwitchLookup:
+        self.calls += 1
+        if self.calls == 1:
+            return TwitchLookup(TwitchLookupKind.LIVE, stream())
+        self.started.set()
+        await asyncio.Future[TwitchLookup]()
+        raise AssertionError("unreachable")
+
+
 @pytest.fixture
 async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
     value = await SQLiteStore.open(tmp_path / "krubit.db")
@@ -386,6 +400,29 @@ async def test_reconciliation_cannot_overwrite_a_concurrent_presence_end(
 
 
 @pytest.mark.asyncio
+async def test_presence_end_is_not_blocked_by_a_hung_reconciliation_lookup(
+    store: SQLiteStore,
+) -> None:
+    twitch = NeverReturningReconciliationTwitch()
+    service = LiveSignalService(store, twitch)
+    initial = await service.observe(observation(), now=NOW)
+
+    reconciliation = asyncio.create_task(service.reconcile(111, now=NOW + timedelta(minutes=1)))
+    await twitch.started.wait()
+    await asyncio.wait_for(
+        service.presence_ended(111, 222, now=NOW + timedelta(minutes=2)),
+        timeout=0.1,
+    )
+
+    saved = await store.get_live_session(111, initial.session_key)
+    assert saved is not None and saved.presence_active is False
+    assert saved.missing_since == NOW + timedelta(minutes=2)
+    reconciliation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconciliation
+
+
+@pytest.mark.asyncio
 async def test_results_require_the_configured_role_and_channel(store: SQLiteStore) -> None:
     service = LiveSignalService(store, FakeTwitch([TwitchLookup(TwitchLookupKind.UNAVAILABLE)]))
     plan = await service.observe(observation(), now=NOW)
@@ -482,6 +519,25 @@ async def test_stale_delivery_completion_cannot_overwrite_a_reclaimed_attempt(
         )
     delivery = await store.get_live_delivery(111, "stream:stream-1")
     assert delivery is not None and delivery.status == "claimed" and delivery.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_delivery_identity_collision_returns_the_fresh_attempt_in_the_announce_plan(
+    store: SQLiteStore,
+) -> None:
+    unavailable = TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
+    service = LiveSignalService(
+        store,
+        FakeTwitch([unavailable, TwitchLookup(TwitchLookupKind.LIVE, stream())]),
+    )
+    initial = await service.observe(observation(), now=NOW)
+    assert initial.delivery_attempt == 1
+    assert await store.claim_live_delivery_attempt(111, "stream:stream-1", initial.session_key) == 1
+
+    merged = await service.observe(observation(), now=NOW + timedelta(minutes=1))
+
+    assert merged.actions == (LiveSignalAction.ANNOUNCE,)
+    assert merged.delivery_attempt == 2
 
 
 @pytest.mark.asyncio
