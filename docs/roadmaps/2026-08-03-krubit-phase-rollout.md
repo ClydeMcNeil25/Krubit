@@ -142,6 +142,14 @@ Advance when Krubit can run continuously for an agreed canary period without dup
 
 ## Phase 2: Creator Signal and Notification Hub
 
+**Implementation status (2026-08-04):** Phase 2A implements only the Twitch/Discord-
+presence live-signal slice: public Discord Streaming activity can trigger a durable Twitch
+lookup, `Streaming Now` role handling, a `#live-notifications` card, recovery, and
+staff-only `/fetch live` controls. A member must choose to share their Twitch Streaming
+activity publicly in Discord for Krubit to observe it; Krubit does not read private
+connected accounts. YouTube, additional social connectors, and the remaining Phase 2
+deliverables below remain pending. The controlled live canary has not run.
+
 ### Goal
 
 Consolidate the current creator-notification bots into Krubit and prove reliable external integration behavior.

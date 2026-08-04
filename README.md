@@ -27,6 +27,21 @@ creator notifications, server monitoring, Entry Sniffing, and member activity me
 Phase 1 does not moderate members, profile members, poll creator platforms, read message
 content, or mutate Discord server configuration.
 
+## Phase 2A capabilities
+
+- Twitch live-signal detection from Discord's public Streaming presence activity
+- Durable, guild-scoped live sessions, delivery claims, checks, and action receipts
+- One configured `Streaming Now` role, assigned and removed only when Krubit has a
+  receipt proving that Krubit assigned it
+- One configured `#live-notifications` destination with a receipted, degradation-aware
+  announcement path
+- Staff-only `/fetch live status`, `/fetch live test`, and `/fetch live reconcile`
+
+This is only the Twitch/Discord-presence slice of Phase 2. Discord can detect a Twitch
+stream only when the member chooses to share a Streaming activity publicly in Discord;
+Krubit does not read private connected accounts. YouTube, other social platforms, and the
+remaining Phase 2 notification features are not implemented yet.
+
 ## Development
 
 ```powershell
@@ -38,6 +53,8 @@ uv run pyright
 
 See the [Phase 1 operations guide](docs/operations/phase-1-operations.md),
 [Phase 0 setup guide](docs/operations/phase-0-setup.md),
+[Phase 2A live-signal operations guide](docs/operations/phase-2a-live-stream-signals.md),
+[Phase 2A development log](docs/devlogs/2026-08-04-phase-2a-live-stream-signals.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
 
