@@ -29,6 +29,38 @@ class FoundationService:
     def __init__(self, store: SQLiteStore) -> None:
         self._store = store
 
+    @property
+    def store(self) -> SQLiteStore:
+        return self._store
+
+    async def authorize_manager(
+        self,
+        guild_id: int,
+        actor_id: int,
+        can_manage_guild: bool,
+        *,
+        action: str,
+    ) -> None:
+        await self._require_enabled(guild_id, action=action)
+        await self._require_manager(guild_id, actor_id, can_manage_guild, action=action)
+
+    async def record_action(
+        self,
+        guild_id: int,
+        *,
+        action: str,
+        status: str,
+        actor_id: int | None,
+        detail: dict[str, str | bool | int],
+    ) -> ActionReceipt:
+        return await self._receipt(
+            guild_id=guild_id,
+            action=action,
+            status=status,
+            actor_id=actor_id,
+            detail=detail,
+        )
+
     async def _receipt(
         self,
         *,

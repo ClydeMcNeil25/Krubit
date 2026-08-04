@@ -59,6 +59,9 @@ class SnapshotService:
     def __init__(self, store: SQLiteStore) -> None:
         self._store = store
 
+    async def latest(self, guild_id: int) -> SnapshotRecord | None:
+        return await self._store.latest_snapshot(guild_id)
+
     async def capture(
         self,
         guild_id: int,

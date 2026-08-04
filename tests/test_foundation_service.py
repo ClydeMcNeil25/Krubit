@@ -100,3 +100,29 @@ async def test_test_signal_is_safe_and_requires_manage_guild(tmp_path: Path) -> 
         assert signal.evidence == {"phase": 0, "member_data": False}
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_phase_one_authorization_and_action_receipts_are_service_enforced(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    service = FoundationService(store)
+    try:
+        with pytest.raises(AuthorizationError):
+            await service.authorize_manager(111, 42, False, action="fetch_server_health")
+        await service.authorize_manager(111, 7, True, action="fetch_server_health")
+        await service.record_action(
+            111,
+            action="fetch_server_health",
+            status="succeeded",
+            actor_id=7,
+            detail={"snapshot_version": 1},
+        )
+
+        receipts = await store.list_receipts(111)
+        assert [receipt.status for receipt in receipts] == ["succeeded", "denied"]
+    finally:
+        await store.close()

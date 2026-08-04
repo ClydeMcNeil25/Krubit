@@ -10,21 +10,79 @@ from aiohttp import BaseConnector
 from discord import app_commands
 
 from krubit.config import Settings
-from krubit.discord.cards import render_card
+from krubit.discord.cards import render_card, render_diff_card, render_health_card
 from krubit.discord.events import guild_event
-from krubit.discord.install import phase_one_intents
+from krubit.discord.install import phase_one_intents, phase_one_permissions
+from krubit.discord.inventory import InventoryCapture, capture_inventory
+from krubit.domain.companion import SnapshotRecord
 from krubit.domain.models import Card, CardField, GuildEvent
 from krubit.services.foundation import (
     AuthorizationError,
     FoundationService,
     GuildDisabledError,
 )
+from krubit.services.health import HealthService
+from krubit.services.snapshots import SnapshotService, compare_inventory
 
 
 class FetchCommands(app_commands.Group):
     def __init__(self, service: FoundationService) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
+        self._snapshots = SnapshotService(service.store)
+        self._health = HealthService()
+        self.add_command(BackupCommands(self))
+
+    @property
+    def snapshots(self) -> SnapshotService:
+        return self._snapshots
+
+    async def authorize(
+        self, interaction: discord.Interaction, action: str
+    ) -> tuple[discord.Guild, int] | None:
+        if interaction.guild_id is None or interaction.guild is None:
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return None
+        user = interaction.user
+        can_manage = isinstance(user, discord.Member) and user.guild_permissions.manage_guild
+        try:
+            await self._service.authorize_manager(
+                interaction.guild_id, user.id, can_manage, action=action
+            )
+        except (AuthorizationError, GuildDisabledError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        return interaction.guild, user.id
+
+    async def capture(self, guild: discord.Guild) -> tuple[InventoryCapture, SnapshotRecord]:
+        inventory = await capture_inventory(
+            guild,
+            required_permissions=phase_one_permissions(),
+            configured_channel_id=None,
+        )
+        snapshot = await self._snapshots.capture(guild.id, inventory, datetime.now(UTC))
+        return inventory, snapshot
+
+    async def finish(
+        self,
+        interaction: discord.Interaction,
+        *,
+        action: str,
+        actor_id: int,
+        embed: discord.Embed,
+        detail: dict[str, str | bool | int],
+    ) -> None:
+        if interaction.guild_id is None:
+            raise RuntimeError("authorized interaction lost guild context")
+        await self._service.record_action(
+            interaction.guild_id,
+            action=action,
+            status="succeeded",
+            actor_id=actor_id,
+            detail=detail,
+        )
+        await interaction.edit_original_response(embed=embed)
 
     @app_commands.command(name="status", description="Fetch Krubit's Phase 0 status")
     @app_commands.guild_only()
@@ -69,6 +127,179 @@ class FetchCommands(app_commands.Group):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
         await interaction.response.send_message(embed=render_card(card), ephemeral=True)
+
+    @app_commands.command(name="server-health", description="Fetch factual server health")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def server_health(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_server_health")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self.capture(guild)
+        report = self._health.server_health(
+            snapshot, now=datetime.now(UTC), database_healthy=True, gateway_ready=True
+        )
+        await self.finish(
+            interaction,
+            action="fetch_server_health",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Server Health"),
+            detail={"snapshot_version": snapshot.version},
+        )
+
+    @app_commands.command(name="changes", description="Fetch latest configuration changes")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def changes(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_changes")
+        if context is None:
+            return
+        guild, actor_id = context
+        previous = await self._snapshots.latest(guild.id)
+        _, current = await self.capture(guild)
+        diff = (
+            compare_inventory(current.content, current.content)
+            if previous is None or previous.snapshot_id == current.snapshot_id
+            else compare_inventory(previous.content, current.content)
+        )
+        await self.finish(
+            interaction,
+            action="fetch_changes",
+            actor_id=actor_id,
+            embed=render_diff_card(diff, title="Fetched: Server Changes"),
+            detail={"change_count": len(diff.items)},
+        )
+
+    @app_commands.command(name="permissions", description="Fetch Krubit's Discord permissions")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def permissions(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_permissions")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self.capture(guild)
+        report = self._health.permission_health(snapshot)
+        await self.finish(
+            interaction,
+            action="fetch_permissions",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Permissions"),
+            detail={"finding_count": len(report.findings)},
+        )
+
+    @app_commands.command(name="integrations", description="Fetch integration visibility")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def integrations(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_integrations")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self.capture(guild)
+        report = self._health.integration_health(snapshot)
+        await self.finish(
+            interaction,
+            action="fetch_integrations",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Integrations"),
+            detail={"finding_count": len(report.findings)},
+        )
+
+
+class BackupCommands(app_commands.Group):
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(name="backup", description="Fetch configuration backup results")
+        self._parent = parent
+
+    @app_commands.command(name="status", description="Fetch latest snapshot status")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def status(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_backup_status")
+        if context is None:
+            return
+        guild, actor_id = context
+        snapshot = await self._parent.snapshots.latest(guild.id)
+        card = Card(
+            kind="fetched",
+            title="Fetched: Backup Status",
+            description="Latest read-only server configuration snapshot.",
+            fields=(
+                CardField("Version", str(snapshot.version) if snapshot else "None", True),
+                CardField("Integrity", snapshot.content_hash[:12] if snapshot else "None", True),
+                CardField(
+                    "Captured", snapshot.captured_at.isoformat() if snapshot else "Never", False
+                ),
+            ),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_backup_status",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"snapshot_present": snapshot is not None},
+        )
+
+    @app_commands.command(name="create", description="Capture a configuration snapshot")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def create(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_backup_create")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self._parent.capture(guild)
+        card = Card(
+            kind="fetched",
+            title="Fetched: Backup Created",
+            description="Configuration snapshot captured without message or member content.",
+            fields=(
+                CardField("Version", str(snapshot.version), True),
+                CardField("Integrity", snapshot.content_hash[:12], True),
+            ),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_backup_create",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"snapshot_version": snapshot.version},
+        )
+
+    @app_commands.command(name="preview", description="Preview restoring the latest snapshot")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def preview(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_backup_preview")
+        if context is None:
+            return
+        guild, actor_id = context
+        target = await self._parent.snapshots.latest(guild.id)
+        if target is None:
+            card = Card("fetched", "Fetched: Restore Preview", "No snapshot exists yet.")
+            await self._parent.finish(
+                interaction,
+                action="fetch_backup_preview",
+                actor_id=actor_id,
+                embed=render_card(card),
+                detail={"snapshot_present": False},
+            )
+            return
+        inventory = await capture_inventory(
+            guild, required_permissions=phase_one_permissions(), configured_channel_id=None
+        )
+        diff = await self._parent.snapshots.preview_restore(
+            guild.id, target.snapshot_id, inventory
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_backup_preview",
+            actor_id=actor_id,
+            embed=render_diff_card(diff, title="Fetched: Restore Preview"),
+            detail={"change_count": len(diff.items), "mutated": False},
+        )
 
 
 class KrubitBot(discord.Client):

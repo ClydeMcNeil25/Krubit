@@ -5,6 +5,7 @@ from typing import cast
 
 import discord
 import pytest
+from discord import app_commands
 
 from krubit.__main__ import main
 from krubit.config import Settings
@@ -66,15 +67,28 @@ def test_cli_emits_schema_valid_signal_without_token(
 
 
 @pytest.mark.asyncio
-async def test_bot_registers_only_phase_zero_fetch_commands(tmp_path: Path) -> None:
+async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
     settings = Settings.from_env(environment(tmp_path / "krubit.db"))
     store = await SQLiteStore.open(tmp_path / "krubit.db")
     bot = KrubitBot(settings, FoundationService(store))
 
     try:
-        fetch = next(command for command in bot.tree.get_commands() if command.name == "fetch")
+        fetch = cast(
+            app_commands.Group,
+            next(command for command in bot.tree.get_commands() if command.name == "fetch"),
+        )
 
-        assert {command.name for command in fetch.commands} == {"status", "test-card"}  # type: ignore[attr-defined]
+        assert {command.name for command in fetch.commands} == {
+            "status", "test-card", "server-health", "changes",
+            "permissions", "integrations", "backup",
+        }
+        backup = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "backup"),
+        )
+        assert {command.name for command in backup.commands} == {
+            "status", "create", "preview",
+        }
     finally:
         await bot.close()
         await store.close()
