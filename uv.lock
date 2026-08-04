@@ -207,6 +207,7 @@ name = "krubit"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "discord-py" },
     { name = "truststore" },
@@ -222,6 +223,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = "==3.14.3" },
     { name = "aiosqlite", specifier = "==0.22.1" },
     { name = "discord-py", specifier = "==2.7.1" },
     { name = "truststore", specifier = "==0.10.4" },

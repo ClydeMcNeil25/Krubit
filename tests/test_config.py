@@ -61,3 +61,26 @@ def test_settings_reject_invalid_staff_channel_id() -> None:
                 "KRUBIT_STAFF_CHANNEL_ID": "staff-chat",
             }
         )
+
+
+def test_phase_two_settings_parse_twitch_and_default_disabled() -> None:
+    settings = Settings.from_env(
+        {
+            "DISCORD_KRUBIT_APPLICATION_ID": "123456789012345678",
+            "TWITCH_KRUBIT_CLIENT_ID": "client-id",
+            "TWITCH_KRUBIT_CLIENT_SECRET": "client-secret",
+        }
+    )
+
+    assert settings.require_twitch_credentials() == ("client-id", "client-secret")
+    assert settings.live_signals_enabled is False
+
+
+def test_settings_rejects_invalid_live_signals_enabled_value() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_LIVE_SIGNALS_ENABLED"):
+        Settings.from_env(
+            {
+                "DISCORD_KRUBIT_APPLICATION_ID": "123456789012345678",
+                "KRUBIT_LIVE_SIGNALS_ENABLED": "yes",
+            }
+        )

@@ -34,6 +34,19 @@ def phase_one_permissions() -> discord.Permissions:
     return permissions
 
 
+def phase_two_intents() -> discord.Intents:
+    intents = phase_one_intents()
+    intents.presences = True
+    return intents
+
+
+def phase_two_permissions() -> discord.Permissions:
+    permissions = phase_one_permissions()
+    permissions.manage_roles = True
+    permissions.mention_everyone = True
+    return permissions
+
+
 def install_url(application_id: int) -> str:
     if application_id <= 0:
         raise ValueError("application_id must be positive")
@@ -41,7 +54,7 @@ def install_url(application_id: int) -> str:
         {
             "client_id": str(application_id),
             "scope": "bot applications.commands",
-            "permissions": str(phase_one_permissions().value),
+            "permissions": str(phase_two_permissions().value),
             "integration_type": "0",
         }
     )
