@@ -72,6 +72,14 @@ async def test_live_session_and_delivery_are_guild_scoped(tmp_path: Path) -> Non
         assert await store.claim_live_delivery(111, "stream:abc", "session-1") is True
         assert await store.claim_live_delivery(111, "stream:abc", "session-1") is False
         assert await store.claim_live_delivery(222, "stream:abc", "session-1") is True
+        assert await store.claim_live_delivery(111, "provisional:merge", "session-1") is True
+        assert await store.claim_live_delivery(222, "provisional:merge", "session-1") is True
+        await store.merge_live_delivery_identity(
+            111, "provisional:merge", "stream:merged", "session-1"
+        )
+        assert await store.get_live_delivery(111, "provisional:merge") is None
+        assert await store.get_live_delivery(222, "provisional:merge") is not None
+        assert await store.get_live_delivery(222, "stream:merged") is None
     finally:
         await store.close()
 
@@ -246,6 +254,64 @@ async def test_failed_delivery_can_be_claimed_again_for_retry(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_delivery_identity_merge_preserves_failed_retry_under_the_stream_key(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session())
+        assert await store.claim_live_delivery(111, "provisional:session-1", "session-1") is True
+        await store.complete_live_delivery(
+            111,
+            "provisional:session-1",
+            status="failed",
+            channel_id=444,
+            message_id=None,
+        )
+
+        await store.merge_live_delivery_identity(
+            111,
+            "provisional:session-1",
+            "stream:stream-1",
+            "session-1",
+        )
+
+        assert await store.get_live_delivery(111, "provisional:session-1") is None
+        delivery = await store.get_live_delivery(111, "stream:stream-1")
+        assert delivery is not None
+        assert delivery.session_key == "session-1"
+        assert delivery.status == "failed"
+        assert await store.claim_live_delivery(111, "stream:stream-1", "session-1") is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_identity_merge_preserves_a_claim_so_stream_enrichment_cannot_duplicate(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session())
+        assert await store.claim_live_delivery(111, "provisional:session-1", "session-1") is True
+
+        await store.merge_live_delivery_identity(
+            111,
+            "provisional:session-1",
+            "stream:stream-1",
+            "session-1",
+        )
+
+        delivery = await store.get_live_delivery(111, "stream:stream-1")
+        assert delivery is not None and delivery.status == "claimed"
+        assert await store.claim_live_delivery(111, "stream:stream-1", "session-1") is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_live_check_details_are_redacted_before_storage(tmp_path: Path) -> None:
     store = await SQLiteStore.open(tmp_path / "krubit.db")
     try:
@@ -320,6 +386,10 @@ async def test_live_signal_methods_reject_nonpositive_guild_ids(tmp_path: Path) 
             await store.list_active_live_sessions(0)
         with pytest.raises(ValueError, match="guild_id must be positive"):
             await store.claim_live_delivery(0, "stream:abc", "session-1")
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.get_live_delivery(0, "stream:abc")
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.merge_live_delivery_identity(0, "provisional:a", "stream:a", "session-1")
         with pytest.raises(ValueError, match="guild_id must be positive"):
             await store.complete_live_delivery(
                 0, "stream:abc", status="failed", channel_id=None, message_id=None

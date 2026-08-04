@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -47,6 +48,18 @@ def _optional_int(value: object) -> int | None:
     if not isinstance(value, (int, str)):
         raise ValueError("stored identifier must be an integer")
     return int(value)
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSignalDelivery:
+    """A guild-scoped durable announcement claim."""
+
+    guild_id: int
+    delivery_key: str
+    session_key: str
+    status: str
+    channel_id: int | None
+    message_id: int | None
 
 
 class SQLiteStore:
@@ -488,6 +501,105 @@ class SQLiteStore:
         await self._connection.commit()
         return cursor.rowcount == 1
 
+    async def get_live_delivery(
+        self, guild_id: int, delivery_key: str
+    ) -> LiveSignalDelivery | None:
+        """Look up one guild-scoped delivery claim without exposing message content."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+            FROM live_signal_deliveries
+            WHERE guild_id = ? AND delivery_key = ?
+            """,
+            (guild_id, delivery_key),
+        )
+        return self._live_signal_delivery_from_row(await cursor.fetchone())
+
+    async def merge_live_delivery_identity(
+        self,
+        guild_id: int,
+        provisional_key: str,
+        stream_key: str,
+        session_key: str,
+    ) -> None:
+        """Atomically carry a provisional claim forward once Helix supplies a stream ID."""
+        _require_guild_id(guild_id)
+        if not provisional_key or not stream_key or not session_key:
+            raise ValueError("delivery and session keys must not be blank")
+        await self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            source_cursor = await self._connection.execute(
+                """
+                SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+                FROM live_signal_deliveries
+                WHERE guild_id = ? AND delivery_key = ?
+                """,
+                (guild_id, provisional_key),
+            )
+            destination_cursor = await self._connection.execute(
+                """
+                SELECT guild_id, delivery_key, session_key, status, channel_id, message_id
+                FROM live_signal_deliveries
+                WHERE guild_id = ? AND delivery_key = ?
+                """,
+                (guild_id, stream_key),
+            )
+            source = self._live_signal_delivery_from_row(await source_cursor.fetchone())
+            destination = self._live_signal_delivery_from_row(await destination_cursor.fetchone())
+            if source is not None and provisional_key != stream_key and destination is None:
+                await self._connection.execute(
+                    """
+                    UPDATE live_signal_deliveries
+                    SET delivery_key = ?, session_key = ?, updated_at = ?
+                    WHERE guild_id = ? AND delivery_key = ?
+                    """,
+                    (
+                        stream_key,
+                        session_key,
+                        datetime.now(UTC).isoformat(),
+                        guild_id,
+                        provisional_key,
+                    ),
+                )
+            elif source is not None and provisional_key != stream_key and destination is not None:
+                retained = max((source, destination), key=self._delivery_priority)
+                await self._connection.execute(
+                    """
+                    UPDATE live_signal_deliveries
+                    SET session_key = ?, status = ?, channel_id = ?, message_id = ?, updated_at = ?
+                    WHERE guild_id = ? AND delivery_key = ?
+                    """,
+                    (
+                        session_key,
+                        retained.status,
+                        retained.channel_id,
+                        retained.message_id,
+                        datetime.now(UTC).isoformat(),
+                        guild_id,
+                        stream_key,
+                    ),
+                )
+                await self._connection.execute(
+                    """
+                    DELETE FROM live_signal_deliveries
+                    WHERE guild_id = ? AND delivery_key = ?
+                    """,
+                    (guild_id, provisional_key),
+                )
+            elif destination is not None:
+                await self._connection.execute(
+                    """
+                    UPDATE live_signal_deliveries SET session_key = ?, updated_at = ?
+                    WHERE guild_id = ? AND delivery_key = ?
+                    """,
+                    (session_key, datetime.now(UTC).isoformat(), guild_id, stream_key),
+                )
+            await self._connection.commit()
+        except BaseException:
+            await self._connection.rollback()
+            raise
+
     async def complete_live_delivery(
         self,
         guild_id: int,
@@ -552,6 +664,25 @@ class SQLiteStore:
             role_id=int(row["role_id"]),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
+
+    @staticmethod
+    def _live_signal_delivery_from_row(
+        row: aiosqlite.Row | None,
+    ) -> LiveSignalDelivery | None:
+        if row is None:
+            return None
+        return LiveSignalDelivery(
+            guild_id=int(row["guild_id"]),
+            delivery_key=str(row["delivery_key"]),
+            session_key=str(row["session_key"]),
+            status=str(row["status"]),
+            channel_id=_optional_int(row["channel_id"]),
+            message_id=_optional_int(row["message_id"]),
+        )
+
+    @staticmethod
+    def _delivery_priority(delivery: LiveSignalDelivery) -> int:
+        return {"failed": 0, "claimed": 1, "succeeded": 2}.get(delivery.status, 3)
 
     @staticmethod
     def _live_signal_session_from_row(row: aiosqlite.Row | None) -> LiveSignalSession | None:
