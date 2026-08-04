@@ -20,7 +20,7 @@ def test_redact_removes_discord_token_and_assignment_secrets_recursively() -> No
 
     assert result == {
         "message": "paste [REDACTED_DISCORD_TOKEN] here",
-        "nested": ["api_key=[REDACTED]", {"password": "password: [REDACTED]"}],
+        "nested": ["api_key=[REDACTED]", {"password": "[REDACTED]"}],
         "count": 7,
         "active": True,
         "missing": None,
@@ -29,6 +29,20 @@ def test_redact_removes_discord_token_and_assignment_secrets_recursively() -> No
 
 def test_redact_preserves_ordinary_text() -> None:
     assert redact("Krubit fetched the server status") == "Krubit fetched the server status"
+
+
+def test_redact_removes_plain_values_under_sensitive_keys() -> None:
+    assert redact(
+        {
+            "bot_token": "plain-value",
+            "nested": {"api-key": "another-value"},
+            "safe": "visible",
+        }
+    ) == {
+        "bot_token": "[REDACTED]",
+        "nested": {"api-key": "[REDACTED]"},
+        "safe": "visible",
+    }
 
 
 def test_guild_event_rejects_blank_event_id() -> None:

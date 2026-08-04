@@ -11,6 +11,9 @@ _ASSIGNMENT_SECRET = re.compile(
     r"(?i)\b(api[_ -]?key|bot[_ -]?token|access[_ -]?token|password|secret)\b"
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
+_SENSITIVE_KEY = re.compile(
+    r"(?i)^(api[_ -]?key|bot[_ -]?token|access[_ -]?token|password|secret)$"
+)
 
 
 def _redact_text(value: str) -> str:
@@ -28,5 +31,8 @@ def redact(value: JSONValue) -> JSONValue:
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): redact(item) for key, item in value.items()}
+        return {
+            str(key): "[REDACTED]" if _SENSITIVE_KEY.fullmatch(str(key)) else redact(item)
+            for key, item in value.items()
+        }
     return value
