@@ -11,6 +11,7 @@ htmlcov/
 .worktrees/
 dist/
 logs/
+.runtime/
 data/
 *.db
 *.db-shm
