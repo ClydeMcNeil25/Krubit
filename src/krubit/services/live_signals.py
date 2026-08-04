@@ -111,6 +111,9 @@ class LiveSignalService:
                         ended_at=now,
                     )
                 )
+                await self._store.cancel_claimed_live_deliveries(
+                    observation.guild_id, active.session_key
+                )
             provisional = LiveSignalSession(
                 guild_id=observation.guild_id,
                 session_key=provisional_session_key(observation),
@@ -215,6 +218,7 @@ class LiveSignalService:
                             ended_at=now,
                         )
                     )
+                    await self._store.cancel_claimed_live_deliveries(guild_id, session.session_key)
 
     async def recover_pending(self, guild_id: int) -> tuple[LiveSignalPlan, ...]:
         """Rebuild runtime-only execution plans from durable claimed deliveries."""
@@ -540,7 +544,7 @@ class LiveSignalService:
         )
 
     async def _end(self, session: LiveSignalSession, now: datetime) -> LiveSignalSession:
-        return await self._store.save_live_session(
+        ended = await self._store.save_live_session(
             replace(
                 session,
                 status=LiveSignalStatus.ENDED,
@@ -548,6 +552,8 @@ class LiveSignalService:
                 ended_at=now,
             )
         )
+        await self._store.cancel_claimed_live_deliveries(session.guild_id, session.session_key)
+        return ended
 
     @staticmethod
     def _plan(

@@ -579,6 +579,18 @@ class SQLiteStore:
         deliveries = [self._live_signal_delivery_from_row(row) for row in await cursor.fetchall()]
         return [delivery for delivery in deliveries if delivery is not None]
 
+    async def cancel_claimed_live_deliveries(self, guild_id: int, session_key: str) -> None:
+        """Retire pending execution for a terminal session without deleting audit history."""
+        _require_guild_id(guild_id)
+        await self._connection.execute(
+            """
+            UPDATE live_signal_deliveries SET status = 'cancelled', updated_at = ?
+            WHERE guild_id = ? AND session_key = ? AND status = 'claimed'
+            """,
+            (datetime.now(UTC).isoformat(), guild_id, session_key),
+        )
+        await self._connection.commit()
+
     async def merge_live_delivery_identity(
         self,
         guild_id: int,

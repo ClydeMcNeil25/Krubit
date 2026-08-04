@@ -691,3 +691,29 @@ async def test_late_role_callback_cannot_revive_an_ended_session(store: SQLiteSt
     assert terminal.status is LiveSignalStatus.ENDED and terminal.ended_at == NOW
     assert terminal.role_assigned_by_krubit is False
     assert await service.recover_pending(111) == ()
+
+
+@pytest.mark.asyncio
+async def test_terminal_session_cancels_claimed_delivery_without_reclaiming(
+    store: SQLiteStore,
+) -> None:
+    service = LiveSignalService(
+        store,
+        FakeTwitch(
+            [TwitchLookup(TwitchLookupKind.LIVE, stream()), TwitchLookup(TwitchLookupKind.OFFLINE)]
+        ),
+    )
+    initial = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, initial.session_key, role_id=333, assigned_by_krubit=False, status="failed"
+    )
+
+    await service.reconcile(111, now=NOW + timedelta(minutes=1))
+
+    delivery = await store.get_live_delivery(111, "stream:stream-1")
+    ended = await store.get_live_session(111, initial.session_key)
+    assert ended is not None and ended.status is LiveSignalStatus.ENDED
+    assert delivery is not None and delivery.status == "cancelled"
+    assert await service.recover_pending(111) == ()
+    attempt = await store.claim_live_delivery_attempt(111, "stream:stream-1", initial.session_key)
+    assert attempt is None
