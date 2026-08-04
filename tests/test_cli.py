@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
+import discord
 import pytest
 
 from krubit.__main__ import main
@@ -72,6 +75,25 @@ async def test_bot_registers_only_phase_zero_fetch_commands(tmp_path: Path) -> N
         fetch = next(command for command in bot.tree.get_commands() if command.name == "fetch")
 
         assert {command.name for command in fetch.commands} == {"status", "test-card"}  # type: ignore[attr-defined]
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_records_guild_installed_while_runtime_is_connected(tmp_path: Path) -> None:
+    settings = Settings.from_env(environment(tmp_path / "krubit.db"))
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    bot = KrubitBot(settings, FoundationService(store))
+    guild = cast(discord.Guild, SimpleNamespace(id=111, name="Krucial Town"))
+
+    try:
+        await bot.on_guild_join(guild)
+
+        event_count, _ = await store.counts(111)
+        assert event_count == 1
     finally:
         await bot.close()
         await store.close()

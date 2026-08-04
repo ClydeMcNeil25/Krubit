@@ -93,7 +93,7 @@ class KrubitBot(discord.Client):
     async def setup_hook(self) -> None:
         await self.tree.sync()
 
-    async def on_guild_available(self, guild: discord.Guild) -> None:
+    async def _record_guild_connection(self, guild: discord.Guild) -> None:
         event = GuildEvent(
             event_id=f"guild_available:{guild.id}:{self._boot_id}",
             guild_id=guild.id,
@@ -105,3 +105,9 @@ class KrubitBot(discord.Client):
             await self._service.ingest(event)
         except GuildDisabledError:
             return
+
+    async def on_guild_available(self, guild: discord.Guild) -> None:
+        await self._record_guild_connection(guild)
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self._record_guild_connection(guild)
