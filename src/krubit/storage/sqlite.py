@@ -12,6 +12,12 @@ from uuid import uuid4
 import aiosqlite
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
+from krubit.domain.live_signals import (
+    LiveSignalConfig,
+    LiveSignalSession,
+    LiveSignalStatus,
+    TwitchStream,
+)
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
 from krubit.security.redaction import redact
 
@@ -20,6 +26,27 @@ def _json_object(value: object) -> dict[str, JSONValue]:
     if not isinstance(value, dict):
         raise ValueError("stored JSON must be an object")
     return {str(key): item for key, item in value.items()}  # type: ignore[misc]
+
+
+def _require_guild_id(guild_id: int) -> None:
+    if guild_id <= 0:
+        raise ValueError("guild_id must be positive")
+
+
+def _stored_timestamp(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _parsed_optional_timestamp(value: object) -> datetime | None:
+    return datetime.fromisoformat(str(value)) if value is not None else None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, str)):
+        raise ValueError("stored identifier must be an integer")
+    return int(value)
 
 
 class SQLiteStore:
@@ -93,12 +120,370 @@ class SQLiteStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (guild_id, summary_date)
             );
+
+            CREATE TABLE IF NOT EXISTS live_signal_config (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS live_signal_sessions (
+                guild_id INTEGER NOT NULL,
+                session_key TEXT NOT NULL,
+                member_id INTEGER NOT NULL,
+                twitch_login TEXT NOT NULL,
+                twitch_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                presence_started_at TEXT,
+                detected_at TEXT NOT NULL,
+                stream_id TEXT,
+                stream_display_name TEXT,
+                stream_title TEXT,
+                stream_category TEXT,
+                stream_started_at TEXT,
+                thumbnail_url TEXT,
+                announcement_channel_id INTEGER,
+                announcement_message_id INTEGER,
+                role_id INTEGER,
+                role_assigned_by_krubit INTEGER NOT NULL DEFAULT 0
+                    CHECK (role_assigned_by_krubit IN (0, 1)),
+                presence_active INTEGER NOT NULL DEFAULT 1
+                    CHECK (presence_active IN (0, 1)),
+                missing_since TEXT,
+                last_discord_at TEXT NOT NULL,
+                last_twitch_at TEXT,
+                ended_at TEXT,
+                PRIMARY KEY (guild_id, session_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_live_sessions_guild_status_detected
+                ON live_signal_sessions (guild_id, status, detected_at DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_live_sessions_guild_stream
+                ON live_signal_sessions (guild_id, stream_id)
+                WHERE stream_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS live_signal_deliveries (
+                guild_id INTEGER NOT NULL,
+                delivery_key TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, delivery_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS live_signal_checks (
+                guild_id INTEGER NOT NULL,
+                check_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                result TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, check_id)
+            );
             """
         )
         await self._connection.commit()
 
     async def close(self) -> None:
         await self._connection.close()
+
+    async def set_live_signal_config(self, config: LiveSignalConfig) -> None:
+        """Persist the configured notification resources by their stable Discord IDs."""
+        _require_guild_id(config.guild_id)
+        await self._connection.execute(
+            """
+            INSERT INTO live_signal_config (guild_id, channel_id, role_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                role_id = excluded.role_id,
+                updated_at = excluded.updated_at
+            """,
+            (config.guild_id, config.channel_id, config.role_id, config.updated_at.isoformat()),
+        )
+        await self._connection.commit()
+
+    async def get_live_signal_config(self, guild_id: int) -> LiveSignalConfig | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM live_signal_config WHERE guild_id = ?", (guild_id,)
+        )
+        return self._live_signal_config_from_row(await cursor.fetchone())
+
+    async def save_live_session(self, session: LiveSignalSession) -> LiveSignalSession:
+        """Insert or update a session, retaining its first durable key for a known stream."""
+        _require_guild_id(session.guild_id)
+        stream = session.stream
+        await self._connection.execute(
+            """
+            INSERT INTO live_signal_sessions (
+                guild_id, session_key, member_id, twitch_login, twitch_url, status,
+                presence_started_at, detected_at, stream_id, stream_display_name,
+                stream_title, stream_category, stream_started_at, thumbnail_url,
+                announcement_channel_id, announcement_message_id, role_id,
+                role_assigned_by_krubit, presence_active, missing_since, last_discord_at,
+                last_twitch_at, ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, session_key) DO UPDATE SET
+                member_id = excluded.member_id,
+                twitch_login = excluded.twitch_login,
+                twitch_url = excluded.twitch_url,
+                status = excluded.status,
+                presence_started_at = excluded.presence_started_at,
+                detected_at = excluded.detected_at,
+                stream_id = excluded.stream_id,
+                stream_display_name = excluded.stream_display_name,
+                stream_title = excluded.stream_title,
+                stream_category = excluded.stream_category,
+                stream_started_at = excluded.stream_started_at,
+                thumbnail_url = excluded.thumbnail_url,
+                announcement_channel_id = excluded.announcement_channel_id,
+                announcement_message_id = excluded.announcement_message_id,
+                role_id = excluded.role_id,
+                role_assigned_by_krubit = excluded.role_assigned_by_krubit,
+                presence_active = excluded.presence_active,
+                missing_since = excluded.missing_since,
+                last_discord_at = excluded.last_discord_at,
+                last_twitch_at = excluded.last_twitch_at,
+                ended_at = excluded.ended_at
+            ON CONFLICT(guild_id, stream_id) WHERE stream_id IS NOT NULL DO UPDATE SET
+                member_id = excluded.member_id,
+                twitch_login = excluded.twitch_login,
+                twitch_url = excluded.twitch_url,
+                status = excluded.status,
+                presence_started_at = excluded.presence_started_at,
+                detected_at = excluded.detected_at,
+                stream_display_name = excluded.stream_display_name,
+                stream_title = excluded.stream_title,
+                stream_category = excluded.stream_category,
+                stream_started_at = excluded.stream_started_at,
+                thumbnail_url = excluded.thumbnail_url,
+                announcement_channel_id = excluded.announcement_channel_id,
+                announcement_message_id = excluded.announcement_message_id,
+                role_id = excluded.role_id,
+                role_assigned_by_krubit = excluded.role_assigned_by_krubit,
+                presence_active = excluded.presence_active,
+                missing_since = excluded.missing_since,
+                last_discord_at = excluded.last_discord_at,
+                last_twitch_at = excluded.last_twitch_at,
+                ended_at = excluded.ended_at
+            """,
+            (
+                session.guild_id,
+                session.session_key,
+                session.member_id,
+                session.twitch_login,
+                session.twitch_url,
+                session.status.value,
+                _stored_timestamp(session.presence_started_at),
+                session.detected_at.isoformat(),
+                stream.stream_id if stream is not None else None,
+                stream.user_name if stream is not None else None,
+                stream.title if stream is not None else None,
+                stream.game_name if stream is not None else None,
+                _stored_timestamp(stream.started_at) if stream is not None else None,
+                stream.thumbnail_url if stream is not None else None,
+                session.announcement_channel_id,
+                session.announcement_message_id,
+                session.role_id,
+                int(session.role_assigned_by_krubit),
+                int(session.presence_active),
+                _stored_timestamp(session.missing_since),
+                _stored_timestamp(session.last_discord_at or session.detected_at),
+                _stored_timestamp(session.last_twitch_at),
+                _stored_timestamp(session.ended_at),
+            ),
+        )
+        await self._connection.commit()
+        session_key = session.session_key
+        if stream is not None:
+            cursor = await self._connection.execute(
+                """
+                SELECT session_key FROM live_signal_sessions
+                WHERE guild_id = ? AND stream_id = ?
+                """,
+                (session.guild_id, stream.stream_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("saved live session stream could not be read")
+            session_key = str(row["session_key"])
+        saved = await self.get_live_session(session.guild_id, session_key)
+        if saved is None:
+            raise RuntimeError("saved live session could not be read")
+        return saved
+
+    async def open_live_session(
+        self, guild_id: int, member_id: int, twitch_login: str
+    ) -> LiveSignalSession | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM live_signal_sessions
+            WHERE guild_id = ? AND member_id = ? AND twitch_login = ?
+                AND status != ? AND ended_at IS NULL
+            ORDER BY detected_at DESC, session_key DESC
+            LIMIT 1
+            """,
+            (guild_id, member_id, twitch_login, LiveSignalStatus.ENDED.value),
+        )
+        return self._live_signal_session_from_row(await cursor.fetchone())
+
+    async def get_live_session(
+        self, guild_id: int, session_key: str
+    ) -> LiveSignalSession | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM live_signal_sessions
+            WHERE guild_id = ? AND session_key = ?
+            """,
+            (guild_id, session_key),
+        )
+        return self._live_signal_session_from_row(await cursor.fetchone())
+
+    async def list_active_live_sessions(self, guild_id: int) -> list[LiveSignalSession]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM live_signal_sessions
+            WHERE guild_id = ? AND status != ? AND ended_at IS NULL
+            ORDER BY detected_at DESC, session_key DESC
+            """,
+            (guild_id, LiveSignalStatus.ENDED.value),
+        )
+        return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
+
+    async def claim_live_delivery(
+        self, guild_id: int, delivery_key: str, session_key: str
+    ) -> bool:
+        _require_guild_id(guild_id)
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._connection.execute(
+            """
+            INSERT INTO live_signal_deliveries (
+                guild_id, delivery_key, session_key, status, channel_id, message_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'claimed', NULL, NULL, ?, ?)
+            ON CONFLICT(guild_id, delivery_key) DO UPDATE SET
+                session_key = excluded.session_key,
+                status = 'claimed',
+                updated_at = excluded.updated_at
+            WHERE live_signal_deliveries.status = 'failed'
+            """,
+            (guild_id, delivery_key, session_key, now, now),
+        )
+        await self._connection.commit()
+        return cursor.rowcount == 1
+
+    async def complete_live_delivery(
+        self,
+        guild_id: int,
+        delivery_key: str,
+        *,
+        status: str,
+        channel_id: int | None,
+        message_id: int | None,
+    ) -> None:
+        _require_guild_id(guild_id)
+        await self._connection.execute(
+            """
+            UPDATE live_signal_deliveries
+            SET status = ?, channel_id = ?, message_id = ?, updated_at = ?
+            WHERE guild_id = ? AND delivery_key = ?
+            """,
+            (status, channel_id, message_id, datetime.now(UTC).isoformat(), guild_id, delivery_key),
+        )
+        await self._connection.commit()
+
+    async def record_live_check(
+        self,
+        guild_id: int,
+        check_id: str,
+        session_key: str,
+        *,
+        result: str,
+        detail: dict[str, JSONValue],
+        checked_at: datetime,
+    ) -> None:
+        _require_guild_id(guild_id)
+        safe_detail = _json_object(redact(detail))
+        await self._connection.execute(
+            """
+            INSERT INTO live_signal_checks (
+                guild_id, check_id, session_key, result, detail_json, checked_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, check_id) DO UPDATE SET
+                session_key = excluded.session_key,
+                result = excluded.result,
+                detail_json = excluded.detail_json,
+                checked_at = excluded.checked_at
+            """,
+            (
+                guild_id,
+                check_id,
+                session_key,
+                result,
+                json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                checked_at.isoformat(),
+            ),
+        )
+        await self._connection.commit()
+
+    @staticmethod
+    def _live_signal_config_from_row(row: aiosqlite.Row | None) -> LiveSignalConfig | None:
+        if row is None:
+            return None
+        return LiveSignalConfig(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            role_id=int(row["role_id"]),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _live_signal_session_from_row(row: aiosqlite.Row | None) -> LiveSignalSession | None:
+        return SQLiteStore._live_signal_session_from_stored_row(row) if row is not None else None
+
+    @staticmethod
+    def _live_signal_session_from_stored_row(row: aiosqlite.Row) -> LiveSignalSession:
+        stream_id = row["stream_id"]
+        stream = None
+        if stream_id is not None:
+            stream = TwitchStream(
+                stream_id=str(stream_id),
+                user_login=str(row["twitch_login"]),
+                user_name=str(row["stream_display_name"]),
+                title=str(row["stream_title"]),
+                game_name=str(row["stream_category"]),
+                started_at=datetime.fromisoformat(str(row["stream_started_at"])),
+                thumbnail_url=str(row["thumbnail_url"]),
+            )
+        return LiveSignalSession(
+            guild_id=int(row["guild_id"]),
+            session_key=str(row["session_key"]),
+            member_id=int(row["member_id"]),
+            twitch_login=str(row["twitch_login"]),
+            twitch_url=str(row["twitch_url"]),
+            status=LiveSignalStatus(str(row["status"])),
+            detected_at=datetime.fromisoformat(str(row["detected_at"])),
+            presence_started_at=_parsed_optional_timestamp(row["presence_started_at"]),
+            stream=stream,
+            announcement_channel_id=_optional_int(row["announcement_channel_id"]),
+            announcement_message_id=_optional_int(row["announcement_message_id"]),
+            role_id=_optional_int(row["role_id"]),
+            role_assigned_by_krubit=bool(row["role_assigned_by_krubit"]),
+            presence_active=bool(row["presence_active"]),
+            missing_since=_parsed_optional_timestamp(row["missing_since"]),
+            last_discord_at=_parsed_optional_timestamp(row["last_discord_at"]),
+            last_twitch_at=_parsed_optional_timestamp(row["last_twitch_at"]),
+            ended_at=_parsed_optional_timestamp(row["ended_at"]),
+        )
 
     async def set_guild_enabled(self, guild_id: int, enabled: bool) -> None:
         if guild_id <= 0:

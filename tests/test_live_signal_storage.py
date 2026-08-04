@@ -1,0 +1,255 @@
+"""Integration tests for guild-scoped live signal persistence."""
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import aiosqlite
+import pytest
+
+from krubit.domain.live_signals import (
+    LiveSignalConfig,
+    LiveSignalSession,
+    LiveSignalStatus,
+    TwitchStream,
+)
+from krubit.domain.models import GuildEvent
+from krubit.storage.sqlite import SQLiteStore
+
+NOW = datetime(2026, 8, 4, 20, 14, tzinfo=UTC)
+
+
+def stream(stream_id: str = "stream-1") -> TwitchStream:
+    return TwitchStream(
+        stream_id=stream_id,
+        user_login="krucialstudios",
+        user_name="Krucial Studios",
+        title="Building Krucial Town",
+        game_name="Just Chatting",
+        started_at=NOW,
+        thumbnail_url="https://example.test/preview.jpg",
+    )
+
+
+def session(
+    *,
+    guild_id: int = 111,
+    session_key: str = "session-1",
+    detected_at: datetime = NOW,
+    stream_value: TwitchStream | None = None,
+    role_assigned_by_krubit: bool = False,
+) -> LiveSignalSession:
+    return LiveSignalSession(
+        guild_id=guild_id,
+        session_key=session_key,
+        member_id=222,
+        twitch_login="krucialstudios",
+        twitch_url="https://twitch.tv/krucialstudios",
+        status=LiveSignalStatus.LIVE,
+        detected_at=detected_at,
+        presence_started_at=NOW - timedelta(minutes=2),
+        stream=stream_value,
+        role_id=333,
+        role_assigned_by_krubit=role_assigned_by_krubit,
+        last_discord_at=NOW,
+        last_twitch_at=NOW,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_session_and_delivery_are_guild_scoped(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session(guild_id=111))
+
+        assert await store.get_live_session(111, "session-1") is not None
+        assert await store.get_live_session(222, "session-1") is None
+        opened = await store.open_live_session(111, 222, "krucialstudios")
+        assert opened is not None and opened.session_key == "session-1"
+        assert await store.open_live_session(222, 222, "krucialstudios") is None
+        assert await store.claim_live_delivery(111, "stream:abc", "session-1") is True
+        assert await store.claim_live_delivery(111, "stream:abc", "session-1") is False
+        assert await store.claim_live_delivery(222, "stream:abc", "session-1") is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_config_keeps_configured_ids_after_resources_are_renamed(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        configured = LiveSignalConfig(111, 444, 555, NOW)
+        await store.set_live_signal_config(configured)
+
+        assert await store.get_live_signal_config(111) == configured
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_sessions_are_newest_first_and_exclude_ended(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session(session_key="older", detected_at=NOW))
+        await store.save_live_session(
+            session(session_key="newer", detected_at=NOW + timedelta(minutes=1))
+        )
+        await store.save_live_session(
+            replace(
+                session(session_key="ended", detected_at=NOW + timedelta(minutes=2)),
+                status=LiveSignalStatus.ENDED,
+                ended_at=NOW + timedelta(minutes=3),
+            )
+        )
+
+        assert [item.session_key for item in await store.list_active_live_sessions(111)] == [
+            "newer",
+            "older",
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_saving_enriched_session_merges_stream_id_without_duplicate_row(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session(stream_value=stream()))
+        await store.save_live_session(
+            session(session_key="later-observation", stream_value=stream())
+        )
+
+        saved = await store.get_live_session(111, "session-1")
+        assert saved is not None and saved.stream == stream()
+        assert await store.get_live_session(111, "later-observation") is None
+        async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
+            cursor = await connection.execute("SELECT COUNT(*) FROM live_signal_sessions")
+            row = await cursor.fetchone()
+        assert row is not None and row[0] == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_retains_preexisting_role_ownership(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(session(role_assigned_by_krubit=False))
+
+        saved = await store.get_live_session(111, "session-1")
+        assert saved is not None and saved.role_assigned_by_krubit is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_can_be_claimed_again_for_retry(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        assert await store.claim_live_delivery(111, "stream:abc", "session-1") is True
+        await store.complete_live_delivery(
+            111,
+            "stream:abc",
+            status="failed",
+            channel_id=444,
+            message_id=None,
+        )
+
+        assert await store.claim_live_delivery(111, "stream:abc", "session-1") is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_check_details_are_redacted_before_storage(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.record_live_check(
+            111,
+            "check-1",
+            "session-1",
+            result="unavailable",
+            detail={"secret": "do-not-store"},
+            checked_at=NOW,
+        )
+
+        async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
+            cursor = await connection.execute("SELECT detail_json FROM live_signal_checks")
+            row = await cursor.fetchone()
+        assert row is not None
+        assert "do-not-store" not in str(row[0])
+        assert '"secret":"[REDACTED]"' in str(row[0])
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_phase_one_database_without_losing_events(tmp_path: Path) -> None:
+    database = tmp_path / "krubit.db"
+    async with aiosqlite.connect(database) as connection:
+        await connection.executescript(
+            """
+            CREATE TABLE guild_events (
+                guild_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (guild_id, event_id)
+            );
+            INSERT INTO guild_events VALUES (111, 'phase-one', 'ready',
+                '2026-08-04T20:14:00+00:00', '{"source":"phase-one"}');
+            """
+        )
+        await connection.commit()
+
+    store = await SQLiteStore.open(database)
+    try:
+        await store.initialize()
+        event = await store.get_event(111, "phase-one")
+        assert event == GuildEvent(
+            event_id="phase-one",
+            guild_id=111,
+            event_type="ready",
+            occurred_at=NOW,
+            payload={"source": "phase-one"},
+        )
+        assert await store.get_live_signal_config(111) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_signal_methods_reject_nonpositive_guild_ids(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.get_live_signal_config(0)
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.get_live_session(0, "session-1")
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.open_live_session(0, 222, "krucialstudios")
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.list_active_live_sessions(0)
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.claim_live_delivery(0, "stream:abc", "session-1")
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.complete_live_delivery(
+                0, "stream:abc", status="failed", channel_id=None, message_id=None
+            )
+        with pytest.raises(ValueError, match="guild_id must be positive"):
+            await store.record_live_check(
+                0, "check-1", "session-1", result="ok", detail={}, checked_at=NOW
+            )
+    finally:
+        await store.close()
