@@ -86,17 +86,19 @@ class FetchCommands(app_commands.Group):
         )
         await interaction.edit_original_response(embed=embed)
 
-    @app_commands.command(name="status", description="Fetch Krubit's Phase 0 status")
+    @app_commands.command(name="status", description="Fetch Krubit's Phase 1 status")
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def status(self, interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+        context = await self.authorize(interaction, "fetch_status")
+        if context is None:
             return
-        snapshot = await self._service.status(interaction.guild_id)
+        guild, actor_id = context
+        snapshot = await self._service.status(guild.id, actor_id=actor_id)
         card = Card(
             kind="fetched",
             title="🦴 Fetched: Krubit Status",
-            description="Krubit's Phase 0 foundation status.",
+            description="Krubit's Phase 1 operational status.",
             fields=(
                 CardField("Enabled", "Yes" if snapshot.enabled else "No", inline=True),
                 CardField("Events", str(snapshot.event_count), inline=True),
@@ -108,7 +110,7 @@ class FetchCommands(app_commands.Group):
                 ),
             ),
         )
-        await interaction.response.send_message(embed=render_card(card), ephemeral=True)
+        await interaction.edit_original_response(embed=render_card(card))
 
     @app_commands.command(name="test-card", description="Fetch an administrator test card")
     @app_commands.guild_only()
@@ -337,48 +339,106 @@ class KrubitBot(discord.Client):
     async def run_daily_summary_for_guild(
         self, guild: discord.Guild, summary_date: date
     ) -> DailySummaryResult:
+        if not await self._service.store.guild_is_enabled(guild.id):
+            return DailySummaryResult(guild.id, summary_date, "guild_disabled", None)
         claimed = await self._daily_summaries.claim(guild.id, summary_date)
         if not claimed:
             return DailySummaryResult(guild.id, summary_date, "already_claimed", None)
         channel_id = self._settings.staff_channel_id
         if channel_id is None:
-            result = await self._daily_summaries.record_outcome(
-                guild.id, summary_date, status="delivery_disabled", channel_id=None
-            )
-            await self._service.record_action(
+            return await self._record_daily_summary_outcome(
                 guild.id,
-                action="daily_health_summary",
+                summary_date,
                 status="delivery_disabled",
-                actor_id=None,
+                channel_id=None,
+                receipt_status="delivery_disabled",
                 detail={"reason": "staff_channel_not_configured"},
             )
-            return result
         channel = guild.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
-            return await self._daily_summaries.record_outcome(
-                guild.id, summary_date, status="channel_missing", channel_id=channel_id
+            return await self._record_daily_summary_outcome(
+                guild.id,
+                summary_date,
+                status="channel_missing",
+                channel_id=channel_id,
+                receipt_status="failed",
+                detail={"channel_id": channel_id, "reason": "staff_channel_missing"},
             )
-        inventory = await capture_inventory(
-            guild,
-            required_permissions=phase_one_permissions(),
-            configured_channel_id=channel_id,
+        permissions = channel.permissions_for(guild.me)
+        if not all(
+            (
+                permissions.view_channel,
+                permissions.send_messages,
+                permissions.embed_links,
+            )
+        ):
+            return await self._record_daily_summary_outcome(
+                guild.id,
+                summary_date,
+                status="permission_missing",
+                channel_id=channel_id,
+                receipt_status="failed",
+                detail={"channel_id": channel_id, "reason": "staff_channel_not_writable"},
+            )
+        try:
+            inventory = await capture_inventory(
+                guild,
+                required_permissions=phase_one_permissions(),
+                configured_channel_id=channel_id,
+            )
+            snapshot = await SnapshotService(self._service.store).capture(
+                guild.id, inventory, datetime.now(UTC)
+            )
+            report = HealthService().server_health(
+                snapshot,
+                now=datetime.now(UTC),
+                database_healthy=True,
+                gateway_ready=self.is_ready(),
+            )
+            await channel.send(
+                embed=render_health_card(report, title="Krubit Daily Server Health")
+            )
+        except Exception as exc:
+            return await self._record_daily_summary_outcome(
+                guild.id,
+                summary_date,
+                status="failed",
+                channel_id=channel_id,
+                receipt_status="failed",
+                detail={
+                    "channel_id": channel_id,
+                    "error_type": type(exc).__name__,
+                    "reason": "discord_delivery_failed",
+                },
+            )
+        return await self._record_daily_summary_outcome(
+            guild.id,
+            summary_date,
+            status="sent",
+            channel_id=channel_id,
+            receipt_status="succeeded",
+            detail={"channel_id": channel_id, "snapshot_version": snapshot.version},
         )
-        snapshot = await SnapshotService(self._service.store).capture(
-            guild.id, inventory, datetime.now(UTC)
-        )
-        report = HealthService().server_health(
-            snapshot, now=datetime.now(UTC), database_healthy=True, gateway_ready=self.is_ready()
-        )
-        await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))
+
+    async def _record_daily_summary_outcome(
+        self,
+        guild_id: int,
+        summary_date: date,
+        *,
+        status: str,
+        channel_id: int | None,
+        receipt_status: str,
+        detail: dict[str, str | int],
+    ) -> DailySummaryResult:
         result = await self._daily_summaries.record_outcome(
-            guild.id, summary_date, status="sent", channel_id=channel_id
+            guild_id, summary_date, status=status, channel_id=channel_id
         )
         await self._service.record_action(
-            guild.id,
+            guild_id,
             action="daily_health_summary",
-            status="succeeded",
+            status=receipt_status,
             actor_id=None,
-            detail={"channel_id": channel_id, "snapshot_version": snapshot.version},
+            detail=detail,
         )
         return result
 

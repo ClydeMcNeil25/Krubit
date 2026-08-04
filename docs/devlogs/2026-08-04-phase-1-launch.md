@@ -59,7 +59,7 @@ Every staff action produces a durable receipt, and detailed operational response
 
 The live bot completed its Phase 1 smoke checks successfully. At the time of this log:
 
-- The relocated project passes all 56 automated tests.
+- The completed Phase 1 project passes all 62 automated tests.
 - Ruff reports no lint violations.
 - Pyright reports no type errors or warnings.
 - The live SQLite database reports healthy.

@@ -11,6 +11,10 @@ Phase 1 runs Krubit as a read-only shadow monitor alongside Zariya. Krubit recor
 
 If Server Members Intent is not enabled, Discord will reject the Phase 1 gateway connection. Restore the Phase 0 runtime or enable the intent before retrying.
 
+### Intentional coverage limits
+
+Discord requires **Manage Server** to list AutoMod rules and **Manage Webhooks** to list guild webhooks. Those permissions can modify server resources, so Krubit's read-only Phase 1 role intentionally does not request them. AutoMod and webhook inventory may therefore report `limited` with a Discord `403`; this is a visible least-privilege limitation rather than a silent collection failure.
+
 ## Configuration
 
 The launcher reads only Krubit's approved variables from the workspace master `.env`:
@@ -58,6 +62,8 @@ Run these commands in Krucial Town as a member with Manage Guild:
 - `/fetch backup preview`
 
 All responses are ephemeral. Restore preview may report additions, removals, or modifications, but it must make no Discord change. A successful command creates one action receipt; inventory collection may additionally create a new snapshot version when configuration changed.
+
+All `/fetch` commands, including `/fetch status` and `/fetch test-card`, require Manage Server authority in Phase 1.
 
 ## Zariya comparison
 

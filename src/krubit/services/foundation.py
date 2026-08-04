@@ -120,14 +120,14 @@ class FoundationService:
         )
         return IngestResult(accepted=accepted, duplicate=not accepted)
 
-    async def status(self, guild_id: int) -> StatusSnapshot:
+    async def status(self, guild_id: int, *, actor_id: int | None = None) -> StatusSnapshot:
         enabled = await self._store.guild_is_enabled(guild_id)
         event_count, receipt_count = await self._store.counts(guild_id)
         await self._receipt(
             guild_id=guild_id,
             action="fetch_status",
             status="succeeded",
-            actor_id=None,
+            actor_id=actor_id,
             detail={"enabled": enabled},
         )
         return StatusSnapshot(

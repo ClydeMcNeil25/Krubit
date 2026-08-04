@@ -112,7 +112,7 @@ Advance only when two test guilds cannot read or mutate each other's configurati
 
 ## Phase 1: Reliable Companion MVP
 
-**Implementation status (2026-08-03):** Built for shadow canary; live rollout requires the Server Members Intent and staff smoke checks.
+**Implementation status (2026-08-04):** Complete. Server Members Intent, live staff smoke checks, automated verification, migration safety, Zariya inventory comparison, and the owner-accepted shadow canary are recorded in the [Phase 1 closeout](../operations/phase-1-closeout.md).
 
 ### Goal
 
