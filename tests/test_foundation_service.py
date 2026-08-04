@@ -100,4 +100,3 @@ async def test_test_signal_is_safe_and_requires_manage_guild(tmp_path: Path) -> 
         assert signal.evidence == {"phase": 0, "member_data": False}
     finally:
         await store.close()
-

@@ -39,4 +39,3 @@ def test_require_token_returns_configured_token() -> None:
     )
 
     assert settings.require_token() == "environment-only-token"
-

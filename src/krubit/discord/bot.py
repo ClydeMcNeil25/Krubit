@@ -40,7 +40,9 @@ class FetchCommands(app_commands.Group):
                 CardField("Events", str(snapshot.event_count), inline=True),
                 CardField("Receipts", str(snapshot.receipt_count), inline=True),
                 CardField(
-                    "Database", "Healthy" if snapshot.database_healthy else "Unavailable", inline=True
+                    "Database",
+                    "Healthy" if snapshot.database_healthy else "Unavailable",
+                    inline=True,
                 ),
             ),
         )
@@ -92,4 +94,3 @@ class KrubitBot(discord.Client):
             await self._service.ingest(event)
         except GuildDisabledError:
             return
-

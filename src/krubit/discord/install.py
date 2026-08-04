@@ -34,4 +34,3 @@ def install_url(application_id: int) -> str:
         }
     )
     return f"https://discord.com/oauth2/authorize?{query}"
-

@@ -33,4 +33,3 @@ def test_install_url_contains_guild_install_scopes_and_permissions() -> None:
     assert set(query["scope"][0].split(" ")) == {"bot", "applications.commands"}
     assert query["permissions"] == [str(phase_zero_permissions().value)]
     assert query["integration_type"] == ["0"]
-

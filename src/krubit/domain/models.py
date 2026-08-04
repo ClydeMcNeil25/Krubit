@@ -85,4 +85,3 @@ class Card:
     description: str
     fields: tuple[CardField, ...] = ()
     color: int = 0x8B5CF6
-

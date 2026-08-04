@@ -20,4 +20,3 @@ def test_render_card_preserves_functional_content_and_brand_color() -> None:
         ("Database", "Healthy", True)
     ]
     assert embed.footer.text == "Krubit · functional system card"
-

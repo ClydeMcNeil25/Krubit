@@ -30,4 +30,3 @@ def redact(value: JSONValue) -> JSONValue:
     if isinstance(value, dict):
         return {str(key): redact(item) for key, item in value.items()}
     return value
-

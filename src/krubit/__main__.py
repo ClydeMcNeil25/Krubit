@@ -102,4 +102,3 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

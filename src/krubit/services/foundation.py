@@ -108,9 +108,7 @@ class FoundationService:
 
     async def test_card(self, guild_id: int, actor_id: int, can_manage_guild: bool) -> Card:
         await self._require_enabled(guild_id, action="fetch_test_card")
-        await self._require_manager(
-            guild_id, actor_id, can_manage_guild, action="fetch_test_card"
-        )
+        await self._require_manager(guild_id, actor_id, can_manage_guild, action="fetch_test_card")
         status = await self.status(guild_id)
         await self._receipt(
             guild_id=guild_id,
@@ -134,9 +132,7 @@ class FoundationService:
         self, guild_id: int, actor_id: int, can_manage_guild: bool
     ) -> ZariyaSignal:
         await self._require_enabled(guild_id, action="emit_test_signal")
-        await self._require_manager(
-            guild_id, actor_id, can_manage_guild, action="emit_test_signal"
-        )
+        await self._require_manager(guild_id, actor_id, can_manage_guild, action="emit_test_signal")
         source_event_id = f"phase0-smoke-{uuid4().hex}"
         signal = ZariyaSignal.create_test(
             guild_id=guild_id,
@@ -151,4 +147,3 @@ class FoundationService:
             detail={"signal_id": signal.signal_id},
         )
         return signal
-

@@ -2,13 +2,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from krubit.domain.models import ActionReceipt, GuildEvent
+from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
 from krubit.security.redaction import redact
 
 
 def test_redact_removes_discord_token_and_assignment_secrets_recursively() -> None:
     discord_token = "A" * 24 + "." + "B" * 6 + "." + "C" * 30
-    source = {
+    source: JSONValue = {
         "message": f"paste {discord_token} here",
         "nested": ["api_key=top-secret", {"password": "password: hunter2"}],
         "count": 7,
@@ -53,4 +53,3 @@ def test_domain_values_reject_nonpositive_guild_ids() -> None:
             detail={},
             created_at=datetime(2026, 8, 3, tzinfo=UTC),
         )
-

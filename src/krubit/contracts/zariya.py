@@ -112,4 +112,3 @@ class ZariyaSignal:
             "evidence": _evidence(dict(self.evidence)),
             "action_request": None,
         }
-

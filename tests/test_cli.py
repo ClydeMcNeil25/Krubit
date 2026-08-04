@@ -42,9 +42,7 @@ def test_cli_prints_install_url(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert main(["install-url"], environment(tmp_path / "krubit.db")) == 0
 
     output = capsys.readouterr().out.strip()
-    assert output.startswith(
-        "https://discord.com/oauth2/authorize?client_id=123456789012345678"
-    )
+    assert output.startswith("https://discord.com/oauth2/authorize?client_id=123456789012345678")
 
 
 def test_cli_emits_schema_valid_signal_without_token(

@@ -13,4 +13,3 @@ def render_card(card: Card) -> discord.Embed:
         embed.add_field(name=field.name, value=field.value, inline=field.inline)
     embed.set_footer(text="Krubit · functional system card")
     return embed
-

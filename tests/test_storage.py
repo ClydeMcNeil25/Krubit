@@ -51,7 +51,9 @@ async def test_event_payload_is_redacted_before_storage(tmp_path: Path) -> None:
         assert stored.payload == {"debug": "bot_token=[REDACTED]"}
         async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
             cursor = await connection.execute("SELECT payload_json FROM guild_events")
-            raw_payload = str((await cursor.fetchone())[0])
+            row = await cursor.fetchone()
+            assert row is not None
+            raw_payload = str(row[0])
         assert "do-not-store" not in raw_payload
     finally:
         await store.close()
@@ -108,4 +110,3 @@ async def test_guild_enablement_defaults_to_false_and_is_isolated(tmp_path: Path
         assert await store.guild_is_enabled(222) is False
     finally:
         await store.close()
-

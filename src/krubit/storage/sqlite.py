@@ -190,5 +190,6 @@ class SQLiteStore:
         )
         event_row = await event_cursor.fetchone()
         receipt_row = await receipt_cursor.fetchone()
+        if event_row is None or receipt_row is None:
+            raise RuntimeError("SQLite COUNT query returned no row")
         return int(event_row["total"]), int(receipt_row["total"])
-

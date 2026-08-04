@@ -40,4 +40,3 @@ class Settings:
         if self.bot_token is None:
             raise SettingsError("DISCORD_KRUBIT_BOT_TOKEN is required to run the Discord bot")
         return self.bot_token
-

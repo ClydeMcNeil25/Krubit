@@ -1,2 +1,1 @@
 """Tenant-scoped persistence."""
-
