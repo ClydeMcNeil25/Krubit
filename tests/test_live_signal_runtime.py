@@ -401,5 +401,29 @@ async def test_recovered_history_forbidden_keeps_claim_pending_without_sending(
     assert len(guild.channel.sent) == 1
 
 
+@pytest.mark.asyncio
+async def test_reconcile_defers_same_session_announcement_after_recovered_role_failure(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, store, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    begun = await service.begin_presence(observation(), now=NOW)
+    guild.member.add_failure = True
+
+    await executor.reconcile_guild(as_guild(guild))
+    await executor.reconcile_guild(as_guild(guild))
+
+    saved = await store.get_live_session(111, begun.session_key)
+    assert saved is not None and saved.role_id is None
+    assert guild.channel.sent == []
+    guild.member.add_failure = False
+
+    await executor.reconcile_guild(as_guild(guild))
+    await executor.reconcile_guild(as_guild(guild))
+
+    assert [role.id for role in guild.member.added_roles] == [333]
+    assert len(guild.channel.sent) == 1
+
+
 def as_member(member: FakeMember) -> discord.Member:
     return cast(discord.Member, member)

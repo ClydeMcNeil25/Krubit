@@ -139,9 +139,14 @@ class LiveSignalRuntime:
             return 0
         recovered = await self._signals.recover_pending(guild.id)
         reconciled = await self._signals.reconcile(guild.id, now=self._now())
-        plans = (*recovered, *reconciled)
+        plans = tuple(sorted((*recovered, *reconciled), key=_plan_order))
+        blocked_sessions: set[str] = set()
         for plan in plans:
-            await self.apply_plan(guild, plan)
+            if plan.session_key in blocked_sessions:
+                continue
+            applied = await self.apply_plan(guild, plan)
+            if LiveSignalAction.ENSURE_ROLE in plan.actions and not applied:
+                blocked_sessions.add(plan.session_key)
         return len(plans)
 
     async def reconcile_all(self, guilds: Iterable[discord.Guild]) -> int:
@@ -468,6 +473,11 @@ def _reason(session_key: str) -> str:
 
 def _delivery_nonce(guild_id: int, delivery_key: str, attempt: int) -> str:
     return sha256(f"{guild_id}:{delivery_key}:{attempt}".encode()).hexdigest()[:32]
+
+
+def _plan_order(plan: LiveSignalPlan) -> tuple[str, int]:
+    priority = 0 if LiveSignalAction.ENSURE_ROLE in plan.actions else 1
+    return plan.session_key, priority
 
 
 async def _find_nonce_message(
