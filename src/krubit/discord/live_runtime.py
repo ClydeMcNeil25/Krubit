@@ -475,7 +475,7 @@ def _reason(session_key: str) -> str:
 
 
 def _delivery_nonce(guild_id: int, delivery_key: str, attempt: int) -> str:
-    return sha256(f"{guild_id}:{delivery_key}:{attempt}".encode()).hexdigest()[:32]
+    return sha256(f"{guild_id}:{delivery_key}:{attempt}".encode()).hexdigest()[:25]
 
 
 def _plan_order(plan: LiveSignalPlan) -> tuple[str, int]:

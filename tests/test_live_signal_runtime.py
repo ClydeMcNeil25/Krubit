@@ -246,6 +246,21 @@ async def test_apply_plan_adds_only_the_dedicated_role_and_announces_once(
 
 
 @pytest.mark.asyncio
+async def test_announcement_nonce_fits_discord_create_message_limit(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, _, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    plan = await service.observe(observation(), now=NOW)
+
+    await executor.apply_plan(as_guild(guild), plan)
+
+    nonce = guild.channel.sent[0]["nonce"]
+    assert isinstance(nonce, str)
+    assert 0 < len(nonce) <= 25
+
+
+@pytest.mark.asyncio
 async def test_apply_plan_records_preexisting_role_as_not_owned_and_never_removes_it(
     runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
 ) -> None:
