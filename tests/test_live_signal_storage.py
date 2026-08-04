@@ -38,13 +38,14 @@ def session(
     detected_at: datetime = NOW,
     stream_value: TwitchStream | None = None,
     role_assigned_by_krubit: bool = False,
+    twitch_url: str = "https://twitch.tv/krucialstudios",
 ) -> LiveSignalSession:
     return LiveSignalSession(
         guild_id=guild_id,
         session_key=session_key,
         member_id=222,
         twitch_login="krucialstudios",
-        twitch_url="https://twitch.tv/krucialstudios",
+        twitch_url=twitch_url,
         status=LiveSignalStatus.LIVE,
         detected_at=detected_at,
         presence_started_at=NOW - timedelta(minutes=2),
@@ -128,6 +129,82 @@ async def test_saving_enriched_session_merges_stream_id_without_duplicate_row(
         saved = await store.get_live_session(111, "session-1")
         assert saved is not None and saved.stream == stream()
         assert await store.get_live_session(111, "later-observation") is None
+        async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
+            cursor = await connection.execute("SELECT COUNT(*) FROM live_signal_sessions")
+            row = await cursor.fetchone()
+        assert row is not None and row[0] == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_url_is_canonical_and_never_stores_query_or_fragment_secrets(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(
+            session(
+                twitch_url=(
+                    "https://twitch.tv/krucialstudios?access_token=do-not-store#credential"
+                )
+            )
+        )
+
+        saved = await store.get_live_session(111, "session-1")
+        assert saved is not None
+        assert saved.twitch_url == "https://www.twitch.tv/krucialstudios"
+        async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
+            cursor = await connection.execute("SELECT twitch_url FROM live_signal_sessions")
+            row = await cursor.fetchone()
+        assert row is not None
+        assert str(row[0]) == "https://www.twitch.tv/krucialstudios"
+        assert "do-not-store" not in str(row[0])
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_and_stream_identity_collision_coalesces_safely(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    try:
+        await store.initialize()
+        await store.save_live_session(
+            replace(
+                session(session_key="session-a", stream_value=stream("stream-a")),
+                announcement_channel_id=444,
+                announcement_message_id=1001,
+                role_id=333,
+                role_assigned_by_krubit=False,
+            )
+        )
+        await store.save_live_session(
+            replace(
+                session(session_key="session-b", stream_value=stream("stream-b")),
+                announcement_channel_id=555,
+                announcement_message_id=2002,
+                role_id=999,
+                role_assigned_by_krubit=True,
+            )
+        )
+
+        await store.save_live_session(
+            replace(
+                session(session_key="session-a", stream_value=stream("stream-b")),
+                announcement_channel_id=None,
+                announcement_message_id=None,
+                role_id=None,
+                role_assigned_by_krubit=False,
+            )
+        )
+
+        saved = await store.get_live_session(111, "session-a")
+        assert saved is not None
+        assert saved.stream == stream("stream-b")
+        assert (saved.announcement_channel_id, saved.announcement_message_id) == (555, 2002)
+        assert (saved.role_id, saved.role_assigned_by_krubit) == (999, True)
+        assert await store.get_live_session(111, "session-b") is None
         async with aiosqlite.connect(tmp_path / "krubit.db") as connection:
             cursor = await connection.execute("SELECT COUNT(*) FROM live_signal_sessions")
             row = await cursor.fetchone()

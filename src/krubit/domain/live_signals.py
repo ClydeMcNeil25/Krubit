@@ -69,6 +69,10 @@ def normalize_twitch_channel(url: str) -> str | None:
     return None if login in _RESERVED_TWITCH_PATHS else login
 
 
+def _canonical_twitch_url(login: str) -> str:
+    return f"https://www.twitch.tv/{login.lower()}"
+
+
 @dataclass(frozen=True, slots=True)
 class StreamingObservation:
     guild_id: int
@@ -86,6 +90,7 @@ class StreamingObservation:
         _require_text("twitch_url", self.twitch_url, limit=_TWITCH_URL_MAX_LENGTH)
         if normalize_twitch_channel(self.twitch_url) != self.twitch_login.lower():
             raise ValueError("twitch_url must match twitch_login")
+        object.__setattr__(self, "twitch_url", _canonical_twitch_url(self.twitch_login))
         if self.activity_started_at is not None:
             _require_aware(self.activity_started_at)
         _require_aware(self.observed_at)
@@ -173,6 +178,7 @@ class LiveSignalSession:
         _require_text("twitch_url", self.twitch_url, limit=_TWITCH_URL_MAX_LENGTH)
         if normalize_twitch_channel(self.twitch_url) != self.twitch_login.lower():
             raise ValueError("twitch_url must match twitch_login")
+        object.__setattr__(self, "twitch_url", _canonical_twitch_url(self.twitch_login))
         if type(self.status) is not LiveSignalStatus:
             raise ValueError("status must be a LiveSignalStatus")
         _require_aware(self.detected_at)

@@ -218,6 +218,81 @@ class SQLiteStore:
     async def save_live_session(self, session: LiveSignalSession) -> LiveSignalSession:
         """Insert or update a session, retaining its first durable key for a known stream."""
         _require_guild_id(session.guild_id)
+        await self._connection.execute("BEGIN IMMEDIATE")
+        saved_session = session
+        try:
+            if session.stream is not None:
+                key_cursor = await self._connection.execute(
+                    """
+                    SELECT * FROM live_signal_sessions
+                    WHERE guild_id = ? AND session_key = ?
+                    """,
+                    (session.guild_id, session.session_key),
+                )
+                stream_cursor = await self._connection.execute(
+                    """
+                    SELECT * FROM live_signal_sessions
+                    WHERE guild_id = ? AND stream_id = ?
+                    """,
+                    (session.guild_id, session.stream.stream_id),
+                )
+                key_row = await key_cursor.fetchone()
+                stream_row = await stream_cursor.fetchone()
+                if (
+                    key_row is not None
+                    and stream_row is not None
+                    and key_row["session_key"] != stream_row["session_key"]
+                ):
+                    saved_session = self._coalesce_live_sessions(
+                        self._live_signal_session_from_stored_row(key_row),
+                        self._live_signal_session_from_stored_row(stream_row),
+                        session,
+                    )
+                    await self._connection.execute(
+                        """
+                        UPDATE live_signal_deliveries SET session_key = ?
+                        WHERE guild_id = ? AND session_key = ?
+                        """,
+                        (saved_session.session_key, session.guild_id, stream_row["session_key"]),
+                    )
+                    await self._connection.execute(
+                        """
+                        UPDATE live_signal_checks SET session_key = ?
+                        WHERE guild_id = ? AND session_key = ?
+                        """,
+                        (saved_session.session_key, session.guild_id, stream_row["session_key"]),
+                    )
+                    await self._connection.execute(
+                        """
+                        DELETE FROM live_signal_sessions
+                        WHERE guild_id = ? AND session_key = ?
+                        """,
+                        (session.guild_id, stream_row["session_key"]),
+                    )
+            await self._upsert_live_session(saved_session)
+            await self._connection.commit()
+        except BaseException:
+            await self._connection.rollback()
+            raise
+        session_key = saved_session.session_key
+        if saved_session.stream is not None:
+            cursor = await self._connection.execute(
+                """
+                SELECT session_key FROM live_signal_sessions
+                WHERE guild_id = ? AND stream_id = ?
+                """,
+                (saved_session.guild_id, saved_session.stream.stream_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("saved live session stream could not be read")
+            session_key = str(row["session_key"])
+        saved = await self.get_live_session(saved_session.guild_id, session_key)
+        if saved is None:
+            raise RuntimeError("saved live session could not be read")
+        return saved
+
+    async def _upsert_live_session(self, session: LiveSignalSession) -> None:
         stream = session.stream
         await self._connection.execute(
             """
@@ -299,24 +374,56 @@ class SQLiteStore:
                 _stored_timestamp(session.ended_at),
             ),
         )
-        await self._connection.commit()
-        session_key = session.session_key
-        if stream is not None:
-            cursor = await self._connection.execute(
-                """
-                SELECT session_key FROM live_signal_sessions
-                WHERE guild_id = ? AND stream_id = ?
-                """,
-                (session.guild_id, stream.stream_id),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                raise RuntimeError("saved live session stream could not be read")
-            session_key = str(row["session_key"])
-        saved = await self.get_live_session(session.guild_id, session_key)
-        if saved is None:
-            raise RuntimeError("saved live session could not be read")
-        return saved
+
+    @staticmethod
+    def _coalesce_live_sessions(
+        key_session: LiveSignalSession,
+        stream_session: LiveSignalSession,
+        incoming_session: LiveSignalSession,
+    ) -> LiveSignalSession:
+        """Keep the key identity while retaining the stream identity's public state."""
+        announcement_source = next(
+            (
+                item
+                for item in (stream_session, incoming_session, key_session)
+                if item.announcement_channel_id is not None
+                and item.announcement_message_id is not None
+            ),
+            key_session,
+        )
+        role_source = next(
+            (
+                item
+                for item in (stream_session, incoming_session, key_session)
+                if item.role_id is not None
+            ),
+            key_session,
+        )
+        role_id = role_source.role_id
+        role_assigned_by_krubit = role_id is not None and any(
+            item.role_id == role_id and item.role_assigned_by_krubit
+            for item in (incoming_session, stream_session, key_session)
+        )
+        return LiveSignalSession(
+            guild_id=incoming_session.guild_id,
+            session_key=key_session.session_key,
+            member_id=incoming_session.member_id,
+            twitch_login=incoming_session.twitch_login,
+            twitch_url=incoming_session.twitch_url,
+            status=incoming_session.status,
+            detected_at=incoming_session.detected_at,
+            presence_started_at=incoming_session.presence_started_at,
+            stream=incoming_session.stream,
+            announcement_channel_id=announcement_source.announcement_channel_id,
+            announcement_message_id=announcement_source.announcement_message_id,
+            role_id=role_id,
+            role_assigned_by_krubit=role_assigned_by_krubit,
+            presence_active=incoming_session.presence_active,
+            missing_since=incoming_session.missing_since,
+            last_discord_at=incoming_session.last_discord_at,
+            last_twitch_at=incoming_session.last_twitch_at,
+            ended_at=incoming_session.ended_at,
+        )
 
     async def open_live_session(
         self, guild_id: int, member_id: int, twitch_login: str
