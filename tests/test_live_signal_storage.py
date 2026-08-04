@@ -1,8 +1,13 @@
 """Integration tests for guild-scoped live signal persistence."""
 
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import aiosqlite
 import pytest
@@ -55,6 +60,30 @@ def session(
         last_discord_at=NOW,
         last_twitch_at=NOW,
     )
+
+
+class _PausingSQLiteStore(SQLiteStore):
+    def __init__(self, connection: aiosqlite.Connection) -> None:
+        super().__init__(connection)
+        self.pause_terminal_save = False
+        self.track_initialize = False
+        self.session_upserted = asyncio.Event()
+        self.resume_terminal_save = asyncio.Event()
+        self.initialize_entered = asyncio.Event()
+
+    async def initialize(self) -> None:
+        if self.track_initialize:
+            self.initialize_entered.set()
+        await super().initialize()
+
+    async def _save_live_session_in_transaction(
+        self, session: LiveSignalSession
+    ) -> LiveSignalSession:
+        saved = await super()._save_live_session_in_transaction(session)
+        if self.pause_terminal_save:
+            self.session_upserted.set()
+            await self.resume_terminal_save.wait()
+        return saved
 
 
 @pytest.mark.asyncio
@@ -524,6 +553,185 @@ async def test_terminal_session_and_claimed_deliveries_commit_or_roll_back_toget
         assert await store.claim_live_delivery_attempt(
             111, "stream:new-identity", "future-session"
         ) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_waits_for_terminal_rollback_before_running_repair(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "krubit.db"
+    store = cast(_PausingSQLiteStore, await _PausingSQLiteStore.open(database))
+    terminal_task: asyncio.Task[LiveSignalSession] | None = None
+    initialize_task: asyncio.Task[None] | None = None
+    try:
+        await store.initialize()
+        active = await store.save_live_session(session(stream_value=stream()))
+        assert await store.claim_live_delivery(
+            111, "stream:stream-1", active.session_key
+        ) is True
+        async with aiosqlite.connect(database) as connection:
+            await connection.executescript(
+                """
+                CREATE TRIGGER abort_initialize_race_cancellation
+                BEFORE UPDATE OF status ON live_signal_deliveries
+                WHEN OLD.status = 'claimed' AND NEW.status = 'cancelled'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced initialize race cancellation failure');
+                END;
+                """
+            )
+            await connection.commit()
+
+        store.pause_terminal_save = True
+        terminal_task = asyncio.create_task(
+            store.save_terminal_live_session(
+                replace(
+                    active,
+                    status=LiveSignalStatus.ENDED,
+                    presence_active=False,
+                    ended_at=NOW + timedelta(minutes=1),
+                )
+            )
+        )
+        await asyncio.wait_for(store.session_upserted.wait(), timeout=1)
+        store.track_initialize = True
+        initialize_task = asyncio.create_task(store.initialize())
+        await asyncio.wait_for(store.initialize_entered.wait(), timeout=1)
+
+        assert initialize_task.done() is False
+        store.resume_terminal_save.set()
+        with pytest.raises(
+            aiosqlite.IntegrityError,
+            match="forced initialize race cancellation failure",
+        ):
+            await terminal_task
+        await initialize_task
+
+        retained_session = await store.get_live_session(111, active.session_key)
+        retained_delivery = await store.get_live_delivery(111, "stream:stream-1")
+        assert retained_session is not None
+        assert retained_session.status is LiveSignalStatus.LIVE
+        assert retained_session.ended_at is None
+        assert retained_delivery is not None and retained_delivery.status == "claimed"
+    finally:
+        store.resume_terminal_save.set()
+        pending = [
+            task
+            for task in (terminal_task, initialize_task)
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with suppress(BaseException):
+                await task
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_alias_retires_retained_stream_session_delivery_atomically(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "krubit.db"
+    store = await SQLiteStore.open(database)
+    try:
+        await store.initialize()
+        retained = await store.save_live_session(
+            session(session_key="retained-session", stream_value=stream("shared-stream"))
+        )
+        assert await store.claim_live_delivery(
+            111, "stream:shared-stream", retained.session_key
+        ) is True
+        alias_terminal = replace(
+            retained,
+            session_key="incoming-alias",
+            status=LiveSignalStatus.ENDED,
+            presence_active=False,
+            ended_at=NOW + timedelta(minutes=1),
+        )
+        async with aiosqlite.connect(database) as connection:
+            await connection.executescript(
+                """
+                CREATE TRIGGER abort_alias_delivery_cancellation
+                BEFORE UPDATE OF status ON live_signal_deliveries
+                WHEN OLD.session_key = 'retained-session'
+                    AND OLD.status = 'claimed'
+                    AND NEW.status = 'cancelled'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced alias cancellation failure');
+                END;
+                """
+            )
+            await connection.commit()
+
+        with pytest.raises(aiosqlite.IntegrityError, match="forced alias cancellation failure"):
+            await store.save_terminal_live_session(alias_terminal)
+        rolled_back = await store.get_live_session(111, retained.session_key)
+        claimed = await store.get_live_delivery(111, "stream:shared-stream")
+        assert rolled_back is not None and rolled_back.status is LiveSignalStatus.LIVE
+        assert rolled_back.ended_at is None
+        assert claimed is not None and claimed.status == "claimed"
+
+        async with aiosqlite.connect(database) as connection:
+            await connection.execute("DROP TRIGGER abort_alias_delivery_cancellation")
+            await connection.commit()
+
+        saved = await store.save_terminal_live_session(alias_terminal)
+
+        delivery = await store.get_live_delivery(111, "stream:shared-stream")
+        assert saved.session_key == "retained-session"
+        assert saved.status is LiveSignalStatus.ENDED and saved.ended_at == alias_terminal.ended_at
+        assert delivery is not None and delivery.status == "cancelled"
+        assert await store.get_live_session(111, "incoming-alias") is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_aborted_config_write_rolls_back_before_next_atomic_write(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "krubit.db"
+    store = await SQLiteStore.open(database)
+    try:
+        await store.initialize()
+        active = await store.save_live_session(session(stream_value=stream()))
+        assert await store.claim_live_delivery(
+            111, "stream:stream-1", active.session_key
+        ) is True
+        async with aiosqlite.connect(database) as connection:
+            await connection.executescript(
+                """
+                CREATE TRIGGER abort_live_signal_config_write
+                BEFORE INSERT ON live_signal_config
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced config write failure');
+                END;
+                """
+            )
+            await connection.commit()
+
+        with pytest.raises(aiosqlite.IntegrityError, match="forced config write failure"):
+            await store.set_live_signal_config(LiveSignalConfig(111, 444, 333, NOW))
+        assert store._connection.in_transaction is False  # pyright: ignore[reportPrivateUsage]
+
+        async with aiosqlite.connect(database) as connection:
+            await connection.execute("DROP TRIGGER abort_live_signal_config_write")
+            await connection.commit()
+        ended = await store.save_terminal_live_session(
+            replace(
+                active,
+                status=LiveSignalStatus.ENDED,
+                presence_active=False,
+                ended_at=NOW + timedelta(minutes=1),
+            )
+        )
+
+        delivery = await store.get_live_delivery(111, "stream:stream-1")
+        assert ended.status is LiveSignalStatus.ENDED
+        assert delivery is not None and delivery.status == "cancelled"
     finally:
         await store.close()
 
