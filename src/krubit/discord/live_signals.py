@@ -82,6 +82,7 @@ def render_live_embed(
 
     embed = discord.Embed(
         title="🔮 LIVE SIGNAL FOUND",
+        url=observation.twitch_url,
         description=description,
         color=_LIVE_PURPLE,
     )
@@ -104,6 +105,7 @@ def render_live_embed(
     embed.add_field(name="Status", value="Streaming Now", inline=True)
     if thumbnail_url is not None:
         embed.set_thumbnail(url=thumbnail_url)
+        embed.set_image(url=thumbnail_url)
     embed.set_footer(text="Automated creature signal • Twitch")
     return embed
 

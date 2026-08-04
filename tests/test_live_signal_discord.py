@@ -84,6 +84,7 @@ def test_full_embed_uses_safe_purple_live_signal_card_and_canonical_thumbnail() 
     embed = render_live_embed(observation(), stream)
 
     assert embed.title == "🔮 LIVE SIGNAL FOUND"
+    assert embed.url == "https://www.twitch.tv/krucialstudios"
     assert embed.description == "Krubit detected a creator streaming"
     assert embed.color is not None and embed.color.value == 0x8B5CF6
     assert field_values(embed) == {
@@ -94,6 +95,7 @@ def test_full_embed_uses_safe_purple_live_signal_card_and_canonical_thumbnail() 
         "Status": "Streaming Now",
     }
     assert embed.thumbnail.url == "https://cdn.twitch.tv/preview-640x360.jpg"
+    assert embed.image.url == "https://cdn.twitch.tv/preview-640x360.jpg"
     assert embed.footer.text == "Automated creature signal • Twitch"
 
 
@@ -108,7 +110,27 @@ def test_reduced_embed_uses_discord_activity_name_and_no_invented_twitch_facts()
         "Category": "Unavailable",
         "Status": "Streaming Now",
     }
+    assert embed.url == "https://www.twitch.tv/krucialstudios"
     assert embed.thumbnail.url is None
+    assert embed.image.url is None
+
+
+def test_full_embed_rejects_unsafe_preview_without_losing_stream_link() -> None:
+    stream = TwitchStream(
+        stream_id="stream-1",
+        user_login="krucialstudios",
+        user_name="Krucial Studios",
+        title="Live",
+        game_name="Art",
+        started_at=STARTED_AT,
+        thumbnail_url="http://cdn.twitch.tv/preview-{width}x{height}.jpg",
+    )
+
+    embed = render_live_embed(observation(), stream)
+
+    assert embed.url == "https://www.twitch.tv/krucialstudios"
+    assert embed.thumbnail.url is None
+    assert embed.image.url is None
 
 
 def test_reduced_embed_bounds_escaped_activity_text_to_discord_field_limit() -> None:
