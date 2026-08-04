@@ -40,4 +40,3 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
-

@@ -89,4 +89,3 @@ back up Discord messages, members, roles, or server configuration.
 - No Twitch, YouTube, or social monitoring
 - No KSHQ transport or automatic Zariya delivery
 - No Discord channel, role, permission, event, or AutoMod mutation
-

@@ -7,8 +7,8 @@ __pycache__/
 .mypy_cache/
 .coverage
 htmlcov/
+dist/
 data/
 *.db
 *.db-shm
 *.db-wal
-

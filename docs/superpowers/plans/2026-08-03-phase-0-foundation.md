@@ -219,4 +219,3 @@ tests/
 - Stored and emitted content is redacted.
 - A schema-valid test signal can be generated for Zariya without modifying KAI-System.
 - No Phase 1+ behavior exists: no moderation, member profiling, external creator monitoring, or Discord mutation.
-

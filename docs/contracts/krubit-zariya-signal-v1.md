@@ -48,4 +48,3 @@ non-info severity, non-test kinds, and every non-null action request.
 
 Future signal kinds and governed action proposals require a new reviewed contract revision or an
 explicit backward-compatible extension. They must not be smuggled through the Phase 0 test kind.
-

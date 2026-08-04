@@ -31,4 +31,3 @@ uv run pyright
 See the [Phase 0 setup guide](docs/operations/phase-0-setup.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
-
