@@ -111,3 +111,19 @@ async def test_bot_records_guild_installed_while_runtime_is_connected(tmp_path: 
     finally:
         await bot.close()
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_uses_presence_intent_while_twitch_remains_optional(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(application_id=123, database_path=tmp_path / "krubit.db"),
+        FoundationService(store),
+        twitch=None,
+    )
+
+    try:
+        assert bot.intents.presences is True
+    finally:
+        await bot.close()
+        await store.close()

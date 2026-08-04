@@ -1,0 +1,415 @@
+"""Safe Discord execution for durable live-stream signal plans."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Iterable
+from contextlib import suppress
+from datetime import UTC, datetime
+from typing import Protocol, cast
+
+import discord
+
+from krubit.discord.live_signals import (
+    build_live_view,
+    extract_twitch_observation,
+    live_allowed_mentions,
+    render_live_content,
+    render_live_embed,
+)
+from krubit.domain.live_signals import (
+    LiveSignalAction,
+    LiveSignalConfig,
+    LiveSignalPlan,
+    StreamingObservation,
+)
+from krubit.services.foundation import FoundationService
+from krubit.services.live_signals import LiveSignalService
+from krubit.storage.sqlite import SQLiteStore
+
+LIVE_CHANNEL_NAME = "live-notifications"
+STREAMING_ROLE_NAME = "Streaming Now"
+
+
+class LiveSignalRuntime:
+    """Execute only the Discord actions already approved by the signal service."""
+
+    def __init__(
+        self,
+        store: SQLiteStore,
+        signals: LiveSignalService | None,
+        *,
+        receipts: FoundationService | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._store = store
+        self._signals = signals
+        self._receipts = receipts
+        self._now = now or (lambda: datetime.now(UTC))
+        self._guild_locks: dict[int, asyncio.Lock] = {}
+
+    def _guild_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self._guild_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._guild_locks[guild_id] = lock
+        return lock
+
+    async def configure_guild(self, guild: discord.Guild) -> LiveSignalConfig | None:
+        """Find the exact bootstrap resources once, then trust persisted IDs."""
+        if self._signals is None or not await self._store.guild_is_enabled(guild.id):
+            return None
+        async with self._guild_lock(guild.id):
+            existing = await self._store.get_live_signal_config(guild.id)
+            if existing is not None:
+                return existing if self._configured_resources_are_usable(guild, existing) else None
+
+            channel = next(
+                (
+                    candidate
+                    for candidate in guild.channels
+                    if getattr(candidate, "name", None) == LIVE_CHANNEL_NAME
+                    and _is_text_channel(candidate)
+                ),
+                None,
+            )
+            role = next(
+                (candidate for candidate in guild.roles if candidate.name == STREAMING_ROLE_NAME),
+                None,
+            )
+            if channel is None or role is None:
+                return None
+            config = LiveSignalConfig(guild.id, channel.id, role.id, self._now())
+            if not self._configured_resources_are_usable(guild, config):
+                return None
+            await self._store.set_live_signal_config(config)
+            return config
+
+    async def handle_presence(self, before: discord.Member, after: discord.Member) -> None:
+        """Convert presence transitions into durable plans and execute them once."""
+        if self._signals is None or before.guild.id != after.guild.id:
+            return
+        guild = after.guild
+        if not await self._store.guild_is_enabled(guild.id):
+            return
+        if await self.configure_guild(guild) is None:
+            return
+        now = self._now()
+        observation = extract_twitch_observation(after, observed_at=now)
+        if observation is not None:
+            await self.apply_plan(guild, await self._signals.observe(observation, now=now))
+            return
+        if extract_twitch_observation(before, observed_at=now) is not None:
+            ending = await self._signals.presence_ended(guild.id, after.id, now=now)
+            if ending is not None:
+                await self.apply_plan(guild, ending)
+
+    async def apply_plan(self, guild: discord.Guild, plan: LiveSignalPlan) -> None:
+        """Apply a plan idempotently; never infer resources from mutable names."""
+        if self._signals is None or guild.id != plan.guild_id:
+            return
+        if not await self._store.guild_is_enabled(guild.id):
+            return
+        async with self._guild_lock(guild.id):
+            config = await self._store.get_live_signal_config(guild.id)
+            if config is None or not self._configured_resources_are_usable(guild, config):
+                return
+            if LiveSignalAction.ENSURE_ROLE in plan.actions and not await self._ensure_role(
+                guild, config, plan
+            ):
+                return
+            if LiveSignalAction.ANNOUNCE in plan.actions:
+                await self._announce(guild, config, plan)
+            if LiveSignalAction.EDIT_ANNOUNCEMENT in plan.actions:
+                await self._edit_announcement(guild, config, plan)
+            if LiveSignalAction.REMOVE_ROLE in plan.actions:
+                await self._remove_owned_role(guild, config, plan)
+
+    async def reconcile_guild(self, guild: discord.Guild) -> int:
+        """Refresh one configured guild and execute its resulting plans."""
+        if self._signals is None or not await self._store.guild_is_enabled(guild.id):
+            return 0
+        if await self.configure_guild(guild) is None:
+            return 0
+        plans = await self._signals.reconcile(guild.id, now=self._now())
+        for plan in plans:
+            await self.apply_plan(guild, plan)
+        return len(plans)
+
+    async def reconcile_all(self, guilds: Iterable[discord.Guild]) -> int:
+        """Reconcile available guilds without creating independent background tasks."""
+        count = 0
+        for guild in guilds:
+            count += await self.reconcile_guild(guild)
+        return count
+
+    def _configured_resources_are_usable(
+        self, guild: discord.Guild, config: LiveSignalConfig
+    ) -> bool:
+        channel = guild.get_channel(config.channel_id)
+        role = guild.get_role(config.role_id)
+        if not _is_text_channel(channel) or role is None:
+            return False
+        text_channel = cast(_TextChannel, channel)
+        permissions = text_channel.permissions_for(guild.me)
+        if not all(
+            (
+                getattr(permissions, "view_channel", False),
+                getattr(permissions, "send_messages", False),
+                getattr(permissions, "embed_links", False),
+                getattr(guild.me.guild_permissions, "manage_roles", False),
+            )
+        ):
+            return False
+        if getattr(role, "managed", False):
+            return False
+        return _role_position(role) < _role_position(guild.me.top_role)
+
+    async def _ensure_role(
+        self, guild: discord.Guild, config: LiveSignalConfig, plan: LiveSignalPlan
+    ) -> bool:
+        if plan.member_id is None:
+            return False
+        signals = self._signals
+        if signals is None:
+            return False
+        session = await self._store.get_live_session(guild.id, plan.session_key)
+        if session is None:
+            return False
+        # A replayed durable plan must not turn an owned assignment into a
+        # pre-existing role merely because the first execution already added it.
+        if session.role_id == config.role_id:
+            return True
+        role = guild.get_role(config.role_id)
+        member = guild.get_member(plan.member_id)
+        if role is None or member is None or not self._role_is_usable(guild, role):
+            return False
+        member_roles = getattr(member, "roles", ())
+        owned = not any(getattr(item, "id", None) == role.id for item in member_roles)
+        try:
+            if owned:
+                await member.add_roles(role, reason=_reason(plan.session_key))
+            await signals.record_role_result(
+                guild.id,
+                plan.session_key,
+                role_id=role.id,
+                assigned_by_krubit=owned,
+                status="succeeded",
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+            with suppress(ValueError):
+                await signals.record_role_result(
+                    guild.id,
+                    plan.session_key,
+                    role_id=config.role_id,
+                    assigned_by_krubit=False,
+                    status="failed",
+                )
+            return False
+        return True
+
+    async def _remove_owned_role(
+        self, guild: discord.Guild, config: LiveSignalConfig, plan: LiveSignalPlan
+    ) -> None:
+        if plan.member_id is None or plan.role_id != config.role_id:
+            return
+        signals = self._signals
+        if signals is None:
+            return
+        session = await self._store.get_live_session(guild.id, plan.session_key)
+        role = guild.get_role(config.role_id)
+        member = guild.get_member(plan.member_id)
+        if (
+            session is None
+            or not session.role_assigned_by_krubit
+            or session.role_id != config.role_id
+            or role is None
+            or member is None
+            or not self._role_is_usable(guild, role)
+        ):
+            return
+        if not any(getattr(item, "id", None) == role.id for item in getattr(member, "roles", ())):
+            return
+        try:
+            await member.remove_roles(role, reason=_reason(plan.session_key))
+            await signals.record_role_result(
+                guild.id,
+                plan.session_key,
+                role_id=role.id,
+                assigned_by_krubit=False,
+                status="succeeded",
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+            return
+
+    async def _announce(
+        self, guild: discord.Guild, config: LiveSignalConfig, plan: LiveSignalPlan
+    ) -> None:
+        if plan.delivery_attempt is None:
+            return
+        signals = self._signals
+        if signals is None:
+            return
+        session = await self._store.get_live_session(guild.id, plan.session_key)
+        channel = guild.get_channel(config.channel_id)
+        if (
+            session is None
+            or session.announcement_message_id is not None
+            or not _is_text_channel(channel)
+        ):
+            return
+        text_channel = cast(_TextChannel, channel)
+        delivery_key = (
+            f"stream:{session.stream.stream_id}"
+            if session.stream is not None
+            else f"provisional:{session.session_key}"
+        )
+        delivery = await self._store.get_live_delivery(guild.id, delivery_key)
+        if (
+            delivery is None
+            or delivery.status != "claimed"
+            or delivery.attempt != plan.delivery_attempt
+            or delivery.session_key != plan.session_key
+        ):
+            return
+        permissions = text_channel.permissions_for(guild.me)
+        if not all(
+            (
+                getattr(permissions, "view_channel", False),
+                getattr(permissions, "send_messages", False),
+                getattr(permissions, "embed_links", False),
+            )
+        ):
+            await self._record_delivery_failure(config, plan)
+            return
+        member = guild.get_member(session.member_id)
+        display_name = getattr(member, "display_name", session.twitch_login)
+        if not isinstance(display_name, str):
+            display_name = session.twitch_login
+        observation = StreamingObservation(
+            guild_id=guild.id,
+            member_id=session.member_id,
+            twitch_login=session.twitch_login,
+            twitch_url=session.twitch_url,
+            activity_started_at=session.presence_started_at,
+            observed_at=self._now(),
+        )
+        degraded = not getattr(permissions, "mention_everyone", False)
+        mentions = discord.AllowedMentions.none() if degraded else live_allowed_mentions()
+        try:
+            message = await text_channel.send(
+                content=render_live_content(display_name),
+                embed=render_live_embed(observation, plan.stream),
+                view=build_live_view(session.twitch_url),
+                allowed_mentions=mentions,
+            )
+            await signals.record_delivery_result(
+                guild.id,
+                plan.session_key,
+                status="succeeded",
+                channel_id=config.channel_id,
+                message_id=message.id,
+                attempt=plan.delivery_attempt,
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+            await self._record_delivery_failure(config, plan)
+            return
+        if degraded and self._receipts is not None:
+            await self._receipts.record_action(
+                guild.id,
+                action="live_signal_announcement",
+                status="degraded",
+                actor_id=None,
+                detail={"channel_id": config.channel_id, "reason": "mention_everyone_missing"},
+            )
+
+    async def _record_delivery_failure(
+        self, config: LiveSignalConfig, plan: LiveSignalPlan
+    ) -> None:
+        if plan.delivery_attempt is None:
+            return
+        signals = self._signals
+        if signals is None:
+            return
+        try:
+            await signals.record_delivery_result(
+                plan.guild_id,
+                plan.session_key,
+                status="failed",
+                channel_id=config.channel_id,
+                message_id=None,
+                attempt=plan.delivery_attempt,
+            )
+        except ValueError:
+            return
+
+    async def _edit_announcement(
+        self, guild: discord.Guild, config: LiveSignalConfig, plan: LiveSignalPlan
+    ) -> None:
+        if (
+            plan.announcement_channel_id != config.channel_id
+            or plan.announcement_message_id is None
+        ):
+            return
+        session = await self._store.get_live_session(guild.id, plan.session_key)
+        channel = guild.get_channel(config.channel_id)
+        if session is None or not _is_text_channel(channel):
+            return
+        text_channel = cast(_TextChannel, channel)
+        observation = StreamingObservation(
+            guild_id=guild.id,
+            member_id=session.member_id,
+            twitch_login=session.twitch_login,
+            twitch_url=session.twitch_url,
+            activity_started_at=session.presence_started_at,
+            observed_at=self._now(),
+        )
+        try:
+            message = await text_channel.fetch_message(plan.announcement_message_id)
+            await message.edit(
+                embed=render_live_embed(observation, plan.stream),
+                view=build_live_view(session.twitch_url),
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, KeyError):
+            return
+
+    @staticmethod
+    def _role_is_usable(guild: discord.Guild, role: discord.Role) -> bool:
+        return not getattr(role, "managed", False) and _role_position(role) < _role_position(
+            guild.me.top_role
+        ) and bool(getattr(guild.me.guild_permissions, "manage_roles", False))
+
+
+def _is_text_channel(channel: object | None) -> bool:
+    return (
+        channel is not None
+        and callable(getattr(channel, "send", None))
+        and callable(getattr(channel, "permissions_for", None))
+    )
+
+
+class _TextChannel(Protocol):
+    id: int
+
+    def permissions_for(self, member: object) -> discord.Permissions: ...
+
+    async def send(
+        self,
+        *,
+        content: str,
+        embed: discord.Embed,
+        view: discord.ui.View,
+        allowed_mentions: discord.AllowedMentions,
+    ) -> discord.Message: ...
+
+    async def fetch_message(self, message_id: int) -> discord.Message: ...
+
+
+def _role_position(role: object) -> int:
+    position = getattr(role, "position", -1)
+    return position if isinstance(position, int) else -1
+
+
+def _reason(session_key: str) -> str:
+    """Keep audit reasons non-secret and bounded to a durable session identity."""
+    return f"Krubit live signal {session_key[:64]}"

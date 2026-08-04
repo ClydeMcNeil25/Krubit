@@ -27,6 +27,13 @@ class TwitchClient(Protocol):
     async def get_stream(self, login: str) -> TwitchLookup: ...
 
 
+class UnavailableTwitchClient:
+    """Typed disabled-mode client that never initiates a provider request."""
+
+    async def get_stream(self, login: str) -> TwitchLookup:
+        return TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="disabled")
+
+
 class _Response(Protocol):
     status: int
     headers: Mapping[str, str]

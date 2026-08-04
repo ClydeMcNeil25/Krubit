@@ -13,10 +13,12 @@ from discord.ext import tasks
 from krubit.config import Settings
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
 from krubit.discord.events import guild_event
-from krubit.discord.install import phase_one_intents, phase_one_permissions
+from krubit.discord.install import phase_one_permissions, phase_two_intents
 from krubit.discord.inventory import InventoryCapture, capture_inventory
+from krubit.discord.live_runtime import LiveSignalRuntime
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.models import Card, CardField, GuildEvent
+from krubit.integrations.twitch import TwitchClient, UnavailableTwitchClient
 from krubit.services.daily_summary import DailySummaryResult, DailySummaryService
 from krubit.services.foundation import (
     AuthorizationError,
@@ -24,6 +26,7 @@ from krubit.services.foundation import (
     GuildDisabledError,
 )
 from krubit.services.health import HealthService
+from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
 
 
@@ -315,9 +318,10 @@ class KrubitBot(discord.Client):
         service: FoundationService,
         *,
         connector: BaseConnector | None = None,
+        twitch: TwitchClient | None = None,
     ) -> None:
         super().__init__(
-            intents=phase_one_intents(),
+            intents=phase_two_intents(),
             application_id=settings.application_id,
             connector=connector,
         )
@@ -327,13 +331,27 @@ class KrubitBot(discord.Client):
         self._boot_id = uuid4().hex
         self._settings = settings
         self._daily_summaries = DailySummaryService(service.store)
+        live_twitch: TwitchClient = twitch or UnavailableTwitchClient()
+        live_runtime_enabled = settings.live_signals_enabled and twitch is not None
+        self._live_runtime_enabled = live_runtime_enabled
+        live_signals = (
+            LiveSignalService(service.store, live_twitch) if live_runtime_enabled else None
+        )
+        self._live_runtime = LiveSignalRuntime(
+            service.store,
+            live_signals,
+            receipts=service,
+        )
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
         self.daily_health_summary.start()
+        if self._live_runtime_enabled:
+            self.live_signal_reconciliation.start()
 
     async def close(self) -> None:
         self.daily_health_summary.cancel()
+        self.live_signal_reconciliation.cancel()
         await super().close()
 
     async def run_daily_summary_for_guild(
@@ -467,9 +485,24 @@ class KrubitBot(discord.Client):
 
     async def on_guild_available(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
+        await self._live_runtime.configure_guild(guild)
+        await self._live_runtime.reconcile_guild(guild)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
+        await self._live_runtime.configure_guild(guild)
+        await self._live_runtime.reconcile_guild(guild)
+
+    async def on_presence_update(self, before: discord.Member, after: discord.Member) -> None:
+        await self._live_runtime.handle_presence(before, after)
+
+    @tasks.loop(seconds=60)
+    async def live_signal_reconciliation(self) -> None:
+        await self._live_runtime.reconcile_all(self.guilds)
+
+    @live_signal_reconciliation.before_loop
+    async def before_live_signal_reconciliation(self) -> None:
+        await self.wait_until_ready()
 
     async def _ingest_change(
         self,

@@ -14,6 +14,7 @@ import aiohttp
 from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
 from krubit.discord.install import install_url
+from krubit.integrations.twitch import TwitchHelixClient
 from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
 from krubit.storage.sqlite import SQLiteStore
@@ -77,15 +78,32 @@ async def _database_command(args: argparse.Namespace, settings: Settings) -> int
 
 
 async def _run_bot(settings: Settings) -> int:
-    store = await SQLiteStore.open(settings.database_path)
-    await store.initialize()
-    connector = aiohttp.TCPConnector(ssl=system_ssl_context())
-    bot = KrubitBot(settings, FoundationService(store), connector=connector)
+    twitch_session: aiohttp.ClientSession | None = None
+    connector: aiohttp.TCPConnector | None = None
+    store: SQLiteStore | None = None
+    bot: KrubitBot | None = None
+    twitch = None
+    if settings.live_signals_enabled:
+        client_id, client_secret = settings.require_twitch_credentials()
+        twitch_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=system_ssl_context())
+        )
+        twitch = TwitchHelixClient(twitch_session, client_id, client_secret)
     try:
+        store = await SQLiteStore.open(settings.database_path)
+        await store.initialize()
+        connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+        bot = KrubitBot(settings, FoundationService(store), connector=connector, twitch=twitch)
         await bot.start(settings.require_token())
     finally:
-        await bot.close()
-        await store.close()
+        if bot is not None:
+            await bot.close()
+        elif connector is not None:
+            await connector.close()
+        if store is not None:
+            await store.close()
+        if twitch_session is not None:
+            await twitch_session.close()
     return 0
 
 
