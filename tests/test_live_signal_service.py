@@ -667,3 +667,27 @@ async def test_url_switch_clears_ended_session_ownership_for_stale_remove(
 
     old = await store.get_live_session(111, first.session_key)
     assert old is not None and old.role_assigned_by_krubit is False
+
+
+@pytest.mark.asyncio
+async def test_late_role_callback_cannot_revive_an_ended_session(store: SQLiteStore) -> None:
+    service = LiveSignalService(store, FakeTwitch.live())
+    begun = await service.begin_presence(observation(), now=NOW)
+    saved = await store.get_live_session(111, begun.session_key)
+    assert saved is not None
+    await store.save_live_session(
+        replace(saved, status=LiveSignalStatus.ENDED, ended_at=NOW, presence_active=False)
+    )
+
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="failed"
+    )
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+
+    terminal = await store.get_live_session(111, begun.session_key)
+    assert terminal is not None
+    assert terminal.status is LiveSignalStatus.ENDED and terminal.ended_at == NOW
+    assert terminal.role_assigned_by_krubit is False
+    assert await service.recover_pending(111) == ()

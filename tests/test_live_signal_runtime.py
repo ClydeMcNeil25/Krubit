@@ -407,6 +407,8 @@ async def test_reconcile_defers_same_session_announcement_after_recovered_role_f
 ) -> None:
     executor, store, guild, service = runtime
     assert await executor.configure_guild(as_guild(guild)) is not None
+    twitch = cast(ScriptedTwitch, service._twitch)  # pyright: ignore[reportPrivateUsage]
+    twitch.results = [live_lookup(), live_lookup(), live_lookup(), live_lookup()]
     begun = await service.begin_presence(observation(), now=NOW)
     guild.member.add_failure = True
 

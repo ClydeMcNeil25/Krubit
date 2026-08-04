@@ -231,7 +231,11 @@ class LiveSignalService:
                         plans.append(self._plan(session, actions, recovery=True))
             for delivery in await self._store.list_claimed_live_deliveries(guild_id):
                 session = await self._store.get_live_session(guild_id, delivery.session_key)
-                if session is None or session.status is LiveSignalStatus.ENDED:
+                if (
+                    session is None
+                    or session.status is LiveSignalStatus.ENDED
+                    or session.ended_at is not None
+                ):
                     continue
                 actions: tuple[LiveSignalAction, ...] = (LiveSignalAction.ANNOUNCE,)
                 if session.role_id is None:
@@ -357,6 +361,8 @@ class LiveSignalService:
         if config is None or config.role_id != role_id:
             raise ValueError("role_id must match the configured streaming role")
         session = await self._required_session(guild_id, session_key)
+        if session.status is LiveSignalStatus.ENDED or session.ended_at is not None:
+            return
         if status == "failed":
             await self._store.save_live_session(replace(session, status=LiveSignalStatus.FAILED))
             return
