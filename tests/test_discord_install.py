@@ -2,7 +2,13 @@ from urllib.parse import parse_qs, urlparse
 
 import discord
 
-from krubit.discord.install import install_url, phase_zero_intents, phase_zero_permissions
+from krubit.discord.install import (
+    install_url,
+    phase_one_intents,
+    phase_one_permissions,
+    phase_zero_intents,
+    phase_zero_permissions,
+)
 
 
 def test_phase_zero_enables_only_guilds_intent() -> None:
@@ -31,5 +37,20 @@ def test_install_url_contains_guild_install_scopes_and_permissions() -> None:
     assert parsed.path == "/oauth2/authorize"
     assert query["client_id"] == ["123456789012345678"]
     assert set(query["scope"][0].split(" ")) == {"bot", "applications.commands"}
-    assert query["permissions"] == [str(phase_zero_permissions().value)]
+    assert query["permissions"] == [str(phase_one_permissions().value)]
     assert query["integration_type"] == ["0"]
+
+
+def test_phase_one_adds_members_intent_and_read_only_audit_access() -> None:
+    intents = phase_one_intents()
+    permissions = phase_one_permissions()
+
+    assert intents.guilds is True
+    assert intents.members is True
+    assert permissions.view_audit_log is True
+    assert permissions.manage_guild is False
+    assert permissions.manage_channels is False
+    assert permissions.manage_roles is False
+    assert permissions.manage_webhooks is False
+    assert permissions.kick_members is False
+    assert permissions.ban_members is False
