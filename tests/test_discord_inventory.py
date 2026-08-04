@@ -6,7 +6,11 @@ from typing import Any, cast
 import discord
 import pytest
 
-from krubit.discord.install import phase_zero_permissions
+from krubit.discord.install import (
+    phase_one_permissions,
+    phase_two_permissions,
+    phase_zero_permissions,
+)
 from krubit.discord.inventory import capture_inventory
 
 
@@ -113,6 +117,32 @@ async def test_capture_inventory_identifies_unexpected_mutation_permissions() ->
 
     permissions = cast(dict[str, object], capture.content["bot_permissions"])
     assert permissions["unexpected_mutation"] == ["kick_members", "manage_guild"]
+
+
+@pytest.mark.asyncio
+async def test_capture_inventory_excludes_required_manage_roles_from_mutation_findings() -> None:
+    granted = phase_one_permissions()
+    granted.manage_roles = True
+    phase_one_capture = await capture_inventory(
+        cast(discord.Guild, FakeGuild((10,), granted=granted)),
+        required_permissions=phase_one_permissions(),
+        configured_channel_id=None,
+    )
+    phase_two_capture = await capture_inventory(
+        cast(discord.Guild, FakeGuild((10,), granted=granted)),
+        required_permissions=phase_two_permissions(),
+        configured_channel_id=None,
+    )
+
+    phase_one_permissions_content = cast(
+        dict[str, object], phase_one_capture.content["bot_permissions"]
+    )
+    phase_two_permissions_content = cast(
+        dict[str, object], phase_two_capture.content["bot_permissions"]
+    )
+    assert phase_one_permissions_content["unexpected_mutation"] == ["manage_roles"]
+    assert phase_two_permissions_content["unexpected_mutation"] == []
+    assert phase_two_permissions_content["missing_required"] == ["mention_everyone"]
 
 
 @pytest.mark.asyncio

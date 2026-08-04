@@ -153,7 +153,9 @@ async def capture_inventory(
     missing_values.extend(missing_names)
     mutation_values: list[JSONValue] = []
     mutation_values.extend(
-        name for name in _MUTATION_PERMISSIONS if getattr(granted, name, False)
+        name
+        for name in _MUTATION_PERMISSIONS
+        if getattr(granted, name, False) and name not in required_names
     )
     configured: dict[str, JSONValue] | None = (
         None
