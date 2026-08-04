@@ -45,6 +45,9 @@ reuse the existing announcement rather than create a replacement message.
 | `1e457b1` | Rendered Discord live-signal cards |
 | `5b8085e` through `3f135a3` | Added Discord runtime, restart recovery, terminal retirement, and transaction hardening |
 | `71aaa7e`, `14c21b5` | Added staff controls and corrected reconciliation applied-plan counting |
+| `948dc8f`, `abc9396` | Corrected permission classification and Discord nonce length |
+| `a818bd9` | Added the linked, large Twitch stream preview |
+| `c1d07fd`, `a104933` | Made ended-session role cleanup durable and restart-safe |
 
 ## Schema and operational surfaces
 
@@ -58,11 +61,11 @@ The operator surface is documented in the [Phase 2A operations guide](../operati
 authorized, ephemeral staff responses. The test preview has no public content, role
 adapter, or channel-send path.
 
-## Automated verification through Task 8
+## Final automated verification
 
-The final Task 8 verification recorded:
+The final merged Phase 2A verification recorded:
 
-- Full test suite: `200 passed in 12.80s`.
+- Full test suite: `206 passed in 12.51s`.
 - Full Ruff: `All checks passed!`.
 - Full Pyright: `0 errors, 0 warnings, 0 informations`.
 - `git diff --check`: exit `0`; Windows emitted only informational line-ending notices.
@@ -77,17 +80,25 @@ suite reported `40 passed`.
 No automated test used a real Twitch request, changed a Discord role, sent a Discord
 message, or issued an `@everyone` notification.
 
-## Controlled live canary status
+## Controlled live canary result
 
-The controlled live canary has not run. It requires explicit user go-ahead before setting
-the live-signal flag true for a real `@everyone` ping. Therefore there are no live Discord
-message receipts, role-change receipts, stream observations, or canary timestamps to
-record in this development log.
+The user authorized and completed a real Twitch/Discord canary after reconnecting Twitch
+to Discord. Krubit detected the public Discord Streaming activity, obtained Twitch
+evidence, assigned the configured `Streaming Now` role, and delivered one announcement
+to the configured live-notifications channel with the approved `@everyone` behavior.
+The durable delivery receipt prevented a duplicate announcement.
 
-Until that authorization is given, the supported validation path is shadow mode with
-`KRUBIT_LIVE_SIGNALS_ENABLED=false`, `/fetch live test`, `/fetch permissions`, `/fetch
-integrations`, and `/fetch live status`. The preview and preflight are available without
-publishing a card or changing a role.
+The canary exposed Discord's 25-character message nonce limit; Krubit's deterministic
+nonce was shortened and the delivery then succeeded. The announcement renderer was also
+enhanced with a linked Twitch title, compact thumbnail, large 640-by-360 stream preview,
+creator, platform, title, category, status, and a direct watch button. This enhanced card
+is covered by automated renderer tests and is ready for the next genuine live event.
+
+End-of-stream verification exposed stale role-ownership receipts after a terminal session.
+Krubit now accepts successful removal receipts for ended sessions, recovers legacy ended
+sessions that still claim role ownership, and treats an already-absent Discord role as a
+successful idempotent cleanup. After deployment, the stale terminal-session count reached
+zero and Krubit was relaunched from the merged `main` branch.
 
 ## Safety and recovery notes
 
