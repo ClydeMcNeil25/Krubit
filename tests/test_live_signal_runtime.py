@@ -297,6 +297,25 @@ async def test_apply_plan_removes_only_the_exact_owned_configured_role(
 
 
 @pytest.mark.asyncio
+async def test_remove_plan_clears_ownership_when_role_is_already_absent(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, store, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    plan = await service.observe(observation(), now=NOW)
+    await executor.apply_plan(as_guild(guild), plan)
+    guild.member.roles.remove(guild.role)
+    ended = await service.reconcile(111, now=NOW)
+
+    assert len(ended) == 1
+    await executor.apply_plan(as_guild(guild), ended[0])
+
+    saved = await store.get_live_session(111, plan.session_key)
+    assert saved is not None and saved.role_assigned_by_krubit is False
+    assert guild.member.removed_roles == []
+
+
+@pytest.mark.asyncio
 async def test_announcement_without_mention_permission_is_degraded_without_implicit_mentions(
     runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
 ) -> None:

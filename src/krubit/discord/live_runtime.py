@@ -265,6 +265,13 @@ class LiveSignalRuntime:
         ):
             return
         if not any(getattr(item, "id", None) == role.id for item in getattr(member, "roles", ())):
+            await signals.record_role_result(
+                guild.id,
+                plan.session_key,
+                role_id=role.id,
+                assigned_by_krubit=False,
+                status="succeeded",
+            )
             return
         try:
             await member.remove_roles(role, reason=_reason(plan.session_key))
