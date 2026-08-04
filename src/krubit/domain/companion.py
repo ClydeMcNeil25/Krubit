@@ -36,3 +36,17 @@ class SnapshotRecord:
             raise ValueError("snapshot guild and version must be positive")
         if self.captured_at.tzinfo is None or self.captured_at.utcoffset() is None:
             raise ValueError("snapshot timestamp must include a timezone")
+
+
+@dataclass(frozen=True, slots=True)
+class DiffItem:
+    section: str
+    resource_id: str
+    change: str
+    fields: dict[str, JSONValue]
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDiff:
+    direction: str
+    items: tuple[DiffItem, ...]
