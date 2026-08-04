@@ -30,7 +30,7 @@ def _report(findings: list[HealthFinding], checked_at: datetime) -> HealthReport
 def _permission_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
     permissions = _dict(snapshot.content.get("bot_permissions"))
     missing = _strings(permissions.get("missing_required"))
-    return [
+    findings = [
         HealthFinding(
             "missing_required_permission",
             "warning",
@@ -38,6 +38,16 @@ def _permission_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:
         )
         for name in missing
     ]
+    unexpected = sorted(_strings(permissions.get("unexpected_mutation")))
+    findings.extend(
+        HealthFinding(
+            "unexpected_mutation_permission",
+            "warning",
+            f"Discord role unexpectedly grants mutation permission: {name}.",
+        )
+        for name in unexpected
+    )
+    return findings
 
 
 def _integration_findings(snapshot: SnapshotRecord) -> list[HealthFinding]:

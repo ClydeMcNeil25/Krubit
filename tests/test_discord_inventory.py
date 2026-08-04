@@ -23,7 +23,13 @@ class FakeGuild:
     scheduled_events: list[SimpleNamespace] = []
     me: SimpleNamespace
 
-    def __init__(self, role_order: tuple[int, ...], *, forbidden: bool = False) -> None:
+    def __init__(
+        self,
+        role_order: tuple[int, ...],
+        *,
+        forbidden: bool = False,
+        granted: discord.Permissions | None = None,
+    ) -> None:
         self.roles = [
             SimpleNamespace(
                 id=role_id,
@@ -36,7 +42,7 @@ class FakeGuild:
             for role_id in role_order
         ]
         self.channels = []
-        self.me = SimpleNamespace(guild_permissions=phase_zero_permissions())
+        self.me = SimpleNamespace(guild_permissions=granted or phase_zero_permissions())
         self._forbidden = forbidden
 
     def get_channel(self, channel_id: int) -> None:
@@ -87,3 +93,20 @@ async def test_capture_inventory_is_stable_across_discord_resource_order() -> No
 
     assert first.content == second.content
     assert first.coverage == second.coverage == ()
+
+
+@pytest.mark.asyncio
+async def test_capture_inventory_identifies_unexpected_mutation_permissions() -> None:
+    granted = phase_zero_permissions()
+    granted.view_audit_log = True
+    granted.manage_guild = True
+    granted.kick_members = True
+
+    capture = await capture_inventory(
+        cast(discord.Guild, FakeGuild((10,), granted=granted)),
+        required_permissions=discord.Permissions(view_channel=True, view_audit_log=True),
+        configured_channel_id=None,
+    )
+
+    permissions = cast(dict[str, object], capture.content["bot_permissions"])
+    assert permissions["unexpected_mutation"] == ["kick_members", "manage_guild"]

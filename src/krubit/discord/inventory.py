@@ -10,6 +10,18 @@ import discord
 from krubit.domain.companion import CoverageIssue
 from krubit.domain.models import JSONValue
 
+_MUTATION_PERMISSIONS = (
+    "administrator",
+    "ban_members",
+    "kick_members",
+    "manage_channels",
+    "manage_guild",
+    "manage_messages",
+    "manage_roles",
+    "manage_webhooks",
+    "moderate_members",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class InventoryCapture:
@@ -134,6 +146,10 @@ async def capture_inventory(
     required_values.extend(required_names)
     missing_values: list[JSONValue] = []
     missing_values.extend(missing_names)
+    mutation_values: list[JSONValue] = []
+    mutation_values.extend(
+        name for name in _MUTATION_PERMISSIONS if getattr(granted, name, False)
+    )
     configured: dict[str, JSONValue] | None = (
         None
         if configured_channel_id is None
@@ -146,6 +162,7 @@ async def capture_inventory(
         "granted": str(granted.value),
         "required": required_values,
         "missing_required": missing_values,
+        "unexpected_mutation": mutation_values,
     }
     role_values: list[JSONValue] = []
     role_values.extend(sorted((_role(role) for role in guild.roles), key=_id_sort))

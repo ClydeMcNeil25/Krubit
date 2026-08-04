@@ -11,6 +11,7 @@ def snapshot_with(
     missing: list[str] | None = None,
     coverage: tuple[CoverageIssue, ...] = (),
     configured_present: bool | None = None,
+    unexpected_mutation: list[str] | None = None,
 ) -> SnapshotRecord:
     configured: dict[str, JSONValue] | None = (
         None
@@ -19,8 +20,13 @@ def snapshot_with(
     )
     missing_values: list[JSONValue] = []
     missing_values.extend(missing or [])
+    mutation_values: list[JSONValue] = []
+    mutation_values.extend(unexpected_mutation or [])
     content: dict[str, JSONValue] = {
-        "bot_permissions": {"missing_required": missing_values},
+        "bot_permissions": {
+            "missing_required": missing_values,
+            "unexpected_mutation": mutation_values,
+        },
         "configured_channel": configured,
     }
     return SnapshotRecord(
@@ -103,3 +109,20 @@ def test_specialized_health_reports_limit_their_factual_sections() -> None:
     assert [finding.code for finding in integrations.findings] == [
         "limited_automod_coverage"
     ]
+
+
+def test_permission_health_warns_when_discord_role_grants_mutation_authority() -> None:
+    snapshot = snapshot_with(
+        captured_at=datetime(2026, 8, 4, tzinfo=UTC),
+        unexpected_mutation=["manage_roles", "ban_members"],
+    )
+
+    report = HealthService().permission_health(snapshot)
+
+    assert report.status == "warning"
+    assert [finding.code for finding in report.findings] == [
+        "unexpected_mutation_permission",
+        "unexpected_mutation_permission",
+    ]
+    assert "ban_members" in report.findings[0].detail
+    assert "manage_roles" in report.findings[1].detail
