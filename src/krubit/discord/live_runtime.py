@@ -98,7 +98,10 @@ class LiveSignalRuntime:
         now = self._now()
         observation = extract_twitch_observation(after, observed_at=now)
         if observation is not None:
-            await self.apply_plan(guild, await self._signals.begin_presence(observation, now=now))
+            if not await self.apply_plan(
+                guild, await self._signals.begin_presence(observation, now=now)
+            ):
+                return
             await self.apply_plan(guild, await self._signals.enrich_presence(observation, now=now))
             return
         if extract_twitch_observation(before, observed_at=now) is not None:
@@ -106,26 +109,27 @@ class LiveSignalRuntime:
             if ending is not None:
                 await self.apply_plan(guild, ending)
 
-    async def apply_plan(self, guild: discord.Guild, plan: LiveSignalPlan) -> None:
+    async def apply_plan(self, guild: discord.Guild, plan: LiveSignalPlan) -> bool:
         """Apply a plan idempotently; never infer resources from mutable names."""
         if self._signals is None or guild.id != plan.guild_id:
-            return
+            return False
         if not await self._store.guild_is_enabled(guild.id):
-            return
+            return False
         async with self._guild_lock(guild.id):
             config = await self._store.get_live_signal_config(guild.id)
             if config is None or not self._configured_resources_are_usable(guild, config):
-                return
+                return False
             if LiveSignalAction.ENSURE_ROLE in plan.actions and not await self._ensure_role(
                 guild, config, plan
             ):
-                return
+                return False
             if LiveSignalAction.ANNOUNCE in plan.actions:
                 await self._announce(guild, config, plan)
             if LiveSignalAction.EDIT_ANNOUNCEMENT in plan.actions:
                 await self._edit_announcement(guild, config, plan)
             if LiveSignalAction.REMOVE_ROLE in plan.actions:
                 await self._remove_owned_role(guild, config, plan)
+        return True
 
     async def reconcile_guild(self, guild: discord.Guild) -> int:
         """Refresh one configured guild and execute its resulting plans."""
@@ -214,7 +218,13 @@ class LiveSignalRuntime:
                 assigned_by_krubit=owned,
                 status="succeeded",
             )
-        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+        except (
+            discord.HTTPException,
+            discord.Forbidden,
+            discord.NotFound,
+            PermissionError,
+            ValueError,
+        ):
             with suppress(ValueError):
                 await signals.record_role_result(
                     guild.id,

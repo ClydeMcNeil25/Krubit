@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import discord
 import pytest
@@ -40,12 +40,16 @@ class FakeMember:
         self.id = member_id
         self.roles = roles
         self.bot = bot
+        self.guild: object | None = None
         self.activities: tuple[object, ...] = ()
         self.display_name = "Krucial Studios"
         self.added_roles: list[FakeRole] = []
         self.removed_roles: list[FakeRole] = []
+        self.add_failure = False
 
     async def add_roles(self, role: FakeRole, *, reason: str) -> None:
+        if self.add_failure:
+            raise PermissionError("role denied")
         self.added_roles.append(role)
         self.roles.append(role)
 
@@ -77,6 +81,7 @@ class FakeTextChannel:
         )
         self.sent: list[dict[str, object]] = []
         self.messages: dict[int, FakeMessage] = {}
+        self.history_failure: BaseException | None = None
 
     def permissions_for(self, member: object) -> object:
         return self.permissions
@@ -91,6 +96,8 @@ class FakeTextChannel:
         return self.messages[message_id]
 
     async def history(self, *, limit: int) -> AsyncIterator[FakeMessage]:
+        if self.history_failure is not None:
+            raise self.history_failure
         for message in list(self.messages.values())[-limit:]:
             yield message
 
@@ -112,6 +119,7 @@ class FakeGuild:
         self.channel = channel
         self.role = role
         self.member = member
+        member.guild = self
         self.me = SimpleNamespace(
             guild_permissions=SimpleNamespace(manage_roles=can_manage_roles),
             top_role=FakeRole(1, "Krubit", top_role_position),
@@ -336,3 +344,62 @@ async def test_reconcile_all_applies_plans_without_retaining_background_tasks(
     await executor.apply_plan(as_guild(guild), plan)
 
     assert await executor.reconcile_all([as_guild(guild)]) == 1
+
+
+@pytest.mark.asyncio
+async def test_presence_role_failure_blocks_enrichment_then_recovery_announces_once(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, store, guild, _ = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    guild.member.activities = (
+        SimpleNamespace(
+            type=discord.ActivityType.streaming,
+            url="https://twitch.tv/krucialstudios",
+            start=NOW,
+        ),
+    )
+    guild.member.add_failure = True
+
+    await executor.handle_presence(as_member(guild.member), as_member(guild.member))
+
+    saved = (await store.list_active_live_sessions(111))[0]
+    assert guild.channel.sent == []
+    assert saved.stream is None and saved.role_id is None
+    guild.member.add_failure = False
+
+    await executor.reconcile_guild(as_guild(guild))
+
+    assert [role.id for role in guild.member.added_roles] == [333]
+    assert len(guild.channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_history_forbidden_keeps_claim_pending_without_sending(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, store, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    begun = await service.begin_presence(observation(), now=NOW)
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    announced = await service.enrich_presence(observation(), now=NOW)
+    guild.channel.history_failure = discord.Forbidden(
+        cast(Any, SimpleNamespace(status=403, reason="forbidden", headers={})), "forbidden"
+    )
+    recovery = (await service.recover_pending(111))[0]
+
+    await executor.apply_plan(as_guild(guild), recovery)
+
+    assert announced.stream is not None
+    delivery = await store.get_live_delivery(111, f"stream:{announced.stream.stream_id}")
+    assert guild.channel.sent == []
+    assert delivery is not None and delivery.status == "claimed"
+    guild.channel.history_failure = None
+    await executor.apply_plan(as_guild(guild), recovery)
+    assert len(guild.channel.sent) == 1
+
+
+def as_member(member: FakeMember) -> discord.Member:
+    return cast(discord.Member, member)
