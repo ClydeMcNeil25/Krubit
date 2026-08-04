@@ -97,6 +97,13 @@ and records the condition. If role execution fails, enrichment and announcement 
 that session are deferred for recovery. Reconciliation is idempotent and counts only
 plans it actually applies.
 
+Each send has a deterministic nonce. Crash recovery scans at most 25 recent Krubit-authored
+messages in the configured destination for that nonce. discord.py 2.7.1 exposes `nonce`
+but not `enforce_nonce`, so external exactly-once delivery cannot be guaranteed if a crash
+occurs after Discord accepts a send but before its receipt is recorded and the message is
+outside that bounded scan. Missing or failed Read Message History is contained: the claim
+stays retryable and Krubit does not blindly resend.
+
 Rollback disables the live runtime, retains the additive database records, and preserves
 Phase 1 monitoring. Manual removal is limited to stale `Streaming Now` roles whose
 receipts prove Krubit assigned them; no other roles should be changed.

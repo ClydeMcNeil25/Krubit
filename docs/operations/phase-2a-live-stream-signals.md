@@ -17,8 +17,10 @@ notification features.
 2. Install or update the bot with `scripts/invoke-krubit.ps1 install-url`. Confirm the
    generated installation does not request Administrator.
 3. Give the Krubit role **Manage Roles** and **Mention @everyone, @here, and All Roles**.
-   It also needs the existing destination permissions: View Channel, Send Messages, and
-   Embed Links.
+   It also needs the destination permissions **View Channel**, **Send Messages**, **Embed
+   Links**, and **Read Message History**. Read Message History is separate from the
+   view/send/embed/mention permissions: it supports the bounded crash-recovery nonce scan
+   described below.
 4. Put Krubit's role above `Streaming Now` in the Discord role hierarchy. The bot will not
    manage a role at or above its own top role.
 5. Create the text channel `#live-notifications` and the role `Streaming Now` with those
@@ -110,6 +112,15 @@ When the bot cannot mention everyone, delivery degrades to a no-mention card and
 that condition. If the destination is unavailable or cannot accept messages or embeds,
 the live delivery remains failed or pending for a later reconciliation; do not use a
 different channel as an undocumented substitute.
+
+Each send uses a deterministic nonce. During recovery, Krubit scans at most 25 recent
+messages authored by Krubit in the configured destination for that nonce before deciding
+whether to send. discord.py 2.7.1 exposes `nonce` but not `enforce_nonce`, so an external
+exactly-once guarantee is not possible if Krubit crashes after Discord accepts a send but
+before Krubit records its receipt and that message is outside the bounded scan. If Read
+Message History is missing or the scan fails, Krubit contains the error, leaves the
+delivery claim retryable, and does not blindly resend. Operators do not need to search
+channel history manually.
 
 ## Rollback
 
