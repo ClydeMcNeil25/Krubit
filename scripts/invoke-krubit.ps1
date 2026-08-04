@@ -10,6 +10,12 @@ $projectPath = Split-Path -Parent $PSScriptRoot
 $allowedNames = @(
     "DISCORD_KRUBIT_APPLICATION_ID",
     "DISCORD_KRUBIT_BOT_TOKEN",
+    "KRUBIT_DATABASE_PATH",
+    "KRUBIT_STAFF_CHANNEL_ID"
+)
+$requiredNames = @(
+    "DISCORD_KRUBIT_APPLICATION_ID",
+    "DISCORD_KRUBIT_BOT_TOKEN",
     "KRUBIT_DATABASE_PATH"
 )
 $loadedNames = @{}
@@ -33,14 +39,17 @@ foreach ($line in Get-Content -LiteralPath $masterEnvPath) {
     }
 
     if ([string]::IsNullOrWhiteSpace($value)) {
-        throw "$name is empty in the master .env"
+        if ($requiredNames -contains $name) {
+            throw "$name is empty in the master .env"
+        }
+        continue
     }
 
     [Environment]::SetEnvironmentVariable($name, $value, "Process")
     $loadedNames[$name] = $true
 }
 
-foreach ($name in $allowedNames) {
+foreach ($name in $requiredNames) {
     if (-not $loadedNames.ContainsKey($name)) {
         throw "$name is missing from the master .env"
     }

@@ -112,6 +112,8 @@ Advance only when two test guilds cannot read or mutate each other's configurati
 
 ## Phase 1: Reliable Companion MVP
 
+**Implementation status (2026-08-03):** Built for shadow canary; live rollout requires the Server Members Intent and staff smoke checks.
+
 ### Goal
 
 Make Krubit useful every day through reliable Discord-native monitoring and functional `/fetch` outputs.
@@ -379,4 +381,3 @@ Safety essentials should not be deliberately weakened to force an upgrade. Paid 
 The first implementation plan should cover Phase 0 only. It should produce a minimal installable Krubit that can connect to isolated test guilds, ingest and deduplicate events, authorize `/fetch status`, render test cards, store redacted receipts, and emit a schema-valid test signal for Zariya without performing moderation or member profiling.
 
 Creator feeds, Entry Sniffing, the Member Activity Ledger, and Zariya runtime migration should each receive separate implementation plans after the preceding phase passes its exit gate.
-

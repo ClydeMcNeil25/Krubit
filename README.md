@@ -4,19 +4,27 @@ Krubit is Zariya's non-conversational Discord pet and operational companion. He 
 functional system results, records auditable events, and provides a safe foundation for later
 creator notifications, server monitoring, Entry Sniffing, and member activity measurement.
 
-## Phase 0 capabilities
+## Phase 1 capabilities
 
 - Guild-isolated SQLite configuration, events, and action receipts
 - Idempotent event ingestion
 - Recursive credential redaction before durable storage or signal output
 - Least-privilege Discord installation URL
-- Non-privileged Guilds Gateway intent
+- Guilds and Server Members Gateway intents for factual join/leave collection
+- Member, role, channel, permission, webhook, AutoMod, and Scheduled Event change records
+- Stable configuration snapshots with integrity hashes and human-readable differences
+- Factual server, permission, and integration health checks
 - `/fetch status` for server-scoped health
 - Manage-Guild-only `/fetch test-card`
+- Staff-only `/fetch server-health`, `/fetch changes`, `/fetch permissions`, and
+  `/fetch integrations`
+- Staff-only `/fetch backup status`, `/fetch backup create`, and non-mutating
+  `/fetch backup preview`
+- Once-daily health summaries with explicit private-channel opt-in
 - Versioned `krubit.zariya-signal.v1` foundation test signal
 - Administrative CLI for initialization, guild enablement, status, and smoke testing
 
-Phase 0 does not moderate members, profile members, poll creator platforms, read message
+Phase 1 does not moderate members, profile members, poll creator platforms, read message
 content, or mutate Discord server configuration.
 
 ## Development
@@ -28,7 +36,8 @@ uv run ruff check .
 uv run pyright
 ```
 
-See the [Phase 0 setup guide](docs/operations/phase-0-setup.md),
+See the [Phase 1 operations guide](docs/operations/phase-1-operations.md),
+[Phase 0 setup guide](docs/operations/phase-0-setup.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
 
