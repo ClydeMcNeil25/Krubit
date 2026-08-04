@@ -43,3 +43,8 @@ See the [Phase 1 operations guide](docs/operations/phase-1-operations.md),
 
 When using the workspace-level master `.env`, invoke Krubit through
 `scripts/invoke-krubit.ps1` so only Krubit's approved environment variables are loaded.
+
+## Legal documents
+
+- [Privacy Policy](docs/PRIVACY_POLICY.md)
+- [Terms of Service](docs/TERMS_OF_SERVICE.md)
