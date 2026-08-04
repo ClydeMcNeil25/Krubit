@@ -141,13 +141,16 @@ class LiveSignalRuntime:
         reconciled = await self._signals.reconcile(guild.id, now=self._now())
         plans = tuple(sorted((*recovered, *reconciled), key=_plan_order))
         blocked_sessions: set[str] = set()
+        applied_count = 0
         for plan in plans:
             if plan.session_key in blocked_sessions:
                 continue
             applied = await self.apply_plan(guild, plan)
+            if applied:
+                applied_count += 1
             if LiveSignalAction.ENSURE_ROLE in plan.actions and not applied:
                 blocked_sessions.add(plan.session_key)
-        return len(plans)
+        return applied_count
 
     async def reconcile_all(self, guilds: Iterable[discord.Guild]) -> int:
         """Reconcile available guilds without creating independent background tasks."""

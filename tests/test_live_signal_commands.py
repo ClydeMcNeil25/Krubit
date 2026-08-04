@@ -85,7 +85,7 @@ class FakeReconcileCallback:
 
     async def __call__(self, guild: discord.Guild) -> int:
         self.calls.append(guild.id)
-        return 2
+        return 1
 
 
 def command(commands: LiveCommands, name: str) -> discord.app_commands.Command[Any, Any, Any]:
@@ -194,9 +194,12 @@ async def test_fetch_live_reconcile_calls_only_the_idempotent_callback_and_recei
 
         assert callback.calls == [111]
         assert interaction.edited_embed is not None
+        assert [(field.name, field.value) for field in interaction.edited_embed.fields] == [
+            ("Plans applied", "1")
+        ]
         receipts = await store.list_receipts(111)
         assert [(item.action, item.detail) for item in receipts] == [
-            ("fetch_live_reconcile", {"plans_applied": 2})
+            ("fetch_live_reconcile", {"plans_applied": 1})
         ]
     finally:
         await store.close()

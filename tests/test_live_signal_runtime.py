@@ -348,6 +348,68 @@ async def test_reconcile_all_applies_plans_without_retaining_background_tasks(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_counts_only_successfully_applied_plans_and_skips_blocked_sessions(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, _, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    failed_role = LiveSignalPlan(
+        guild_id=111,
+        session_key="failed-role",
+        actions=(LiveSignalAction.ENSURE_ROLE,),
+    )
+    skipped_announcement = LiveSignalPlan(
+        guild_id=111,
+        session_key="failed-role",
+        actions=(LiveSignalAction.ANNOUNCE,),
+    )
+    failed_announcement = LiveSignalPlan(
+        guild_id=111,
+        session_key="failed-announcement",
+        actions=(LiveSignalAction.ANNOUNCE,),
+    )
+    succeeded_first = LiveSignalPlan(
+        guild_id=111,
+        session_key="succeeded-first",
+        actions=(LiveSignalAction.ANNOUNCE,),
+    )
+    succeeded_second = LiveSignalPlan(
+        guild_id=111,
+        session_key="succeeded-second",
+        actions=(LiveSignalAction.REMOVE_ROLE,),
+    )
+    attempted: list[str] = []
+
+    async def recover_pending(guild_id: int) -> tuple[LiveSignalPlan, ...]:
+        assert guild_id == 111
+        return failed_role, skipped_announcement
+
+    async def reconcile(guild_id: int, *, now: datetime) -> tuple[LiveSignalPlan, ...]:
+        assert guild_id == 111 and now == NOW
+        return failed_announcement, succeeded_first, succeeded_second
+
+    async def apply_plan(guild: discord.Guild, plan: LiveSignalPlan) -> bool:
+        assert guild.id == 111
+        attempted.append(plan.session_key)
+        return plan.session_key.startswith("succeeded")
+
+    monkeypatch.setattr(service, "recover_pending", recover_pending)
+    monkeypatch.setattr(service, "reconcile", reconcile)
+    monkeypatch.setattr(executor, "apply_plan", apply_plan)
+
+    applied = await executor.reconcile_guild(as_guild(guild))
+
+    assert applied == 2
+    assert attempted == [
+        "failed-announcement",
+        "failed-role",
+        "succeeded-first",
+        "succeeded-second",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_presence_role_failure_blocks_enrichment_then_recovery_announces_once(
     runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
 ) -> None:
