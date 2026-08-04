@@ -556,6 +556,19 @@ class SQLiteStore:
         )
         return self._live_signal_delivery_from_row(await cursor.fetchone())
 
+    async def list_claimed_live_deliveries(self, guild_id: int) -> list[LiveSignalDelivery]:
+        """Return only durable delivery claims that need runtime recovery."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, delivery_key, session_key, status, attempt, channel_id, message_id
+            FROM live_signal_deliveries WHERE guild_id = ? AND status = 'claimed'
+            """,
+            (guild_id,),
+        )
+        deliveries = [self._live_signal_delivery_from_row(row) for row in await cursor.fetchall()]
+        return [delivery for delivery in deliveries if delivery is not None]
+
     async def merge_live_delivery_identity(
         self,
         guild_id: int,

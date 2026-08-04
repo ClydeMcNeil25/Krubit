@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import suppress
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Protocol, cast
 
 import discord
@@ -97,7 +98,8 @@ class LiveSignalRuntime:
         now = self._now()
         observation = extract_twitch_observation(after, observed_at=now)
         if observation is not None:
-            await self.apply_plan(guild, await self._signals.observe(observation, now=now))
+            await self.apply_plan(guild, await self._signals.begin_presence(observation, now=now))
+            await self.apply_plan(guild, await self._signals.enrich_presence(observation, now=now))
             return
         if extract_twitch_observation(before, observed_at=now) is not None:
             ending = await self._signals.presence_ended(guild.id, after.id, now=now)
@@ -131,7 +133,9 @@ class LiveSignalRuntime:
             return 0
         if await self.configure_guild(guild) is None:
             return 0
-        plans = await self._signals.reconcile(guild.id, now=self._now())
+        recovered = await self._signals.recover_pending(guild.id)
+        reconciled = await self._signals.reconcile(guild.id, now=self._now())
+        plans = (*recovered, *reconciled)
         for plan in plans:
             await self.apply_plan(guild, plan)
         return len(plans)
@@ -142,6 +146,20 @@ class LiveSignalRuntime:
         for guild in guilds:
             count += await self.reconcile_guild(guild)
         return count
+
+    async def bootstrap_guild(self, guild: discord.Guild) -> int:
+        """Discover cached current streaming presences after an offline interval."""
+        if await self.configure_guild(guild) is None:
+            return 0
+        for member in guild.members:
+            await self.handle_presence(member, member)
+        return await self.reconcile_guild(guild)
+
+    async def handle_member_leave(self, member: discord.Member) -> None:
+        """End member sessions without trying to mutate a departed Discord member."""
+        if self._signals is None or not await self._store.guild_is_enabled(member.guild.id):
+            return
+        await self._signals.member_left(member.guild.id, member.id, now=self._now())
 
     def _configured_resources_are_usable(
         self, guild: discord.Guild, config: LiveSignalConfig
@@ -282,6 +300,22 @@ class LiveSignalRuntime:
         ):
             await self._record_delivery_failure(config, plan)
             return
+        nonce = _delivery_nonce(guild.id, delivery_key, plan.delivery_attempt)
+        if plan.recovery:
+            recovered_message = await _find_nonce_message(text_channel, guild.me, nonce)
+            if recovered_message is not None:
+                try:
+                    await signals.record_delivery_result(
+                        guild.id,
+                        plan.session_key,
+                        status="succeeded",
+                        channel_id=config.channel_id,
+                        message_id=recovered_message.id,
+                        attempt=plan.delivery_attempt,
+                    )
+                except ValueError:
+                    return
+                return
         member = guild.get_member(session.member_id)
         display_name = getattr(member, "display_name", session.twitch_login)
         if not isinstance(display_name, str):
@@ -302,6 +336,7 @@ class LiveSignalRuntime:
                 embed=render_live_embed(observation, plan.stream),
                 view=build_live_view(session.twitch_url),
                 allowed_mentions=mentions,
+                nonce=nonce,
             )
             await signals.record_delivery_result(
                 guild.id,
@@ -400,9 +435,12 @@ class _TextChannel(Protocol):
         embed: discord.Embed,
         view: discord.ui.View,
         allowed_mentions: discord.AllowedMentions,
+        nonce: str,
     ) -> discord.Message: ...
 
     async def fetch_message(self, message_id: int) -> discord.Message: ...
+
+    def history(self, *, limit: int) -> AsyncIterator[discord.Message]: ...
 
 
 def _role_position(role: object) -> int:
@@ -413,3 +451,20 @@ def _role_position(role: object) -> int:
 def _reason(session_key: str) -> str:
     """Keep audit reasons non-secret and bounded to a durable session identity."""
     return f"Krubit live signal {session_key[:64]}"
+
+
+def _delivery_nonce(guild_id: int, delivery_key: str, attempt: int) -> str:
+    return sha256(f"{guild_id}:{delivery_key}:{attempt}".encode()).hexdigest()[:32]
+
+
+async def _find_nonce_message(
+    channel: _TextChannel, bot_member: object, nonce: str
+) -> discord.Message | None:
+    """Bound recovery scan; discord.py exposes nonce but no enforce_nonce switch."""
+    async for message in channel.history(limit=25):
+        if (
+            getattr(getattr(message, "author", None), "id", None) == getattr(bot_member, "id", None)
+            and getattr(message, "nonce", None) == nonce
+        ):
+            return message
+    return None

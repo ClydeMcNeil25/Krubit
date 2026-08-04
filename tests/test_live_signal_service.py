@@ -559,3 +559,57 @@ async def test_integration_health_uses_the_latest_twitch_check(store: SQLiteStor
     await service.reconcile(111, now=NOW + timedelta(minutes=2))
 
     assert await service.integration_health(111) == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_begin_presence_persists_and_plans_role_before_twitch_enrichment(
+    store: SQLiteStore,
+) -> None:
+    twitch = HangingTwitch()
+    service = LiveSignalService(store, twitch)
+
+    plan = await service.begin_presence(observation(), now=NOW)
+
+    assert plan.actions == (LiveSignalAction.ENSURE_ROLE,)
+    assert await store.get_live_session(111, plan.session_key) is not None
+
+
+@pytest.mark.asyncio
+async def test_url_switch_ends_old_session_and_transfers_owned_role(store: SQLiteStore) -> None:
+    service = LiveSignalService(store, FakeTwitch([TwitchLookup(TwitchLookupKind.LIVE, stream())]))
+    first = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, first.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    replacement = StreamingObservation(
+        guild_id=111,
+        member_id=222,
+        twitch_login="othercreator",
+        twitch_url="https://twitch.tv/othercreator",
+        activity_started_at=NOW,
+        observed_at=NOW,
+    )
+
+    plan = await service.begin_presence(replacement, now=NOW + timedelta(minutes=1))
+
+    old = await store.get_live_session(111, first.session_key)
+    new = await store.get_live_session(111, plan.session_key)
+    assert old is not None and old.status is LiveSignalStatus.ENDED
+    assert new is not None and new.role_id == 333 and new.role_assigned_by_krubit is True
+    assert plan.actions == ()
+
+
+@pytest.mark.asyncio
+async def test_member_left_ends_sessions_and_clears_role_ownership(store: SQLiteStore) -> None:
+    service = LiveSignalService(store, FakeTwitch.live())
+    initial = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, initial.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+
+    await service.member_left(111, 222, now=NOW + timedelta(minutes=1))
+
+    saved = await store.get_live_session(111, initial.session_key)
+    assert saved is not None
+    assert saved.status is LiveSignalStatus.ENDED
+    assert saved.role_assigned_by_krubit is False

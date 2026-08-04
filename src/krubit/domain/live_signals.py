@@ -211,6 +211,7 @@ class LiveSignalPlan:
     announcement_channel_id: int | None = None
     announcement_message_id: int | None = None
     delivery_attempt: int | None = None
+    recovery: bool = False
 
     def __post_init__(self) -> None:
         _require_positive_id("guild_id", self.guild_id)
@@ -229,6 +230,8 @@ class LiveSignalPlan:
                 _require_positive_id(name, identifier)
         if self.delivery_attempt is not None and self.delivery_attempt <= 0:
             raise ValueError("delivery_attempt must be positive")
+        if type(self.recovery) is not bool:
+            raise ValueError("recovery must be a bool")
 
 
 def provisional_session_key(observation: StreamingObservation) -> str:

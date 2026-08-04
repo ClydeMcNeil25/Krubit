@@ -59,7 +59,80 @@ class LiveSignalService:
     async def observe(
         self, observation: StreamingObservation, *, now: datetime
     ) -> LiveSignalPlan:
-        """Observe a Discord streaming presence and persist its next idempotent actions."""
+        """Compatibility helper that begins durable state before enrichment."""
+        begun = await self.begin_presence(observation, now=now)
+        enriched = await self.enrich_presence(observation, now=now)
+        enrichment_actions = tuple(
+            action for action in enriched.actions if action not in begun.actions
+        )
+        actions = begun.actions + enrichment_actions
+        return LiveSignalPlan(
+            guild_id=enriched.guild_id,
+            session_key=enriched.session_key,
+            actions=actions,
+            stream=enriched.stream,
+            member_id=enriched.member_id,
+            role_id=enriched.role_id,
+            announcement_channel_id=enriched.announcement_channel_id,
+            announcement_message_id=enriched.announcement_message_id,
+            delivery_attempt=enriched.delivery_attempt,
+        )
+
+    async def begin_presence(
+        self, observation: StreamingObservation, *, now: datetime
+    ) -> LiveSignalPlan:
+        """Persist a provisional session and role plan without waiting for Twitch."""
+        async with self._guild_lock(observation.guild_id):
+            _require_aware("now", now)
+            existing = await self._store.open_live_session(
+                observation.guild_id, observation.member_id, observation.twitch_login
+            )
+            if existing is not None:
+                saved = await self._store.save_live_session(
+                    replace(existing, presence_active=True, missing_since=None, last_discord_at=now)
+                )
+                return self._plan(saved, ())
+            transferred_role_id: int | None = None
+            transferred_owned = False
+            for active in await self._store.list_active_live_sessions(observation.guild_id):
+                if active.member_id != observation.member_id:
+                    continue
+                if active.role_assigned_by_krubit:
+                    transferred_role_id = active.role_id
+                    transferred_owned = True
+                await self._store.save_live_session(
+                    replace(
+                        active,
+                        status=LiveSignalStatus.ENDED,
+                        presence_active=False,
+                        role_assigned_by_krubit=False,
+                        ended_at=now,
+                    )
+                )
+            provisional = LiveSignalSession(
+                guild_id=observation.guild_id,
+                session_key=provisional_session_key(observation),
+                member_id=observation.member_id,
+                twitch_login=observation.twitch_login,
+                twitch_url=observation.twitch_url,
+                status=LiveSignalStatus.DETECTED,
+                detected_at=now,
+                presence_started_at=observation.activity_started_at,
+                role_id=transferred_role_id,
+                role_assigned_by_krubit=transferred_owned,
+                presence_active=True,
+                last_discord_at=now,
+            )
+            saved = await self._store.save_live_session(provisional)
+            return self._plan(
+                saved,
+                () if saved.role_assigned_by_krubit else (LiveSignalAction.ENSURE_ROLE,),
+            )
+
+    async def enrich_presence(
+        self, observation: StreamingObservation, *, now: datetime
+    ) -> LiveSignalPlan:
+        """Enrich a previously durable presence with bounded Twitch evidence."""
         async with self._guild_lock(observation.guild_id):
             return await self._observe(observation, now=now)
 
@@ -101,6 +174,10 @@ class LiveSignalService:
                     retry_attempt = await self._store.claim_live_delivery_attempt(
                         saved.guild_id, _delivery_key(saved), saved.session_key
                     )
+            elif saved.stream is None:
+                retry_attempt = await self._store.claim_live_delivery_attempt(
+                    saved.guild_id, _delivery_key(saved), saved.session_key
+                )
             actions: tuple[LiveSignalAction, ...] = ()
             if saved.announcement_message_id is not None and lookup.kind is TwitchLookupKind.LIVE:
                 actions = (LiveSignalAction.EDIT_ANNOUNCEMENT,)
@@ -120,6 +197,38 @@ class LiveSignalService:
         """Mark Discord presence unavailable; Helix reconciliation decides the final end."""
         async with self._guild_lock(guild_id):
             return await self._presence_ended(guild_id, member_id, now=now)
+
+    async def member_left(self, guild_id: int, member_id: int, *, now: datetime) -> None:
+        """Force-close sessions for a departed member without a Discord role action."""
+        _require_aware("now", now)
+        async with self._guild_lock(guild_id):
+            for session in await self._store.list_active_live_sessions(guild_id):
+                if session.member_id == member_id:
+                    await self._store.save_live_session(
+                        replace(
+                            session,
+                            status=LiveSignalStatus.ENDED,
+                            presence_active=False,
+                            role_assigned_by_krubit=False,
+                            ended_at=now,
+                        )
+                    )
+
+    async def recover_pending(self, guild_id: int) -> tuple[LiveSignalPlan, ...]:
+        """Rebuild runtime-only execution plans from durable claimed deliveries."""
+        async with self._guild_lock(guild_id):
+            plans: list[LiveSignalPlan] = []
+            for delivery in await self._store.list_claimed_live_deliveries(guild_id):
+                session = await self._store.get_live_session(guild_id, delivery.session_key)
+                if session is None or session.status is LiveSignalStatus.ENDED:
+                    continue
+                actions: tuple[LiveSignalAction, ...] = (LiveSignalAction.ANNOUNCE,)
+                if session.role_id is None:
+                    actions = (LiveSignalAction.ENSURE_ROLE, LiveSignalAction.ANNOUNCE)
+                plans.append(
+                    self._plan(session, actions, delivery_attempt=delivery.attempt, recovery=True)
+                )
+            return tuple(plans)
 
     async def _presence_ended(
         self, guild_id: int, member_id: int, *, now: datetime
@@ -423,6 +532,7 @@ class LiveSignalService:
         actions: tuple[LiveSignalAction, ...],
         *,
         delivery_attempt: int | None = None,
+        recovery: bool = False,
     ) -> LiveSignalPlan:
         return LiveSignalPlan(
             guild_id=session.guild_id,
@@ -434,6 +544,7 @@ class LiveSignalService:
             announcement_channel_id=session.announcement_channel_id,
             announcement_message_id=session.announcement_message_id,
             delivery_attempt=delivery_attempt,
+            recovery=recovery,
         )
 
     @staticmethod

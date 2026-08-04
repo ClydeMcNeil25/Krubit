@@ -485,13 +485,11 @@ class KrubitBot(discord.Client):
 
     async def on_guild_available(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
-        await self._live_runtime.configure_guild(guild)
-        await self._live_runtime.reconcile_guild(guild)
+        await self._live_runtime.bootstrap_guild(guild)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
-        await self._live_runtime.configure_guild(guild)
-        await self._live_runtime.reconcile_guild(guild)
+        await self._live_runtime.bootstrap_guild(guild)
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member) -> None:
         await self._live_runtime.handle_presence(before, after)
@@ -528,6 +526,7 @@ class KrubitBot(discord.Client):
         await self._ingest_change(
             "member_left", member.guild.id, member.id, {"bot": member.bot}, None
         )
+        await self._live_runtime.handle_member_leave(member)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         before_roles = ",".join(str(role.id) for role in before.roles)

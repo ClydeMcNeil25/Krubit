@@ -90,6 +90,10 @@ class FakeTextChannel:
     async def fetch_message(self, message_id: int) -> FakeMessage:
         return self.messages[message_id]
 
+    async def history(self, *, limit: int) -> AsyncIterator[FakeMessage]:
+        for message in list(self.messages.values())[-limit:]:
+            yield message
+
 
 class FakeGuild:
     def __init__(
