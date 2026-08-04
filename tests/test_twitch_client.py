@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
+import aiohttp
 import pytest
 
 from krubit.domain.live_signals import TwitchLookupKind
@@ -38,6 +40,25 @@ class InvalidJsonResponse(FakeResponse):
         raise ValueError("response body is not JSON")
 
 
+class ContentTypeJsonResponse(FakeResponse):
+    async def json(self) -> object:
+        raise aiohttp.ContentTypeError(
+            cast(aiohttp.RequestInfo, None), (), message="unexpected content type"
+        )
+
+
+class BlockingResponse(FakeResponse):
+    def __init__(self, status: int, payload: object) -> None:
+        super().__init__(status, payload)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aenter__(self) -> BlockingResponse:
+        self.entered.set()
+        await self.release.wait()
+        return self
+
+
 class FakeSession:
     def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
         self.responses = responses
@@ -59,8 +80,8 @@ class FrozenClock:
         return self.value
 
 
-def token_response(expires_in: int = 3_600) -> FakeResponse:
-    return FakeResponse(200, {"access_token": "app-token", "expires_in": expires_in})
+def token_response(expires_in: object = 3_600, token: str = "app-token") -> FakeResponse:
+    return FakeResponse(200, {"access_token": token, "expires_in": expires_in})
 
 
 def offline_response() -> FakeResponse:
@@ -150,7 +171,21 @@ async def test_get_stream_refreshes_the_token_sixty_seconds_before_expiry() -> N
 @pytest.mark.asyncio
 async def test_get_stream_validates_a_cached_token_once_an_hour() -> None:
     session = FakeSession(
-        [token_response(7_200), offline_response(), FakeResponse(200, {}), offline_response()]
+        [
+            token_response(7_200),
+            offline_response(),
+            FakeResponse(
+                200,
+                {
+                    "client_id": "client-id",
+                    "login": "krubit-app",
+                    "scopes": [],
+                    "user_id": "",
+                    "expires_in": 3_600,
+                },
+            ),
+            offline_response(),
+        ]
     )
     clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
     twitch = client(session, clock)
@@ -255,6 +290,137 @@ async def test_get_stream_retries_after_a_rate_limit_reset_with_an_injected_slee
     assert result.kind is TwitchLookupKind.OFFLINE
     assert delays == [10.0]
     assert [request[1] for request in session.requests] == [TOKEN_URL, STREAMS_URL, STREAMS_URL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset", ["9999999999", "-1"])
+async def test_get_stream_does_not_sleep_for_an_unsafe_or_past_rate_limit_reset(reset: str) -> None:
+    session = FakeSession(
+        [
+            token_response(),
+            FakeResponse(429, {}, {"Ratelimit-Reset": reset}),
+            offline_response(),
+        ]
+    )
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    result = await client(session, clock, record_sleep).get_stream("krucialstudios")
+
+    assert delays == []
+    if reset == "9999999999":
+        assert result.kind is TwitchLookupKind.UNAVAILABLE
+        assert result.unavailable_reason == "rate_limited"
+        assert [request[1] for request in session.requests] == [TOKEN_URL, STREAMS_URL]
+    else:
+        assert result.kind is TwitchLookupKind.OFFLINE
+        assert [request[1] for request in session.requests] == [TOKEN_URL, STREAMS_URL, STREAMS_URL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expires_in",
+    [float("nan"), float("inf"), float("-inf"), 120.5, "120", None, {}, 10**1000],
+)
+async def test_get_stream_rejects_non_integer_or_unbounded_token_lifetimes(
+    expires_in: object,
+) -> None:
+    session = FakeSession([token_response(expires_in)])
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+
+    result = await client(session, clock).get_stream("krucialstudios")
+
+    assert result.kind is TwitchLookupKind.UNAVAILABLE
+    assert result.unavailable_reason == "invalid_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"client_id": "another-client"},
+        {"client_id": "client-id", "login": "krubit-app", "scopes": [], "user_id": ""},
+    ],
+)
+async def test_get_stream_rejects_malformed_hourly_token_validation_payloads(
+    payload: object,
+) -> None:
+    session = FakeSession([token_response(7_200), offline_response(), FakeResponse(200, payload)])
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+    twitch = client(session, clock)
+
+    await twitch.get_stream("first")
+    clock.value += timedelta(hours=1)
+    result = await twitch.get_stream("second")
+
+    assert result.kind is TwitchLookupKind.UNAVAILABLE
+    assert result.unavailable_reason == "invalid_response"
+
+
+@pytest.mark.asyncio
+async def test_get_stream_classifies_aiohttp_content_type_failures_as_invalid_responses() -> None:
+    session = FakeSession([token_response(), ContentTypeJsonResponse(200, None)])
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+
+    result = await client(session, clock).get_stream("krucialstudios")
+
+    assert result.kind is TwitchLookupKind.UNAVAILABLE
+    assert result.unavailable_reason == "invalid_response"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_missing_token_lookups_share_a_single_token_grant() -> None:
+    blocked_token = BlockingResponse(200, {"access_token": "app-token", "expires_in": 3_600})
+    session = FakeSession([blocked_token, offline_response(), offline_response()])
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+    twitch = client(session, clock)
+
+    first = asyncio.create_task(twitch.get_stream("first"))
+    await blocked_token.entered.wait()
+    second = asyncio.create_task(twitch.get_stream("second"))
+    await asyncio.sleep(0)
+    blocked_token.release.set()
+    results = await asyncio.gather(first, second)
+
+    assert [result.kind for result in results] == [
+        TwitchLookupKind.OFFLINE,
+        TwitchLookupKind.OFFLINE,
+    ]
+    assert [request[1] for request in session.requests].count(TOKEN_URL) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_401_does_not_clear_a_newer_token_from_another_lookup() -> None:
+    delayed_401 = BlockingResponse(401, {})
+    session = FakeSession(
+        [
+            token_response(7_200, "old-token"),
+            offline_response(),
+            delayed_401,
+            token_response(7_200, "new-token"),
+            offline_response(),
+            offline_response(),
+        ]
+    )
+    clock = FrozenClock(datetime(2026, 8, 4, 20, 0, tzinfo=UTC))
+    twitch = client(session, clock)
+    await twitch.get_stream("initial")
+
+    stale_lookup = asyncio.create_task(twitch.get_stream("stale"))
+    await delayed_401.entered.wait()
+    clock.value += timedelta(hours=2)
+    fresh_lookup = await twitch.get_stream("fresh")
+    delayed_401.release.set()
+    stale_result = await stale_lookup
+
+    assert fresh_lookup.kind is TwitchLookupKind.OFFLINE
+    assert stale_result.kind is TwitchLookupKind.OFFLINE
+    assert [request[1] for request in session.requests].count(TOKEN_URL) == 2
 
 
 @pytest.mark.asyncio

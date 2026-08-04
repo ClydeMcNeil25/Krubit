@@ -18,6 +18,7 @@ STREAMS_URL = "https://api.twitch.tv/helix/streams"
 
 _REFRESH_WINDOW = timedelta(seconds=60)
 _VALIDATE_INTERVAL = timedelta(hours=1)
+_MAX_RATE_LIMIT_WAIT_SECONDS = 60.0
 
 
 class TwitchClient(Protocol):
@@ -77,6 +78,7 @@ class TwitchHelixClient:
         self._access_token: str | None = None
         self._expires_at: datetime | None = None
         self._validated_at: datetime | None = None
+        self._token_lock = asyncio.Lock()
 
     async def get_stream(self, login: str) -> TwitchLookup:
         """Return the current stream state without exposing provider details."""
@@ -84,13 +86,18 @@ class TwitchHelixClient:
         if preparation_failure is not None:
             return self._unavailable(preparation_failure)
 
-        result = await self._get_stream_response(login)
+        token = self._access_token
+        if token is None:
+            return self._unavailable("token_rejected")
+        result = await self._get_stream_response(login, token)
         if result.status == 401:
-            self._clear_token()
-            preparation_failure = await self._prepare_token()
+            preparation_failure = await self._recover_from_401(token)
             if preparation_failure is not None:
                 return self._unavailable(preparation_failure)
-            result = await self._get_stream_response(login)
+            retry_token = self._access_token
+            if retry_token is None:
+                return self._unavailable("token_rejected")
+            result = await self._get_stream_response(login, retry_token)
             if result.status == 401:
                 return self._unavailable("token_rejected")
 
@@ -98,12 +105,26 @@ class TwitchHelixClient:
 
     async def _prepare_token(self) -> str | None:
         now = self._now()
-        if self._token_needs_refresh(now):
-            failure = await self._acquire_token(now)
-            if failure is not None:
-                return failure
-        if self._token_needs_validation(now):
-            failure = await self._validate_token(now)
+        if not self._token_needs_refresh(now) and not self._token_needs_validation(now):
+            return None
+        async with self._token_lock:
+            now = self._now()
+            if self._token_needs_refresh(now):
+                failure = await self._acquire_token(now)
+                if failure is not None:
+                    return failure
+            if self._token_needs_validation(now):
+                failure = await self._validate_token(now)
+                if failure is not None:
+                    return failure
+        return None
+
+    async def _recover_from_401(self, rejected_token: str) -> str | None:
+        async with self._token_lock:
+            if self._access_token != rejected_token:
+                return None
+            self._clear_token()
+            failure = await self._acquire_token(self._now())
             if failure is not None:
                 return failure
         return None
@@ -140,17 +161,16 @@ class TwitchHelixClient:
 
         token = payload.get("access_token")
         expires_in = payload.get("expires_in")
-        if (
-            not isinstance(token, str)
-            or not token
-            or isinstance(expires_in, bool)
-            or not isinstance(expires_in, int | float)
-            or expires_in <= _REFRESH_WINDOW.total_seconds()
-        ):
+        duration = _token_duration(expires_in)
+        if not isinstance(token, str) or not token or duration is None:
             return "invalid_response"
 
+        try:
+            expires_at = now + timedelta(seconds=duration)
+        except OverflowError:
+            return "invalid_response"
         self._access_token = token
-        self._expires_at = now + timedelta(seconds=expires_in)
+        self._expires_at = expires_at
         self._validated_at = now
         return None
 
@@ -168,16 +188,13 @@ class TwitchHelixClient:
             return await self._acquire_token(now)
         if result.status == 429:
             return "rate_limited"
-        if result.status != 200:
+        payload = _string_mapping(result.payload)
+        if result.status != 200 or not self._is_valid_validation_payload(payload):
             return "invalid_response"
         self._validated_at = now
         return None
 
-    async def _get_stream_response(self, login: str) -> _HttpResult:
-        token = self._access_token
-        if token is None:
-            return _HttpResult(None, None, {}, "token_rejected")
-
+    async def _get_stream_response(self, login: str, token: str) -> _HttpResult:
         result = await self._request_json(
             "GET",
             STREAMS_URL,
@@ -189,9 +206,18 @@ class TwitchHelixClient:
 
         reset_value = result.headers.get("Ratelimit-Reset")
         try:
-            delay = max(0.0, float(int(reset_value or "")) - self._now().timestamp())
+            delay = float(int(reset_value or "")) - self._now().timestamp()
         except ValueError:
             return _HttpResult(None, None, {}, "rate_limited")
+        if delay > _MAX_RATE_LIMIT_WAIT_SECONDS:
+            return _HttpResult(None, None, {}, "rate_limited")
+        if delay <= 0:
+            return await self._request_json(
+                "GET",
+                STREAMS_URL,
+                params={"user_login": login},
+                headers={"Client-Id": self._client_id, "Authorization": f"Bearer {token}"},
+            )
         try:
             await self._sleep(delay)
         except TimeoutError:
@@ -208,7 +234,12 @@ class TwitchHelixClient:
             async with self._session.request(method, url, **kwargs) as response:
                 try:
                     payload = await response.json()
-                except (TypeError, ValueError):
+                except (
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ContentTypeError,
+                    TypeError,
+                    ValueError,
+                ):
                     return _HttpResult(response.status, None, response.headers, "invalid_response")
                 return _HttpResult(response.status, payload, response.headers)
         except TimeoutError:
@@ -273,6 +304,20 @@ class TwitchHelixClient:
             "{height}", "360"
         )
 
+    def _is_valid_validation_payload(self, payload: Mapping[str, object] | None) -> bool:
+        if payload is None or payload.get("client_id") != self._client_id:
+            return False
+        if not isinstance(payload.get("login"), str) or not isinstance(payload.get("user_id"), str):
+            return False
+        scopes = _object_list(payload.get("scopes"))
+        expires_in = payload.get("expires_in")
+        return (
+            scopes is not None
+            and all(isinstance(scope, str) for scope in scopes)
+            and type(expires_in) is int
+            and expires_in >= 0
+        )
+
     def _clear_token(self) -> None:
         self._access_token = None
         self._expires_at = None
@@ -299,3 +344,9 @@ def _object_list(value: object | None) -> list[object] | None:
     if not isinstance(value, list):
         return None
     return list(cast(list[object], value))
+
+
+def _token_duration(value: object) -> int | None:
+    if type(value) is not int or value <= _REFRESH_WINDOW.total_seconds():
+        return None
+    return value
