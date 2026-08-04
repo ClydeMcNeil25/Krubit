@@ -223,6 +223,12 @@ class LiveSignalService:
         """Rebuild runtime-only execution plans from durable claimed deliveries."""
         async with self._guild_lock(guild_id):
             plans: list[LiveSignalPlan] = []
+            for session in await self._store.list_terminal_live_sessions_with_owned_roles(
+                guild_id
+            ):
+                plans.append(
+                    self._plan(session, (LiveSignalAction.REMOVE_ROLE,), recovery=True)
+                )
             for session in await self._store.list_active_live_sessions(guild_id):
                 if session.stream is None and session.announcement_message_id is None:
                     actions = (
@@ -364,7 +370,8 @@ class LiveSignalService:
         if config is None or config.role_id != role_id:
             raise ValueError("role_id must match the configured streaming role")
         session = await self._required_session(guild_id, session_key)
-        if session.status is LiveSignalStatus.ENDED or session.ended_at is not None:
+        terminal = session.status is LiveSignalStatus.ENDED or session.ended_at is not None
+        if terminal and (assigned_by_krubit or status != "succeeded"):
             return
         if status == "failed":
             await self._store.save_live_session(replace(session, status=LiveSignalStatus.FAILED))

@@ -552,6 +552,24 @@ class SQLiteStore:
         )
         return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
 
+    async def list_terminal_live_sessions_with_owned_roles(
+        self, guild_id: int
+    ) -> list[LiveSignalSession]:
+        """Return ended sessions whose Krubit-owned role still needs cleanup."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM live_signal_sessions
+            WHERE guild_id = ?
+              AND status = ?
+              AND ended_at IS NOT NULL
+              AND role_assigned_by_krubit = 1
+            ORDER BY ended_at ASC, session_key ASC
+            """,
+            (guild_id, LiveSignalStatus.ENDED.value),
+        )
+        return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
+
     async def list_member_live_sessions(
         self, guild_id: int, member_id: int
     ) -> list[LiveSignalSession]:

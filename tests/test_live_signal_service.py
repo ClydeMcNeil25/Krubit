@@ -770,6 +770,49 @@ async def test_late_role_callback_cannot_revive_an_ended_session(store: SQLiteSt
 
 
 @pytest.mark.asyncio
+async def test_successful_role_removal_clears_ownership_after_session_ends(
+    store: SQLiteStore,
+) -> None:
+    service = LiveSignalService(store, FakeTwitch.live())
+    begun = await service.begin_presence(observation(), now=NOW)
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    saved = await store.get_live_session(111, begun.session_key)
+    assert saved is not None
+    await store.save_terminal_live_session(
+        replace(saved, status=LiveSignalStatus.ENDED, ended_at=NOW, presence_active=False)
+    )
+
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=False, status="succeeded"
+    )
+
+    terminal = await store.get_live_session(111, begun.session_key)
+    assert terminal is not None and terminal.role_assigned_by_krubit is False
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_terminal_session_with_owned_role(store: SQLiteStore) -> None:
+    service = LiveSignalService(store, FakeTwitch.live())
+    begun = await service.begin_presence(observation(), now=NOW)
+    await service.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    saved = await store.get_live_session(111, begun.session_key)
+    assert saved is not None
+    await store.save_terminal_live_session(
+        replace(saved, status=LiveSignalStatus.ENDED, ended_at=NOW, presence_active=False)
+    )
+
+    pending = await LiveSignalService(store, FakeTwitch.live()).recover_pending(111)
+
+    assert len(pending) == 1
+    assert pending[0].actions == (LiveSignalAction.REMOVE_ROLE,)
+    assert pending[0].recovery is True
+
+
+@pytest.mark.asyncio
 async def test_terminal_session_cancels_claimed_delivery_without_reclaiming(
     store: SQLiteStore,
 ) -> None:
