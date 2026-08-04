@@ -102,7 +102,7 @@ class LiveSignalService:
                 if active.role_assigned_by_krubit:
                     transferred_role_id = active.role_id
                     transferred_owned = True
-                await self._store.save_live_session(
+                await self._store.save_terminal_live_session(
                     replace(
                         active,
                         status=LiveSignalStatus.ENDED,
@@ -110,9 +110,6 @@ class LiveSignalService:
                         role_assigned_by_krubit=False,
                         ended_at=now,
                     )
-                )
-                await self._store.cancel_claimed_live_deliveries(
-                    observation.guild_id, active.session_key
                 )
             provisional = LiveSignalSession(
                 guild_id=observation.guild_id,
@@ -161,7 +158,10 @@ class LiveSignalService:
 
         lookup = await self._initial_lookup(observation.twitch_login)
         session = self._observed_session(existing, observation, lookup, now)
-        saved = await self._store.save_live_session(session)
+        if lookup.kind is TwitchLookupKind.OFFLINE:
+            saved = await self._store.save_terminal_live_session(session)
+        else:
+            saved = await self._store.save_live_session(session)
         await self._record_lookup(saved, lookup, now)
         if lookup.kind is TwitchLookupKind.OFFLINE:
             return self._remove_role_plan(saved) or self._plan(saved, ())
@@ -209,7 +209,7 @@ class LiveSignalService:
         async with self._guild_lock(guild_id):
             for session in await self._store.list_active_live_sessions(guild_id):
                 if session.member_id == member_id:
-                    await self._store.save_live_session(
+                    await self._store.save_terminal_live_session(
                         replace(
                             session,
                             status=LiveSignalStatus.ENDED,
@@ -218,7 +218,6 @@ class LiveSignalService:
                             ended_at=now,
                         )
                     )
-                    await self._store.cancel_claimed_live_deliveries(guild_id, session.session_key)
 
     async def recover_pending(self, guild_id: int) -> tuple[LiveSignalPlan, ...]:
         """Rebuild runtime-only execution plans from durable claimed deliveries."""
@@ -544,7 +543,7 @@ class LiveSignalService:
         )
 
     async def _end(self, session: LiveSignalSession, now: datetime) -> LiveSignalSession:
-        ended = await self._store.save_live_session(
+        return await self._store.save_terminal_live_session(
             replace(
                 session,
                 status=LiveSignalStatus.ENDED,
@@ -552,8 +551,6 @@ class LiveSignalService:
                 ended_at=now,
             )
         )
-        await self._store.cancel_claimed_live_deliveries(session.guild_id, session.session_key)
-        return ended
 
     @staticmethod
     def _plan(

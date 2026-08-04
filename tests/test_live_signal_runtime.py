@@ -17,6 +17,7 @@ from krubit.discord.live_runtime import (
 from krubit.domain.live_signals import (
     LiveSignalAction,
     LiveSignalPlan,
+    LiveSignalStatus,
     StreamingObservation,
     TwitchLookup,
     TwitchLookupKind,
@@ -372,6 +373,34 @@ async def test_presence_role_failure_blocks_enrichment_then_recovery_announces_o
 
     assert [role.id for role in guild.member.added_roles] == [333]
     assert len(guild.channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_permission_restoration_after_member_terminal_state_stays_quiescent(
+    runtime: tuple[LiveSignalRuntime, SQLiteStore, FakeGuild, LiveSignalService],
+) -> None:
+    executor, store, guild, service = runtime
+    assert await executor.configure_guild(as_guild(guild)) is not None
+    guild.member.activities = (
+        SimpleNamespace(
+            type=discord.ActivityType.streaming,
+            url="https://twitch.tv/krucialstudios",
+            start=NOW,
+        ),
+    )
+    guild.member.add_failure = True
+    await executor.handle_presence(as_member(guild.member), as_member(guild.member))
+
+    await executor.handle_member_leave(as_member(guild.member))
+    guild.member.add_failure = False
+    reconciled = await executor.reconcile_guild(as_guild(guild))
+
+    sessions = await store.list_member_live_sessions(111, 222)
+    assert len(sessions) == 1 and sessions[0].status is LiveSignalStatus.ENDED
+    assert await service.recover_pending(111) == ()
+    assert reconciled == 0
+    assert guild.member.added_roles == []
+    assert guild.channel.sent == []
 
 
 @pytest.mark.asyncio

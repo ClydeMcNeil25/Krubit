@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from krubit.domain.live_signals import (
@@ -614,6 +615,81 @@ async def test_member_left_ends_sessions_and_clears_role_ownership(store: SQLite
     assert saved is not None
     assert saved.status is LiveSignalStatus.ENDED
     assert saved.role_assigned_by_krubit is False
+
+
+@pytest.mark.parametrize(
+    "terminal_path",
+    ("explicit-offline", "grace-expiry", "member-leave", "supersession"),
+)
+@pytest.mark.asyncio
+async def test_terminal_service_paths_roll_back_when_delivery_retirement_fails(
+    tmp_path: Path,
+    terminal_path: str,
+) -> None:
+    database = tmp_path / f"{terminal_path}.db"
+    store = await SQLiteStore.open(database)
+    await store.initialize()
+    await store.set_live_signal_config(LiveSignalConfig(111, 444, 333, NOW))
+    if terminal_path == "explicit-offline":
+        service = LiveSignalService(store, FakeTwitch([TwitchLookup(TwitchLookupKind.OFFLINE)]))
+        initial = await service.begin_presence(observation(), now=NOW)
+        delivery_key = f"provisional:{initial.session_key}"
+        assert await store.claim_live_delivery(
+            111, delivery_key, initial.session_key
+        ) is True
+    else:
+        results = [TwitchLookup(TwitchLookupKind.LIVE, stream())]
+        if terminal_path == "grace-expiry":
+            results.append(
+                TwitchLookup(TwitchLookupKind.UNAVAILABLE, unavailable_reason="timeout")
+            )
+        service = LiveSignalService(store, FakeTwitch(results))
+        initial = await service.observe(observation(), now=NOW)
+        delivery_key = "stream:stream-1"
+        if terminal_path == "grace-expiry":
+            await service.presence_ended(111, 222, now=NOW + timedelta(minutes=1))
+
+    prior = await store.get_live_session(111, initial.session_key)
+    assert prior is not None
+    async with aiosqlite.connect(database) as connection:
+        await connection.executescript(
+            """
+            CREATE TRIGGER abort_service_delivery_cancellation
+            BEFORE UPDATE OF status ON live_signal_deliveries
+            WHEN OLD.status = 'claimed' AND NEW.status = 'cancelled'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced service cancellation failure');
+            END;
+            """
+        )
+        await connection.commit()
+
+    try:
+        with pytest.raises(aiosqlite.IntegrityError, match="forced service cancellation failure"):
+            if terminal_path == "explicit-offline":
+                await service.enrich_presence(observation(), now=NOW + timedelta(minutes=1))
+            elif terminal_path == "grace-expiry":
+                await service.reconcile(111, now=NOW + timedelta(minutes=6))
+            elif terminal_path == "member-leave":
+                await service.member_left(111, 222, now=NOW + timedelta(minutes=1))
+            else:
+                replacement = StreamingObservation(
+                    111,
+                    222,
+                    "othercreator",
+                    "https://twitch.tv/othercreator",
+                    NOW,
+                    NOW + timedelta(minutes=1),
+                )
+                await service.begin_presence(replacement, now=NOW + timedelta(minutes=1))
+
+        assert await store.get_live_session(111, initial.session_key) == prior
+        delivery = await store.get_live_delivery(111, delivery_key)
+        assert delivery is not None and delivery.status == "claimed"
+        if terminal_path == "supersession":
+            assert await store.open_live_session(111, 222, "othercreator") is None
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

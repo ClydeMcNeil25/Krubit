@@ -426,6 +426,203 @@ async def test_delivery_identity_collision_invalidates_callbacks_from_both_old_r
 
 
 @pytest.mark.asyncio
+async def test_terminal_session_and_claimed_deliveries_commit_or_roll_back_together(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "krubit.db"
+    store = await SQLiteStore.open(database)
+    try:
+        await store.initialize()
+        active = await store.save_live_session(session(stream_value=stream()))
+        assert await store.claim_live_delivery_attempt(
+            111, "stream:stream-1", active.session_key
+        ) == 1
+        assert await store.claim_live_delivery_attempt(
+            111, "stream:stream-1:secondary", active.session_key
+        ) == 1
+        async with aiosqlite.connect(database) as connection:
+            await connection.execute(
+                """
+                UPDATE live_signal_deliveries
+                SET attempt = 3, channel_id = 444, message_id = 1001,
+                    created_at = 'created-original', updated_at = 'updated-original'
+                WHERE guild_id = 111 AND delivery_key = 'stream:stream-1'
+                """
+            )
+            await connection.executescript(
+                """
+                CREATE TRIGGER abort_claimed_delivery_cancellation
+                BEFORE UPDATE OF status ON live_signal_deliveries
+                WHEN OLD.guild_id = 111
+                    AND OLD.session_key = 'session-1'
+                    AND OLD.status = 'claimed'
+                    AND NEW.status = 'cancelled'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced cancellation failure');
+                END;
+                """
+            )
+            await connection.commit()
+
+        ended = replace(
+            active,
+            status=LiveSignalStatus.ENDED,
+            presence_active=False,
+            ended_at=NOW + timedelta(minutes=1),
+        )
+        with pytest.raises(aiosqlite.IntegrityError, match="forced cancellation failure"):
+            await store.save_terminal_live_session(ended)
+
+        rolled_back = await store.get_live_session(111, active.session_key)
+        retained = await store.get_live_delivery(111, "stream:stream-1")
+        assert rolled_back is not None
+        assert rolled_back.status is LiveSignalStatus.LIVE
+        assert rolled_back.ended_at is None and rolled_back.presence_active is True
+        assert retained is not None and retained.status == "claimed" and retained.attempt == 3
+
+        async with aiosqlite.connect(database) as connection:
+            await connection.execute("DROP TRIGGER abort_claimed_delivery_cancellation")
+            await connection.commit()
+
+        saved = await store.save_terminal_live_session(ended)
+
+        assert saved.status is LiveSignalStatus.ENDED and saved.ended_at == ended.ended_at
+        assert await store.list_claimed_live_deliveries(111) == []
+        for delivery_key in ("stream:stream-1", "stream:stream-1:secondary"):
+            delivery = await store.get_live_delivery(111, delivery_key)
+            assert delivery is not None and delivery.status == "cancelled"
+        async with aiosqlite.connect(database) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT delivery_key, session_key, attempt, channel_id, message_id,
+                       created_at, updated_at
+                FROM live_signal_deliveries
+                WHERE guild_id = 111 AND delivery_key = 'stream:stream-1'
+                """
+            )
+            audit_row = await cursor.fetchone()
+        assert audit_row == (
+            "stream:stream-1",
+            "session-1",
+            3,
+            444,
+            1001,
+            "created-original",
+            "updated-original",
+        )
+        assert await store.complete_live_delivery(
+            111,
+            "stream:stream-1",
+            status="succeeded",
+            channel_id=444,
+            message_id=1002,
+            attempt=3,
+        ) is False
+        assert await store.claim_live_delivery_attempt(
+            111, "stream:stream-1", active.session_key
+        ) is None
+        assert await store.claim_live_delivery_attempt(
+            111, "stream:new-identity", "future-session"
+        ) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_repairs_legacy_terminal_claim_without_changing_audit_data(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "krubit.db"
+    original = await SQLiteStore.open(database)
+    await original.initialize()
+    await original.set_live_signal_config(LiveSignalConfig(111, 444, 333, NOW))
+    await original.save_live_session(session(guild_id=111, stream_value=stream()))
+    await original.save_live_session(session(guild_id=222, stream_value=stream()))
+    await original.save_live_session(
+        session(session_key="active-session", stream_value=stream("active-stream"))
+    )
+    assert await original.claim_live_delivery(111, "stream:legacy", "session-1") is True
+    assert await original.claim_live_delivery(222, "stream:legacy", "session-1") is True
+    assert await original.claim_live_delivery(
+        111, "stream:unrelated", "active-session"
+    ) is True
+    await original.close()
+
+    async with aiosqlite.connect(database) as connection:
+        await connection.execute(
+            """
+            UPDATE live_signal_sessions
+            SET status = 'ended', presence_active = 0,
+                ended_at = '2026-08-04T20:15:00+00:00'
+            WHERE guild_id = 111 AND session_key = 'session-1'
+            """
+        )
+        await connection.execute(
+            """
+            UPDATE live_signal_deliveries
+            SET attempt = 4, channel_id = 444, message_id = 1001,
+                created_at = 'legacy-created', updated_at = 'legacy-updated'
+            WHERE guild_id = 111 AND delivery_key = 'stream:legacy'
+            """
+        )
+        await connection.commit()
+        cursor = await connection.execute(
+            """
+            SELECT guild_id, delivery_key, session_key, status, attempt,
+                   channel_id, message_id, created_at, updated_at
+            FROM live_signal_deliveries
+            ORDER BY guild_id, delivery_key
+            """
+        )
+        before_rows = list(await cursor.fetchall())
+
+    reopened = await SQLiteStore.open(database)
+    try:
+        await reopened.initialize()
+
+        async with aiosqlite.connect(database) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT guild_id, delivery_key, session_key, status, attempt,
+                       channel_id, message_id, created_at, updated_at
+                FROM live_signal_deliveries
+                ORDER BY guild_id, delivery_key
+                """
+            )
+            rows = list(await cursor.fetchall())
+        assert rows[0] == (
+            111,
+            "stream:legacy",
+            "session-1",
+            "cancelled",
+            4,
+            444,
+            1001,
+            "legacy-created",
+            "legacy-updated",
+        )
+        assert rows[1:] == before_rows[1:]
+        assert await reopened.get_live_signal_config(111) == LiveSignalConfig(111, 444, 333, NOW)
+        assert [
+            delivery.delivery_key
+            for delivery in await reopened.list_claimed_live_deliveries(111)
+        ] == ["stream:unrelated"]
+        assert await reopened.complete_live_delivery(
+            111,
+            "stream:legacy",
+            status="succeeded",
+            channel_id=444,
+            message_id=1002,
+            attempt=4,
+        ) is False
+        assert await reopened.claim_live_delivery_attempt(
+            111, "stream:legacy", "session-1"
+        ) is None
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_initialize_adds_delivery_attempt_to_existing_phase_two_table(tmp_path: Path) -> None:
     database = tmp_path / "krubit.db"
     async with aiosqlite.connect(database) as connection:
