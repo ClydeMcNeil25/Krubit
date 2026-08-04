@@ -17,6 +17,7 @@ class Settings:
     application_id: int
     database_path: Path
     bot_token: str | None = None
+    staff_channel_id: int | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -30,10 +31,18 @@ class Settings:
         if not raw_path:
             raise SettingsError("KRUBIT_DATABASE_PATH must not be blank")
         raw_token = values.get("DISCORD_KRUBIT_BOT_TOKEN", "").strip()
+        raw_staff_channel = values.get("KRUBIT_STAFF_CHANNEL_ID", "").strip()
+        if raw_staff_channel and (
+            not raw_staff_channel.isdigit() or int(raw_staff_channel) <= 0
+        ):
+            raise SettingsError(
+                "KRUBIT_STAFF_CHANNEL_ID must be a positive numeric Discord snowflake"
+            )
         return cls(
             application_id=int(raw_application_id),
             database_path=Path(raw_path),
             bot_token=raw_token or None,
+            staff_channel_id=int(raw_staff_channel) if raw_staff_channel else None,
         )
 
     def require_token(self) -> str:

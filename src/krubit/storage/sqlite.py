@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -84,6 +84,15 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_snapshots_guild_version
                 ON configuration_snapshots (guild_id, version DESC);
+
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                guild_id INTEGER NOT NULL,
+                summary_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                channel_id INTEGER,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, summary_date)
+            );
             """
         )
         await self._connection.commit()
@@ -350,3 +359,49 @@ class SQLiteStore:
         if event_row is None or receipt_row is None:
             raise RuntimeError("SQLite COUNT query returned no row")
         return int(event_row["total"]), int(receipt_row["total"])
+
+    async def claim_daily_summary(self, guild_id: int, summary_date: date) -> bool:
+        cursor = await self._connection.execute(
+            """
+            INSERT OR IGNORE INTO daily_summaries
+                (guild_id, summary_date, status, channel_id, created_at)
+            VALUES (?, ?, 'claimed', NULL, ?)
+            """,
+            (guild_id, summary_date.isoformat(), datetime.now(UTC).isoformat()),
+        )
+        await self._connection.commit()
+        return cursor.rowcount == 1
+
+    async def set_daily_summary_status(
+        self,
+        guild_id: int,
+        summary_date: date,
+        status: str,
+        channel_id: int | None,
+    ) -> None:
+        await self._connection.execute(
+            """
+            INSERT INTO daily_summaries
+                (guild_id, summary_date, status, channel_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, summary_date) DO UPDATE SET
+                status = excluded.status,
+                channel_id = excluded.channel_id
+            """,
+            (
+                guild_id,
+                summary_date.isoformat(),
+                status,
+                channel_id,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await self._connection.commit()
+
+    async def daily_summary_status(self, guild_id: int, summary_date: date) -> str | None:
+        cursor = await self._connection.execute(
+            "SELECT status FROM daily_summaries WHERE guild_id = ? AND summary_date = ?",
+            (guild_id, summary_date.isoformat()),
+        )
+        row = await cursor.fetchone()
+        return str(row["status"]) if row is not None else None

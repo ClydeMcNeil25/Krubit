@@ -16,6 +16,7 @@ def test_settings_load_without_requiring_token() -> None:
     assert settings.application_id == 123456789012345678
     assert settings.database_path == Path("state/test.db")
     assert settings.bot_token is None
+    assert settings.staff_channel_id is None
 
 
 def test_settings_reject_non_numeric_application_id() -> None:
@@ -39,3 +40,24 @@ def test_require_token_returns_configured_token() -> None:
     )
 
     assert settings.require_token() == "environment-only-token"
+
+
+def test_settings_parse_optional_staff_channel_id() -> None:
+    settings = Settings.from_env(
+        {
+            "DISCORD_KRUBIT_APPLICATION_ID": "123456789012345678",
+            "KRUBIT_STAFF_CHANNEL_ID": "987654321098765432",
+        }
+    )
+
+    assert settings.staff_channel_id == 987654321098765432
+
+
+def test_settings_reject_invalid_staff_channel_id() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_STAFF_CHANNEL_ID"):
+        Settings.from_env(
+            {
+                "DISCORD_KRUBIT_APPLICATION_ID": "123456789012345678",
+                "KRUBIT_STAFF_CHANNEL_ID": "staff-chat",
+            }
+        )

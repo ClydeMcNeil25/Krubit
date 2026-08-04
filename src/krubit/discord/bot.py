@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from uuid import uuid4
 
 import discord
 from aiohttp import BaseConnector
 from discord import app_commands
+from discord.ext import tasks
 
 from krubit.config import Settings
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
@@ -16,6 +17,7 @@ from krubit.discord.install import phase_one_intents, phase_one_permissions
 from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.models import Card, CardField, GuildEvent
+from krubit.services.daily_summary import DailySummaryResult, DailySummaryService
 from krubit.services.foundation import (
     AuthorizationError,
     FoundationService,
@@ -321,9 +323,74 @@ class KrubitBot(discord.Client):
         self.tree.add_command(FetchCommands(service))
         self._service = service
         self._boot_id = uuid4().hex
+        self._settings = settings
+        self._daily_summaries = DailySummaryService(service.store)
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
+        self.daily_health_summary.start()
+
+    async def close(self) -> None:
+        self.daily_health_summary.cancel()
+        await super().close()
+
+    async def run_daily_summary_for_guild(
+        self, guild: discord.Guild, summary_date: date
+    ) -> DailySummaryResult:
+        claimed = await self._daily_summaries.claim(guild.id, summary_date)
+        if not claimed:
+            return DailySummaryResult(guild.id, summary_date, "already_claimed", None)
+        channel_id = self._settings.staff_channel_id
+        if channel_id is None:
+            result = await self._daily_summaries.record_outcome(
+                guild.id, summary_date, status="delivery_disabled", channel_id=None
+            )
+            await self._service.record_action(
+                guild.id,
+                action="daily_health_summary",
+                status="delivery_disabled",
+                actor_id=None,
+                detail={"reason": "staff_channel_not_configured"},
+            )
+            return result
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return await self._daily_summaries.record_outcome(
+                guild.id, summary_date, status="channel_missing", channel_id=channel_id
+            )
+        inventory = await capture_inventory(
+            guild,
+            required_permissions=phase_one_permissions(),
+            configured_channel_id=channel_id,
+        )
+        snapshot = await SnapshotService(self._service.store).capture(
+            guild.id, inventory, datetime.now(UTC)
+        )
+        report = HealthService().server_health(
+            snapshot, now=datetime.now(UTC), database_healthy=True, gateway_ready=self.is_ready()
+        )
+        await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))
+        result = await self._daily_summaries.record_outcome(
+            guild.id, summary_date, status="sent", channel_id=channel_id
+        )
+        await self._service.record_action(
+            guild.id,
+            action="daily_health_summary",
+            status="succeeded",
+            actor_id=None,
+            detail={"channel_id": channel_id, "snapshot_version": snapshot.version},
+        )
+        return result
+
+    @tasks.loop(time=time(hour=12, tzinfo=UTC))
+    async def daily_health_summary(self) -> None:
+        today = datetime.now(UTC).date()
+        for guild in self.guilds:
+            await self.run_daily_summary_for_guild(guild, today)
+
+    @daily_health_summary.before_loop
+    async def before_daily_health_summary(self) -> None:
+        await self.wait_until_ready()
 
     async def _record_guild_connection(self, guild: discord.Guild) -> None:
         event = GuildEvent(
