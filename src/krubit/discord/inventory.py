@@ -1,0 +1,175 @@
+"""Stable, read-only Discord guild inventory capture."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+import discord
+
+from krubit.domain.companion import CoverageIssue
+from krubit.domain.models import JSONValue
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryCapture:
+    content: dict[str, JSONValue]
+    coverage: tuple[CoverageIssue, ...]
+
+
+def _timestamp(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _id_sort(item: dict[str, JSONValue]) -> int:
+    resource_id = item.get("id")
+    if not isinstance(resource_id, str):
+        raise ValueError("normalized resource id must be a string")
+    return int(resource_id)
+
+
+def _overwrites(channel: discord.abc.GuildChannel) -> list[JSONValue]:
+    values: list[JSONValue] = []
+    for target, overwrite in channel.overwrites.items():
+        allow, deny = overwrite.pair()
+        values.append(
+            {
+                "target_id": str(target.id),
+                "target_type": "role" if isinstance(target, discord.Role) else "member",
+                "allow": str(allow.value),
+                "deny": str(deny.value),
+            }
+        )
+    return sorted(values, key=lambda item: int(str(item["target_id"])))  # type: ignore[index]
+
+
+def _channel(channel: discord.abc.GuildChannel) -> dict[str, JSONValue]:
+    parent_id = getattr(channel, "category_id", None)
+    return {
+        "id": str(channel.id),
+        "name": channel.name,
+        "type": str(channel.type),
+        "position": channel.position,
+        "parent_id": str(parent_id) if parent_id is not None else None,
+        "topic": getattr(channel, "topic", None),
+        "nsfw": bool(getattr(channel, "nsfw", False)),
+        "overwrites": _overwrites(channel),
+    }
+
+
+def _role(role: discord.Role) -> dict[str, JSONValue]:
+    return {
+        "id": str(role.id),
+        "name": role.name,
+        "position": role.position,
+        "color": role.color.value,
+        "managed": role.managed,
+        "permissions": str(role.permissions.value),
+    }
+
+
+def _scheduled_event(event: discord.ScheduledEvent) -> dict[str, JSONValue]:
+    return {
+        "id": str(event.id),
+        "name": event.name,
+        "status": str(event.status),
+        "channel_id": str(event.channel_id) if event.channel_id is not None else None,
+        "start_time": _timestamp(event.start_time),
+        "end_time": _timestamp(event.end_time),
+    }
+
+
+async def capture_inventory(
+    guild: discord.Guild,
+    *,
+    required_permissions: discord.Permissions,
+    configured_channel_id: int | None,
+) -> InventoryCapture:
+    """Capture deterministic facts and explicit access limitations for one guild."""
+
+    issues: list[CoverageIssue] = []
+    webhooks: list[dict[str, JSONValue]] = []
+    automod_rules: list[dict[str, JSONValue]] = []
+    try:
+        visible_webhooks = await guild.webhooks()
+        webhooks = sorted(
+            [
+                {
+                    "id": str(webhook.id),
+                    "channel_id": (
+                        str(webhook.channel_id) if webhook.channel_id is not None else None
+                    ),
+                    "name": webhook.name,
+                    "type": str(webhook.type),
+                }
+                for webhook in visible_webhooks
+            ],
+            key=_id_sort,
+        )
+    except discord.HTTPException as exc:
+        issues.append(CoverageIssue("webhooks", "limited", f"discord_http_{exc.status}"))
+
+    try:
+        visible_rules = await guild.fetch_automod_rules()
+        automod_rules = sorted(
+            [
+                {
+                    "id": str(rule.id),
+                    "name": rule.name,
+                    "enabled": rule.enabled,
+                    "event_type": str(rule.event_type),
+                    "trigger_type": str(rule.trigger.type),
+                }
+                for rule in visible_rules
+            ],
+            key=_id_sort,
+        )
+    except discord.HTTPException as exc:
+        issues.append(CoverageIssue("automod_rules", "limited", f"discord_http_{exc.status}"))
+
+    granted = guild.me.guild_permissions
+    required_names = sorted(name for name, enabled in required_permissions if enabled)
+    missing_names = sorted(name for name in required_names if not getattr(granted, name, False))
+    required_values: list[JSONValue] = []
+    required_values.extend(required_names)
+    missing_values: list[JSONValue] = []
+    missing_values.extend(missing_names)
+    configured: dict[str, JSONValue] | None = (
+        None
+        if configured_channel_id is None
+        else {
+            "id": str(configured_channel_id),
+            "present": guild.get_channel(configured_channel_id) is not None,
+        }
+    )
+    bot_permissions: dict[str, JSONValue] = {
+        "granted": str(granted.value),
+        "required": required_values,
+        "missing_required": missing_values,
+    }
+    role_values: list[JSONValue] = []
+    role_values.extend(sorted((_role(role) for role in guild.roles), key=_id_sort))
+    channel_values: list[JSONValue] = []
+    channel_values.extend(sorted((_channel(channel) for channel in guild.channels), key=_id_sort))
+    event_values: list[JSONValue] = []
+    event_values.extend(
+        sorted((_scheduled_event(event) for event in guild.scheduled_events), key=_id_sort)
+    )
+    webhook_values: list[JSONValue] = []
+    webhook_values.extend(webhooks)
+    automod_values: list[JSONValue] = []
+    automod_values.extend(automod_rules)
+    content: dict[str, JSONValue] = {
+        "guild": {"id": str(guild.id), "name": guild.name},
+        "roles": role_values,
+        "channels": channel_values,
+        "scheduled_events": event_values,
+        "webhooks": webhook_values,
+        "automod_rules": automod_values,
+        "bot_permissions": bot_permissions,
+        "configured_channel": configured,
+    }
+    return InventoryCapture(
+        content=content,
+        coverage=tuple(sorted(issues, key=lambda item: item.section)),
+    )
