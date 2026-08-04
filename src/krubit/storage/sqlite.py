@@ -490,6 +490,16 @@ class SQLiteStore:
         )
         return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
 
+    async def list_member_live_sessions(
+        self, guild_id: int, member_id: int
+    ) -> list[LiveSignalSession]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM live_signal_sessions WHERE guild_id = ? AND member_id = ?",
+            (guild_id, member_id),
+        )
+        return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
+
     async def claim_live_delivery(
         self, guild_id: int, delivery_key: str, session_key: str
     ) -> bool:

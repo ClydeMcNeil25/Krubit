@@ -302,7 +302,10 @@ class LiveSignalRuntime:
             return
         nonce = _delivery_nonce(guild.id, delivery_key, plan.delivery_attempt)
         if plan.recovery:
-            recovered_message = await _find_nonce_message(text_channel, guild.me, nonce)
+            try:
+                recovered_message = await _find_nonce_message(text_channel, guild.me, nonce)
+            except (discord.Forbidden, discord.HTTPException):
+                return
             if recovered_message is not None:
                 try:
                     await signals.record_delivery_result(

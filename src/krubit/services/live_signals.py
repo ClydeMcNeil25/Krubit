@@ -94,8 +94,10 @@ class LiveSignalService:
                 return self._plan(saved, ())
             transferred_role_id: int | None = None
             transferred_owned = False
-            for active in await self._store.list_active_live_sessions(observation.guild_id):
-                if active.member_id != observation.member_id:
+            for active in await self._store.list_member_live_sessions(
+                observation.guild_id, observation.member_id
+            ):
+                if active.twitch_login == observation.twitch_login:
                     continue
                 if active.role_assigned_by_krubit:
                     transferred_role_id = active.role_id
@@ -218,6 +220,15 @@ class LiveSignalService:
         """Rebuild runtime-only execution plans from durable claimed deliveries."""
         async with self._guild_lock(guild_id):
             plans: list[LiveSignalPlan] = []
+            for session in await self._store.list_active_live_sessions(guild_id):
+                if session.stream is None and session.announcement_message_id is None:
+                    actions = (
+                        (LiveSignalAction.ENSURE_ROLE,)
+                        if session.role_id is None
+                        else ()
+                    )
+                    if actions:
+                        plans.append(self._plan(session, actions, recovery=True))
             for delivery in await self._store.list_claimed_live_deliveries(guild_id):
                 session = await self._store.get_live_session(guild_id, delivery.session_key)
                 if session is None or session.status is LiveSignalStatus.ENDED:
@@ -289,6 +300,12 @@ class LiveSignalService:
                 and (session.status is not LiveSignalStatus.LIVE or session.stream != saved.stream)
             ):
                 return self._plan(saved, (LiveSignalAction.EDIT_ANNOUNCEMENT,))
+            if saved.announcement_message_id is None:
+                attempt = await self._store.claim_live_delivery_attempt(
+                    saved.guild_id, _delivery_key(saved), saved.session_key
+                )
+                if attempt is not None:
+                    return self._plan(saved, (LiveSignalAction.ANNOUNCE,), delivery_attempt=attempt)
             return None
         if lookup.kind is TwitchLookupKind.OFFLINE:
             return self._remove_role_plan(await self._end(session, now))

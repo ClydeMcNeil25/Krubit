@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -613,3 +614,56 @@ async def test_member_left_ends_sessions_and_clears_role_ownership(store: SQLite
     assert saved is not None
     assert saved.status is LiveSignalStatus.ENDED
     assert saved.role_assigned_by_krubit is False
+
+
+@pytest.mark.asyncio
+async def test_restart_after_begin_recovers_role_then_enriches_once(store: SQLiteStore) -> None:
+    first = LiveSignalService(store, FakeTwitch.live())
+    begun = await first.begin_presence(observation(), now=NOW)
+
+    restarted = LiveSignalService(store, FakeTwitch.live())
+    pending = await restarted.recover_pending(111)
+    await restarted.record_role_result(
+        111, begun.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    enriched = await restarted.reconcile(111, now=NOW + timedelta(minutes=1))
+    await restarted.record_delivery_result(
+        111,
+        begun.session_key,
+        status="succeeded",
+        channel_id=444,
+        message_id=1001,
+        attempt=enriched[0].delivery_attempt or 1,
+    )
+
+    assert pending[0].actions == (LiveSignalAction.ENSURE_ROLE,)
+    assert enriched[0].actions == (LiveSignalAction.ANNOUNCE,)
+    assert (await restarted.recover_pending(111)) == ()
+
+
+@pytest.mark.asyncio
+async def test_url_switch_clears_ended_session_ownership_for_stale_remove(
+    store: SQLiteStore,
+) -> None:
+    service = LiveSignalService(store, FakeTwitch.live())
+    first = await service.observe(observation(), now=NOW)
+    await service.record_role_result(
+        111, first.session_key, role_id=333, assigned_by_krubit=True, status="succeeded"
+    )
+    saved_first = await store.get_live_session(111, first.session_key)
+    assert saved_first is not None
+    await store.save_live_session(
+        replace(
+            saved_first,
+            status=LiveSignalStatus.ENDED,
+            ended_at=NOW,
+        )
+    )
+    replacement = StreamingObservation(
+        111, 222, "othercreator", "https://twitch.tv/othercreator", NOW, NOW
+    )
+
+    await service.begin_presence(replacement, now=NOW + timedelta(minutes=1))
+
+    old = await store.get_live_session(111, first.session_key)
+    assert old is not None and old.role_assigned_by_krubit is False
