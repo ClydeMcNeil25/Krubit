@@ -26,7 +26,9 @@ responsible for mapping its provider's payload into this shared envelope.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from krubit.domain.creator_signals import (
@@ -35,10 +37,17 @@ from krubit.domain.creator_signals import (
     ContentState,
     CreatorAccount,
     IngestionResult,
+    Platform,
 )
 from krubit.domain.models import JSONValue
 from krubit.integrations.base import ConnectorPage
+from krubit.services.notification_policy import CorrelationDecision
 from krubit.storage.sqlite import SQLiteStore
+
+_MAX_URL_LENGTH = 2_048
+_MAX_TITLE_LENGTH = 300
+_MAX_FINGERPRINT_LENGTH = 200
+_DEFAULT_CORRELATION_WINDOW = timedelta(minutes=30)
 
 
 class MalformedContentItemError(ValueError):
@@ -142,3 +151,157 @@ class ContentSignalService:
             detail=detail,
             created_at=now,
         )
+
+
+def _require_text(name: str, value: str, *, limit: int) -> None:
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank")
+    if len(value) > limit:
+        raise ValueError(f"{name} exceeds {limit} characters")
+
+
+def _require_positive_id(name: str, value: int) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _normalize_url(url: str) -> str:
+    """Fold case/trailing-slash/query/fragment noise so equivalent links compare equal."""
+    parts = urlsplit(url.strip())
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelationCandidate:
+    """The bounded evidence available to correlate one content item across platforms.
+
+    `owner_member_id` is the Discord member who owns the account this item came from —
+    "the same creator" for correlation purposes means the same owning member, not the
+    same platform-specific `account_id` (which necessarily differs across platforms).
+    `outbound_url` and `media_fingerprint` are optional strong-match evidence a connector
+    or later enrichment step may supply; their absence never causes a false merge.
+    """
+
+    guild_id: int
+    owner_member_id: int
+    platform: Platform
+    external_id: str
+    canonical_url: str
+    title: str | None = None
+    published_at: datetime | None = None
+    outbound_url: str | None = None
+    media_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_positive_id("owner_member_id", self.owner_member_id)
+        if type(self.platform) is not Platform:
+            raise ValueError("platform must be a Platform")
+        _require_text("external_id", self.external_id, limit=_MAX_URL_LENGTH)
+        _require_text("canonical_url", self.canonical_url, limit=_MAX_URL_LENGTH)
+        if not self.canonical_url.startswith("https://"):
+            raise ValueError("canonical_url must use https")
+        if self.title is not None:
+            _require_text("title", self.title, limit=_MAX_TITLE_LENGTH)
+        if self.published_at is not None and (
+            self.published_at.tzinfo is None or self.published_at.utcoffset() is None
+        ):
+            raise ValueError("published_at must include a timezone")
+        if self.outbound_url is not None:
+            _require_text("outbound_url", self.outbound_url, limit=_MAX_URL_LENGTH)
+        if self.media_fingerprint is not None:
+            _require_text(
+                "media_fingerprint", self.media_fingerprint, limit=_MAX_FINGERPRINT_LENGTH
+            )
+
+
+class ContentCorrelator:
+    """Cross-platform duplicate/simulcast detection, conservative by design.
+
+    An exact match — identical `(platform, external_id)` or an identical normalized
+    `canonical_url` — merges unconditionally. Everything else requires the same creator
+    (same `owner_member_id`), a bounded observation window, AND either a matching
+    normalized `outbound_url` or a matching `media_fingerprint`. Title similarity alone
+    never merges, and missing evidence never merges: ambiguous crossposts stay separate
+    so Krubit never silently drops or suppresses a legitimately distinct post.
+    """
+
+    def __init__(self, *, window: timedelta = _DEFAULT_CORRELATION_WINDOW) -> None:
+        if window <= timedelta(0):
+            raise ValueError("window must be positive")
+        self._window = window
+
+    def correlate(
+        self, first: CorrelationCandidate, second: CorrelationCandidate
+    ) -> CorrelationDecision:
+        if first.guild_id != second.guild_id:
+            raise ValueError("correlation candidates must belong to the same guild")
+
+        if (first.platform, first.external_id) == (second.platform, second.external_id):
+            return CorrelationDecision(
+                merge=True,
+                correlation_group=self._group(first, second),
+                reason="identical content identity",
+            )
+
+        if _normalize_url(first.canonical_url) == _normalize_url(second.canonical_url):
+            return CorrelationDecision(
+                merge=True,
+                correlation_group=self._group(first, second),
+                reason="identical canonical url",
+            )
+
+        if first.owner_member_id != second.owner_member_id:
+            return CorrelationDecision(
+                merge=False, correlation_group=None, reason="ambiguous: different creator"
+            )
+
+        if not self._within_window(first, second):
+            return CorrelationDecision(
+                merge=False,
+                correlation_group=None,
+                reason="ambiguous: outside correlation window",
+            )
+
+        if self._strong_match(first, second):
+            return CorrelationDecision(
+                merge=True,
+                correlation_group=self._group(first, second),
+                reason="strong simulcast match: outbound link or media fingerprint",
+            )
+
+        return CorrelationDecision(
+            merge=False,
+            correlation_group=None,
+            reason="ambiguous: no strong correlation evidence",
+        )
+
+    def _within_window(self, first: CorrelationCandidate, second: CorrelationCandidate) -> bool:
+        if first.published_at is None or second.published_at is None:
+            return False
+        return abs(first.published_at - second.published_at) <= self._window
+
+    @staticmethod
+    def _strong_match(first: CorrelationCandidate, second: CorrelationCandidate) -> bool:
+        outbound_match = (
+            first.outbound_url is not None
+            and second.outbound_url is not None
+            and _normalize_url(first.outbound_url) == _normalize_url(second.outbound_url)
+        )
+        fingerprint_match = (
+            first.media_fingerprint is not None
+            and second.media_fingerprint is not None
+            and first.media_fingerprint == second.media_fingerprint
+        )
+        return outbound_match or fingerprint_match
+
+    @staticmethod
+    def _group(first: CorrelationCandidate, second: CorrelationCandidate) -> str:
+        identities = sorted(
+            (
+                f"{first.platform.value}:{first.external_id}",
+                f"{second.platform.value}:{second.external_id}",
+            )
+        )
+        return "|".join(identities)

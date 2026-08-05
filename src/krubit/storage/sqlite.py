@@ -123,6 +123,26 @@ class ContentReceipt:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class MentionBudgetReceipt:
+    """A guild-scoped, redacted audit record of one mention-budget outcome.
+
+    Every delivery decision that touches a mention budget — whether it consumed a unit,
+    was suppressed by an exhausted budget, or bypassed budget accounting entirely (for
+    example an unlimited budget) — is recorded here, matching the design's "every
+    consumed, suppressed, or bypassed mention is recorded" rule.
+    """
+
+    guild_id: int
+    receipt_id: str
+    budget_kind: str
+    period_key: str
+    outcome: str
+    platform: Platform | None
+    external_id: str | None
+    created_at: datetime
+
+
 class SQLiteStore:
     """A single database whose public APIs always require tenant scope."""
 
@@ -423,6 +443,30 @@ class SQLiteStore:
                 FOREIGN KEY (guild_id, platform, external_id)
                     REFERENCES content_events (guild_id, platform, external_id)
             );
+
+            CREATE TABLE IF NOT EXISTS mention_budget_state (
+                guild_id INTEGER NOT NULL,
+                budget_kind TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed >= 0),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, budget_kind, period_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS mention_budget_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                budget_kind TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                platform TEXT,
+                external_id TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mention_budget_receipts_guild_created
+                ON mention_budget_receipts (guild_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS content_receipts (
                 guild_id INTEGER NOT NULL,
@@ -2041,3 +2085,187 @@ class SQLiteStore:
             detail=_json_object(json.loads(str(row["detail_json"]))),
             created_at=datetime.fromisoformat(str(row["created_at"])),
         )
+
+    async def claim_mention_budget(
+        self,
+        *,
+        guild_id: int,
+        budget_kind: str,
+        period_key: str,
+        limit: int,
+        now: datetime,
+    ) -> bool:
+        """Atomically consume one unit of a mention budget.
+
+        Returns `True` if this call claimed the unit, `False` if the budget was already
+        exhausted. The read-modify-write happens inside one immediate write transaction,
+        so concurrent callers racing for the last unit of a budget can never all
+        believe they won it — see `test_claim_mention_budget_is_atomic_under_concurrency`.
+        """
+        _require_guild_id(guild_id)
+        if limit <= 0:
+            return False
+        async with self._write_transaction(immediate=True):
+            await self._connection.execute(
+                """
+                INSERT OR IGNORE INTO mention_budget_state (
+                    guild_id, budget_kind, period_key, consumed, updated_at
+                ) VALUES (?, ?, ?, 0, ?)
+                """,
+                (guild_id, budget_kind, period_key, now.isoformat()),
+            )
+            cursor = await self._connection.execute(
+                """
+                UPDATE mention_budget_state
+                SET consumed = consumed + 1, updated_at = ?
+                WHERE guild_id = ? AND budget_kind = ? AND period_key = ? AND consumed < ?
+                """,
+                (now.isoformat(), guild_id, budget_kind, period_key, limit),
+            )
+            return cursor.rowcount == 1
+
+    async def mention_budget_consumed(
+        self, guild_id: int, budget_kind: str, period_key: str
+    ) -> int:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT consumed FROM mention_budget_state
+            WHERE guild_id = ? AND budget_kind = ? AND period_key = ?
+            """,
+            (guild_id, budget_kind, period_key),
+        )
+        row = await cursor.fetchone()
+        return int(row["consumed"]) if row is not None else 0
+
+    async def record_mention_receipt(
+        self,
+        *,
+        guild_id: int,
+        receipt_id: str,
+        budget_kind: str,
+        period_key: str,
+        outcome: str,
+        platform: Platform | None,
+        external_id: str | None,
+        created_at: datetime,
+    ) -> None:
+        """Record a redacted audit receipt for one mention-budget outcome."""
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO mention_budget_receipts (
+                    guild_id, receipt_id, budget_kind, period_key, outcome, platform,
+                    external_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt_id,
+                    budget_kind,
+                    period_key,
+                    outcome,
+                    platform.value if platform is not None else None,
+                    external_id,
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def list_mention_budget_receipts(
+        self, guild_id: int, limit: int = 50
+    ) -> list[MentionBudgetReceipt]:
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, receipt_id, budget_kind, period_key, outcome, platform,
+                   external_id, created_at
+            FROM mention_budget_receipts
+            WHERE guild_id = ?
+            ORDER BY created_at DESC, receipt_id DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [self._mention_budget_receipt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _mention_budget_receipt_from_row(row: aiosqlite.Row) -> MentionBudgetReceipt:
+        stored_platform = row["platform"]
+        stored_external_id = row["external_id"]
+        return MentionBudgetReceipt(
+            guild_id=int(row["guild_id"]),
+            receipt_id=str(row["receipt_id"]),
+            budget_kind=str(row["budget_kind"]),
+            period_key=str(row["period_key"]),
+            outcome=str(row["outcome"]),
+            platform=Platform(str(stored_platform)) if stored_platform is not None else None,
+            external_id=str(stored_external_id) if stored_external_id is not None else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    async def record_content_correlation(
+        self,
+        *,
+        guild_id: int,
+        platform: Platform,
+        external_id: str,
+        correlation_group: str,
+        reason: str,
+        created_at: datetime,
+    ) -> None:
+        """Persist which correlation group one content item was merged into, if any."""
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO content_correlations (
+                    guild_id, platform, external_id, correlation_group, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, platform, external_id) DO UPDATE SET
+                    correlation_group = excluded.correlation_group,
+                    reason = excluded.reason,
+                    created_at = excluded.created_at
+                """,
+                (
+                    guild_id,
+                    platform.value,
+                    external_id,
+                    correlation_group,
+                    reason,
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def get_content_correlation_group(
+        self, guild_id: int, platform: Platform, external_id: str
+    ) -> str | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT correlation_group FROM content_correlations
+            WHERE guild_id = ? AND platform = ? AND external_id = ?
+            """,
+            (guild_id, platform.value, external_id),
+        )
+        row = await cursor.fetchone()
+        return str(row["correlation_group"]) if row is not None else None
+
+    async def list_content_correlation_members(
+        self, guild_id: int, correlation_group: str
+    ) -> list[tuple[Platform, str]]:
+        """Return every `(platform, external_id)` merged into `correlation_group`."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT platform, external_id FROM content_correlations
+            WHERE guild_id = ? AND correlation_group = ?
+            ORDER BY platform ASC, external_id ASC
+            """,
+            (guild_id, correlation_group),
+        )
+        rows = await cursor.fetchall()
+        return [(Platform(str(row["platform"])), str(row["external_id"])) for row in rows]
