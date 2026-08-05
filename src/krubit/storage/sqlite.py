@@ -38,6 +38,13 @@ from krubit.domain.live_signals import (
     TwitchStream,
 )
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
+from krubit.domain.watchdog import (
+    AllowBlockEntry,
+    EntrySniffAssessment,
+    Incident,
+    WatchWindow,
+    WatchWindowCloseReason,
+)
 from krubit.security.redaction import redact
 from krubit.storage.creator_rows import (
     content_cursor_from_row,
@@ -46,6 +53,12 @@ from krubit.storage.creator_rows import (
     creator_account_from_row,
     creator_profile_from_row,
     creator_route_from_row,
+)
+from krubit.storage.watchdog_rows import (
+    allow_block_entry_from_row,
+    entry_sniff_assessment_from_row,
+    incident_from_row,
+    watch_window_from_row,
 )
 
 
@@ -207,6 +220,25 @@ class ContentScheduleState:
     last_state: CapabilityState
     last_detail: str | None
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SniffReceipt:
+    """A guild-scoped, redacted audit record of one watchdog storage transition.
+
+    Storage-only view type, matching the `CreatorRegistryReceipt`/`ContentReceipt`
+    convention: append-only, mirroring every `entry_sniff_assessments` write,
+    `watch_windows` transition, and incident evidence write per the design doc's
+    Data Model section. `member_id` is `None` for guild-scoped events (for example a
+    raid/spam-wave incident) that are not about a single member.
+    """
+
+    guild_id: int
+    receipt_id: str
+    member_id: int | None
+    action: str
+    detail: dict[str, JSONValue]
+    created_at: datetime
 
 
 _CONTENT_DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
@@ -593,6 +625,72 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_content_schedule_next_poll
                 ON content_schedule (next_poll_at ASC);
+
+            CREATE TABLE IF NOT EXISTS entry_sniff_assessments (
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                joined_at TEXT NOT NULL,
+                band TEXT NOT NULL,
+                signals_json TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, member_id, joined_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entry_sniff_assessments_guild_member_joined
+                ON entry_sniff_assessments (guild_id, member_id, joined_at DESC);
+
+            CREATE TABLE IF NOT EXISTS watch_windows (
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                opened_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                band TEXT NOT NULL,
+                closed_at TEXT,
+                close_reason TEXT,
+                PRIMARY KEY (guild_id, member_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_watch_windows_guild_open
+                ON watch_windows (guild_id, closed_at);
+
+            CREATE TABLE IF NOT EXISTS incidents (
+                guild_id INTEGER NOT NULL,
+                incident_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                band TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                evidence_packet_id TEXT NOT NULL,
+                recommended_action TEXT NOT NULL,
+                acknowledged_by INTEGER,
+                PRIMARY KEY (guild_id, incident_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_incidents_guild_opened
+                ON incidents (guild_id, opened_at DESC);
+
+            CREATE TABLE IF NOT EXISTS guild_allow_block_lists (
+                guild_id INTEGER NOT NULL,
+                discord_user_id INTEGER NOT NULL,
+                list_kind TEXT NOT NULL CHECK (list_kind IN ('allow', 'block')),
+                reason TEXT NOT NULL,
+                set_by INTEGER NOT NULL,
+                set_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, discord_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sniff_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                member_id INTEGER,
+                action TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sniff_receipts_guild_created
+                ON sniff_receipts (guild_id, created_at DESC);
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -2901,3 +2999,399 @@ class SQLiteStore:
                     now_text,
                 ),
             )
+
+    # -- Watchdog (Phase 3) ---------------------------------------------------
+
+    async def save_entry_sniff_assessment(
+        self, assessment: EntrySniffAssessment
+    ) -> EntrySniffAssessment:
+        """Insert or replace the one durable assessment for a single member join.
+
+        Identity is `(guild_id, member_id, joined_at)`, matching `EntrySniffAssessment`
+        — a rejoin gets its own row rather than overwriting the prior join's record.
+        Per-signal detail is redacted before storage, matching the design doc's Data
+        Model note that the stored breakdown is "JSON, redacted".
+        """
+        _require_guild_id(assessment.guild_id)
+        signals_payload: list[JSONValue] = [
+            {
+                "name": signal.name,
+                "weight": signal.weight,
+                "detail": signal.detail,
+                "confidence": signal.confidence,
+            }
+            for signal in assessment.signals
+        ]
+        safe_signals = redact(signals_payload)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO entry_sniff_assessments (
+                    guild_id, member_id, joined_at, band, signals_json, explanation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, member_id, joined_at) DO UPDATE SET
+                    band = excluded.band,
+                    signals_json = excluded.signals_json,
+                    explanation = excluded.explanation,
+                    created_at = excluded.created_at
+                """,
+                (
+                    assessment.guild_id,
+                    assessment.member_id,
+                    assessment.joined_at.isoformat(),
+                    assessment.band.value,
+                    json.dumps(safe_signals, sort_keys=True, separators=(",", ":")),
+                    assessment.explanation,
+                    assessment.created_at.isoformat(),
+                ),
+            )
+        saved = await self.get_entry_sniff_assessment(
+            assessment.guild_id, assessment.member_id, joined_at=assessment.joined_at
+        )
+        if saved is None:
+            raise RuntimeError("saved entry sniff assessment could not be read")
+        return saved
+
+    async def get_entry_sniff_assessment(
+        self, guild_id: int, member_id: int, *, joined_at: datetime | None = None
+    ) -> EntrySniffAssessment | None:
+        """Return one member's assessment: the exact `joined_at` row, or (when omitted)
+        the current/most recent one, matching `/fetch sniff <member>`'s "current or most
+        recent assessment" behavior.
+        """
+        _require_guild_id(guild_id)
+        if joined_at is not None:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, member_id, joined_at, band, signals_json, explanation, created_at
+                FROM entry_sniff_assessments
+                WHERE guild_id = ? AND member_id = ? AND joined_at = ?
+                """,
+                (guild_id, member_id, joined_at.isoformat()),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, member_id, joined_at, band, signals_json, explanation, created_at
+                FROM entry_sniff_assessments
+                WHERE guild_id = ? AND member_id = ?
+                ORDER BY joined_at DESC
+                LIMIT 1
+                """,
+                (guild_id, member_id),
+            )
+        row = await cursor.fetchone()
+        return entry_sniff_assessment_from_row(row)
+
+    async def _get_watch_window(self, guild_id: int, member_id: int) -> WatchWindow | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, opened_at, expires_at, band, closed_at, close_reason
+            FROM watch_windows
+            WHERE guild_id = ? AND member_id = ?
+            """,
+            (guild_id, member_id),
+        )
+        row = await cursor.fetchone()
+        return watch_window_from_row(row)
+
+    async def open_watch_window(self, window: WatchWindow) -> WatchWindow:
+        """Insert or replace the one open-or-closed watch window for a member.
+
+        Identity is `(guild_id, member_id)`, matching `WatchWindow` — reopening a
+        watch window for a member (for example a fresh incoming-signal escalation
+        after a prior window already closed) replaces that member's single row rather
+        than accumulating history; durable history of the transition belongs to
+        `sniff_receipts`, not this table.
+        """
+        _require_guild_id(window.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO watch_windows (
+                    guild_id, member_id, opened_at, expires_at, band, closed_at, close_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, member_id) DO UPDATE SET
+                    opened_at = excluded.opened_at,
+                    expires_at = excluded.expires_at,
+                    band = excluded.band,
+                    closed_at = excluded.closed_at,
+                    close_reason = excluded.close_reason
+                """,
+                (
+                    window.guild_id,
+                    window.member_id,
+                    window.opened_at.isoformat(),
+                    window.expires_at.isoformat(),
+                    window.band.value,
+                    _stored_timestamp(window.closed_at),
+                    window.close_reason.value if window.close_reason is not None else None,
+                ),
+            )
+        saved = await self._get_watch_window(window.guild_id, window.member_id)
+        if saved is None:
+            raise RuntimeError("opened watch window could not be read")
+        return saved
+
+    async def close_watch_window(
+        self,
+        guild_id: int,
+        member_id: int,
+        *,
+        reason: WatchWindowCloseReason,
+        now: datetime,
+    ) -> WatchWindow | None:
+        """Close a member's open watch window, or do nothing if it is already closed.
+
+        Genuinely idempotent: the `WHERE closed_at IS NULL` guard means a second call
+        (whatever `reason`/`now` it passes) matches zero rows, never raises, and never
+        overwrites the first close's `closed_at`/`close_reason` — matching the design
+        doc's "clean members age out of watch state automatically" guarantee without
+        letting a race between an expiry sweep and a staff override corrupt history.
+        Returns `None` if no watch window exists for this member at all.
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                UPDATE watch_windows
+                SET closed_at = ?, close_reason = ?
+                WHERE guild_id = ? AND member_id = ? AND closed_at IS NULL
+                """,
+                (now.isoformat(), reason.value, guild_id, member_id),
+            )
+        return await self._get_watch_window(guild_id, member_id)
+
+    async def list_open_watch_windows(self, guild_id: int) -> tuple[WatchWindow, ...]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, opened_at, expires_at, band, closed_at, close_reason
+            FROM watch_windows
+            WHERE guild_id = ? AND closed_at IS NULL
+            ORDER BY opened_at ASC
+            """,
+            (guild_id,),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(WatchWindow, watch_window_from_row(row)) for row in rows)
+
+    async def record_incident(self, incident: Incident) -> Incident:
+        """Insert or replace one incident-band evidence record.
+
+        Identity is `(guild_id, incident_id)`, matching `Incident`. An upsert (rather
+        than an append-only insert) so `acknowledged_by` can be set by a later staff
+        action without a separate "acknowledge" table; every state transition is still
+        durably mirrored to `sniff_receipts` by the caller.
+        """
+        _require_guild_id(incident.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO incidents (
+                    guild_id, incident_id, kind, band, opened_at, evidence_packet_id,
+                    recommended_action, acknowledged_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, incident_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    band = excluded.band,
+                    opened_at = excluded.opened_at,
+                    evidence_packet_id = excluded.evidence_packet_id,
+                    recommended_action = excluded.recommended_action,
+                    acknowledged_by = excluded.acknowledged_by
+                """,
+                (
+                    incident.guild_id,
+                    incident.incident_id,
+                    incident.kind.value,
+                    incident.band.value,
+                    incident.opened_at.isoformat(),
+                    incident.evidence_packet_id,
+                    incident.recommended_action,
+                    incident.acknowledged_by,
+                ),
+            )
+        saved = await self.get_incident(incident.guild_id, incident.incident_id)
+        if saved is None:
+            raise RuntimeError("recorded incident could not be read")
+        return saved
+
+    async def get_incident(self, guild_id: int, incident_id: str) -> Incident | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, incident_id, kind, band, opened_at, evidence_packet_id,
+                   recommended_action, acknowledged_by
+            FROM incidents
+            WHERE guild_id = ? AND incident_id = ?
+            """,
+            (guild_id, incident_id),
+        )
+        row = await cursor.fetchone()
+        return incident_from_row(row)
+
+    async def list_recent_incidents(self, guild_id: int, limit: int = 50) -> tuple[Incident, ...]:
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, incident_id, kind, band, opened_at, evidence_packet_id,
+                   recommended_action, acknowledged_by
+            FROM incidents
+            WHERE guild_id = ?
+            ORDER BY opened_at DESC, incident_id DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(Incident, incident_from_row(row)) for row in rows)
+
+    async def save_allow_block_entry(self, entry: AllowBlockEntry) -> AllowBlockEntry:
+        """Insert or replace one guild-configured allow/block entry for a Discord user.
+
+        Identity is `(guild_id, discord_user_id)`, matching `AllowBlockEntry` — a user
+        can hold at most one `list_kind` per guild at a time; re-setting the entry
+        (including to the opposite `list_kind`) replaces it rather than accumulating
+        history, matching the "staff-set facts" description in the design doc.
+        """
+        _require_guild_id(entry.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO guild_allow_block_lists (
+                    guild_id, discord_user_id, list_kind, reason, set_by, set_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                    list_kind = excluded.list_kind,
+                    reason = excluded.reason,
+                    set_by = excluded.set_by,
+                    set_at = excluded.set_at
+                """,
+                (
+                    entry.guild_id,
+                    entry.discord_user_id,
+                    entry.list_kind,
+                    entry.reason,
+                    entry.set_by,
+                    entry.set_at.isoformat(),
+                ),
+            )
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, discord_user_id, list_kind, reason, set_by, set_at
+            FROM guild_allow_block_lists
+            WHERE guild_id = ? AND discord_user_id = ?
+            """,
+            (entry.guild_id, entry.discord_user_id),
+        )
+        saved = allow_block_entry_from_row(await cursor.fetchone())
+        if saved is None:
+            raise RuntimeError("saved allow/block entry could not be read")
+        return saved
+
+    async def list_allow_block_entries(
+        self, guild_id: int, list_kind: str | None = None
+    ) -> tuple[AllowBlockEntry, ...]:
+        _require_guild_id(guild_id)
+        if list_kind is None:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, discord_user_id, list_kind, reason, set_by, set_at
+                FROM guild_allow_block_lists
+                WHERE guild_id = ?
+                ORDER BY set_at DESC
+                """,
+                (guild_id,),
+            )
+        else:
+            if list_kind not in ("allow", "block"):
+                raise ValueError("list_kind must be 'allow' or 'block'")
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, discord_user_id, list_kind, reason, set_by, set_at
+                FROM guild_allow_block_lists
+                WHERE guild_id = ? AND list_kind = ?
+                ORDER BY set_at DESC
+                """,
+                (guild_id, list_kind),
+            )
+        rows = await cursor.fetchall()
+        return tuple(cast(AllowBlockEntry, allow_block_entry_from_row(row)) for row in rows)
+
+    async def record_sniff_receipt(
+        self,
+        *,
+        guild_id: int,
+        receipt_id: str,
+        member_id: int | None,
+        action: str,
+        detail: dict[str, JSONValue],
+        created_at: datetime,
+    ) -> None:
+        """Record a redacted, append-only audit receipt for one watchdog storage
+        transition, matching the `creator_registry_receipts`/`content_receipts`
+        append-only receipt convention.
+        """
+        _require_guild_id(guild_id)
+        safe_detail = _json_object(redact(detail))
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO sniff_receipts (
+                    guild_id, receipt_id, member_id, action, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt_id,
+                    member_id,
+                    action,
+                    json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def list_sniff_receipts(
+        self, guild_id: int, member_id: int | None = None, limit: int = 50
+    ) -> tuple[SniffReceipt, ...]:
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if member_id is None:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, member_id, action, detail_json, created_at
+                FROM sniff_receipts
+                WHERE guild_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, member_id, action, detail_json, created_at
+                FROM sniff_receipts
+                WHERE guild_id = ? AND member_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, member_id, limit),
+            )
+        rows = await cursor.fetchall()
+        return tuple(self._sniff_receipt_from_row(row) for row in rows)
+
+    @staticmethod
+    def _sniff_receipt_from_row(row: aiosqlite.Row) -> SniffReceipt:
+        stored_member_id = row["member_id"]
+        return SniffReceipt(
+            guild_id=int(row["guild_id"]),
+            receipt_id=str(row["receipt_id"]),
+            member_id=int(stored_member_id) if stored_member_id is not None else None,
+            action=str(row["action"]),
+            detail=_json_object(json.loads(str(row["detail_json"]))),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
