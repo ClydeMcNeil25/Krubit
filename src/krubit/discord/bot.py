@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from uuid import uuid4
 
 import discord
@@ -22,10 +22,11 @@ from krubit.discord.content_commands import (
 )
 from krubit.discord.content_runtime import ConnectorScheduler, ContentRuntime
 from krubit.discord.events import guild_event
-from krubit.discord.install import phase_two_intents, phase_two_permissions
+from krubit.discord.install import phase_three_intents, phase_two_intents, phase_two_permissions
 from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
+from krubit.discord.watchdog_runtime import WatchdogRuntime
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.creator_signals import ContentPlan, Platform
 from krubit.domain.models import Card, CardField, GuildEvent
@@ -41,6 +42,7 @@ from krubit.services.health import HealthService
 from krubit.services.incident_evidence import correlate_automod_action
 from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
+from krubit.services.watch_window import WATCH_WINDOW_DURATION, WatchWindowService
 
 _logger = logging.getLogger(__name__)
 
@@ -411,8 +413,14 @@ class KrubitBot(discord.Client):
         twitch: TwitchClient | None = None,
         content_connectors: Mapping[Platform, Connector] | None = None,
     ) -> None:
+        # `phase_three_intents()`'s new `message_content`/`messages` flags are only
+        # requested when `watchdog_enabled` is explicitly on: requesting a privileged
+        # intent unconditionally would require every operator to enable Message
+        # Content in the Discord Developer Portal before the bot could connect at
+        # all, even for a deployment that never opts into Watchdog -- breaking the
+        # "safe by default" promise `watchdog_enabled=False` is supposed to keep.
         super().__init__(
-            intents=phase_two_intents(),
+            intents=phase_three_intents() if settings.watchdog_enabled else phase_two_intents(),
             application_id=settings.application_id,
             connector=connector,
         )
@@ -445,6 +453,21 @@ class KrubitBot(discord.Client):
             guild_ids=lambda: tuple(guild.id for guild in self.guilds),
             on_plans=self._deliver_content_plans,
         )
+        watch_window_duration = (
+            timedelta(hours=settings.watchdog_watch_window_hours)
+            if settings.watchdog_watch_window_hours is not None
+            else WATCH_WINDOW_DURATION
+        )
+        self._watchdog_runtime = WatchdogRuntime(
+            service.store,
+            watchdog_enabled=settings.watchdog_enabled,
+            watchdog_notifications_enabled=settings.watchdog_notifications_enabled,
+            staff_channel_id=settings.staff_channel_id,
+            guild_lookup=self.get_guild,
+            guild_ids=lambda: tuple(guild.id for guild in self.guilds),
+            message_content_available=self.intents.message_content,
+            watch_window=WatchWindowService(service.store, duration=watch_window_duration),
+        )
         self.tree.add_command(
             FetchCommands(
                 service,
@@ -467,11 +490,14 @@ class KrubitBot(discord.Client):
             self.live_signal_reconciliation.start()
         if self._content_scheduler_enabled:
             self.content_scheduler_cycle.start()
+        if self._settings.watchdog_enabled:
+            self.watchdog_sweep_cycle.start()
 
     async def close(self) -> None:
         self.daily_health_summary.cancel()
         self.live_signal_reconciliation.cancel()
         self.content_scheduler_cycle.cancel()
+        self.watchdog_sweep_cycle.cancel()
         await super().close()
 
     async def _deliver_content_plans(self, guild_id: int, plans: tuple[ContentPlan, ...]) -> None:
@@ -511,6 +537,38 @@ class KrubitBot(discord.Client):
     async def on_content_scheduler_cycle_error(self, exception: BaseException) -> None:
         _logger.exception(
             "content_scheduler_cycle: exception escaped the loop body", exc_info=exception
+        )
+
+    @tasks.loop(seconds=60)
+    async def watchdog_sweep_cycle(self) -> None:
+        """Run one Watchdog sweep cycle without ever letting the loop itself stop.
+
+        `WatchdogRuntime.sweep_cycle` already isolates every per-guild and per-detector
+        failure internally (mirroring `ConnectorScheduler.run_cycle`'s own discipline),
+        but this outer `try`/`except` is the same second-layer guarantee
+        `content_scheduler_cycle` relies on: `discord.ext.tasks.Loop` only auto-retries
+        a narrow set of reconnect-worthy exceptions, so anything else escaping this
+        coroutine would otherwise stop watch-window expiry and raid/spam-wave/webhook-
+        abuse/permission-risk detection permanently until a process restart. Sixty
+        seconds matches `content_scheduler_cycle`'s own cadence and is comfortably
+        finer-grained than every detector's own correlation window (the shortest,
+        `SpamWaveDetector`'s 5 minutes), so a window is never open materially longer
+        than its configured duration and a fired detector is never left unnotified for
+        more than one cycle.
+        """
+        try:
+            await self._watchdog_runtime.sweep_cycle(datetime.now(UTC))
+        except Exception:
+            _logger.exception("watchdog_sweep_cycle: unhandled exception during sweep_cycle")
+
+    @watchdog_sweep_cycle.before_loop
+    async def before_watchdog_sweep_cycle(self) -> None:
+        await self.wait_until_ready()
+
+    @watchdog_sweep_cycle.error
+    async def on_watchdog_sweep_cycle_error(self, exception: BaseException) -> None:
+        _logger.exception(
+            "watchdog_sweep_cycle: exception escaped the loop body", exc_info=exception
         )
 
     async def run_daily_summary_for_guild(
@@ -653,11 +711,13 @@ class KrubitBot(discord.Client):
         await self._record_guild_connection(guild)
         await self._live_runtime.bootstrap_guild(guild)
         await self._content_runtime.recover_pending(guild)
+        await self._watchdog_runtime.bootstrap_guild(guild.id, datetime.now(UTC))
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
         await self._live_runtime.bootstrap_guild(guild)
         await self._content_runtime.recover_pending(guild)
+        await self._watchdog_runtime.bootstrap_guild(guild.id, datetime.now(UTC))
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member) -> None:
         await self._live_runtime.handle_presence(before, after)
@@ -689,6 +749,10 @@ class KrubitBot(discord.Client):
         await self._ingest_change(
             "member_joined", member.guild.id, member.id, None, {"bot": member.bot}
         )
+        await self._watchdog_runtime.on_member_join(member, datetime.now(UTC))
+
+    async def on_message(self, message: discord.Message) -> None:
+        await self._watchdog_runtime.on_message(message, datetime.now(UTC))
 
     async def on_member_remove(self, member: discord.Member) -> None:
         await self._ingest_change(
@@ -795,6 +859,12 @@ class KrubitBot(discord.Client):
         await self._ingest_change(
             "webhooks_updated", channel.guild.id, channel.id, None, {"channel": channel.name}
         )
+        # Feed the raw callback into `WebhookAbuseDetector`'s in-memory same-channel
+        # cache independently of the durable `_ingest_change` write above -- see
+        # `WatchdogRuntime`'s module docstring for why both this and `on_message`'s
+        # `SpamWaveDetector.record_message` call must exist (Task 5's review flagged
+        # wiring only one of the two as a silent, recurring detection gap).
+        await self._watchdog_runtime.on_webhooks_update(channel, datetime.now(UTC))
 
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild) -> None:
         await self._ingest_change(

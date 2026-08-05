@@ -56,6 +56,27 @@ def phase_two_permissions(*, scheduled_events_enabled: bool = False) -> discord.
     return permissions
 
 
+def phase_three_intents() -> discord.Intents:
+    """The Phase 3 Watchdog intent set: Message Content, additively on top of Phase 2.
+
+    Per the design doc's "Privileged Intent Requirement" section, the post-join watch
+    window's message inspection needs Discord's privileged `message_content` intent,
+    which nothing before this phase requests. This also adds the non-privileged
+    `messages` intent (`guild_messages`/`dm_messages`): `message_content` on its own
+    only controls whether `content`/`embeds`/`attachments`/`components` populate on a
+    dispatched `MESSAGE_CREATE` event — it does not itself cause that event to be
+    dispatched at all (`discord.Intents.messages` gates dispatch). Without `messages`,
+    requesting `message_content` alone would leave `on_message` never firing for guild
+    text channels, silently dead-ending the entire watch-window message path this
+    intent exists to unlock. `phase_two_intents()`'s own three flags (`guilds`,
+    `members`, `presences`) are inherited unchanged.
+    """
+    intents = phase_two_intents()
+    intents.message_content = True
+    intents.messages = True
+    return intents
+
+
 def install_url(application_id: int, *, scheduled_events_enabled: bool = False) -> str:
     if application_id <= 0:
         raise ValueError("application_id must be positive")

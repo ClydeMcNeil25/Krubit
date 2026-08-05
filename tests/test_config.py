@@ -12,6 +12,42 @@ def base_env() -> dict[str, str]:
     }
 
 
+def test_watchdog_settings_default_disabled() -> None:
+    settings = Settings.from_env(base_env())
+    assert settings.watchdog_enabled is False
+    assert settings.watchdog_notifications_enabled is False
+    assert settings.watchdog_watch_window_hours is None
+    assert settings.watchdog_zariya_bridge_url is None
+
+
+def test_watchdog_settings_parse_when_enabled() -> None:
+    settings = Settings.from_env(
+        {
+            **base_env(),
+            "KRUBIT_WATCHDOG_ENABLED": "true",
+            "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED": "true",
+            "KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS": "12",
+            "KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL": "https://zariya.example/bridge",
+        }
+    )
+    assert settings.watchdog_enabled is True
+    assert settings.watchdog_notifications_enabled is True
+    assert settings.watchdog_watch_window_hours == 12
+    assert settings.watchdog_zariya_bridge_url == "https://zariya.example/bridge"
+
+
+def test_watchdog_settings_reject_non_positive_watch_window_hours() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS"):
+        Settings.from_env({**base_env(), "KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS": "0"})
+
+
+def test_watchdog_settings_reject_non_https_zariya_bridge_url() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL"):
+        Settings.from_env(
+            {**base_env(), "KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL": "http://zariya.example/bridge"}
+        )
+
+
 def test_settings_load_without_requiring_token() -> None:
     settings = Settings.from_env(
         {

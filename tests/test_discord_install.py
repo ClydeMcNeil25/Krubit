@@ -6,6 +6,7 @@ from krubit.discord.install import (
     install_url,
     phase_one_intents,
     phase_one_permissions,
+    phase_three_intents,
     phase_two_intents,
     phase_two_permissions,
     phase_zero_intents,
@@ -92,6 +93,24 @@ def test_install_url_omits_scheduled_event_scopes_by_default() -> None:
     query = parse_qs(parsed.query)
 
     assert query["permissions"] == [str(phase_two_permissions().value)]
+
+
+def test_phase_three_intents_adds_message_content_to_phase_two() -> None:
+    intents = phase_three_intents()
+
+    assert intents.message_content is True
+    assert intents.members is True  # inherited from phase_two_intents()
+    assert intents.guilds is True
+    assert intents.presences is True
+
+
+def test_phase_three_intents_adds_messages_so_on_message_actually_dispatches() -> None:
+    """`message_content` alone only controls whether Message fields populate; it does
+    not cause `MESSAGE_CREATE` to dispatch at all -- `Intents.messages` does. Without
+    it, requesting `message_content` alone would never fire `on_message`."""
+    intents = phase_three_intents()
+
+    assert intents.messages is True
 
 
 def test_install_url_requests_scheduled_event_scopes_when_enabled() -> None:

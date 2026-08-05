@@ -52,6 +52,10 @@ class Settings:
     credential_encryption_key: str | None = field(default=None, repr=False)
     callback_public_base_url: str | None = None
     callback_port: int | None = None
+    watchdog_enabled: bool = False
+    watchdog_notifications_enabled: bool = False
+    watchdog_watch_window_hours: int | None = None
+    watchdog_zariya_bridge_url: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -97,6 +101,16 @@ class Settings:
         raw_credential_encryption_key = values.get("KRUBIT_CREDENTIAL_ENCRYPTION_KEY", "").strip()
         raw_callback_public_base_url = values.get("KRUBIT_CALLBACK_PUBLIC_BASE_URL", "").strip()
         raw_callback_port = values.get("KRUBIT_CALLBACK_PORT", "").strip()
+        raw_watchdog_enabled = values.get("KRUBIT_WATCHDOG_ENABLED", "false").strip()
+        raw_watchdog_notifications_enabled = values.get(
+            "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED", "false"
+        ).strip()
+        raw_watchdog_watch_window_hours = values.get(
+            "KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS", ""
+        ).strip()
+        raw_watchdog_zariya_bridge_url = values.get(
+            "KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL", ""
+        ).strip()
 
         creator_signals_enabled = _parse_bool(
             "KRUBIT_CREATOR_SIGNALS_ENABLED", raw_creator_signals_enabled
@@ -115,6 +129,25 @@ class Settings:
                     "KRUBIT_CALLBACK_PORT must be a port number between 1 and 65535"
                 )
             callback_port = int(raw_callback_port)
+
+        watchdog_enabled = _parse_bool("KRUBIT_WATCHDOG_ENABLED", raw_watchdog_enabled)
+        watchdog_notifications_enabled = _parse_bool(
+            "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED", raw_watchdog_notifications_enabled
+        )
+        watchdog_watch_window_hours: int | None = None
+        if raw_watchdog_watch_window_hours:
+            if (
+                not raw_watchdog_watch_window_hours.isdigit()
+                or int(raw_watchdog_watch_window_hours) <= 0
+            ):
+                raise SettingsError(
+                    "KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS must be a positive integer"
+                )
+            watchdog_watch_window_hours = int(raw_watchdog_watch_window_hours)
+        if raw_watchdog_zariya_bridge_url and not raw_watchdog_zariya_bridge_url.startswith(
+            "https://"
+        ):
+            raise SettingsError("KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL must use https")
 
         return cls(
             application_id=int(raw_application_id),
@@ -138,6 +171,10 @@ class Settings:
             credential_encryption_key=raw_credential_encryption_key or None,
             callback_public_base_url=raw_callback_public_base_url or None,
             callback_port=callback_port,
+            watchdog_enabled=watchdog_enabled,
+            watchdog_notifications_enabled=watchdog_notifications_enabled,
+            watchdog_watch_window_hours=watchdog_watch_window_hours,
+            watchdog_zariya_bridge_url=raw_watchdog_zariya_bridge_url or None,
         )
 
     def require_token(self) -> str:
