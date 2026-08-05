@@ -58,6 +58,54 @@ meaningful signal anyway: an attacker touching several channels' webhook
 configuration in a short window is broader and more alarming than one channel's
 config merely being edited a couple of times.
 
+## The distinct-channel signal alone misses same-channel repeated abuse — fixed below
+
+A code review of this task caught a real gap the first version of this module left
+open: the distinct-channel signal above answers "how many different channels were
+touched," never "how many times was *this one* channel touched" — and the single most
+realistic webhook-abuse shape (an attacker or compromised token repeatedly
+create/edit/delete-cycling a webhook in *one* channel to evade takedown) collapses
+to exactly one distinguishable `entity_id`, so `affected_channels` never grows past
+`{that one channel}` no matter how many times it recurs. Worse, this can never be
+fixed by reading `guild_events` more cleverly: the second and third same-payload
+`webhooks_updated` events for that channel are never even written to storage — see
+"Why this detector counts distinct channels, not raw event rows" above —
+`accept_event`'s `INSERT OR IGNORE` silently drops them *before* this detector's next
+`evaluate()` call ever runs. No read-side query, however clever, can recover
+information that was never persisted.
+
+Two fixes were considered:
+
+1. **Change `guild_event()`'s hash to include `occurred_at`.** Rejected: in
+   production, `occurred_at` is `datetime.now(UTC)` read fresh at every
+   `_ingest_change` call (see `bot.py`), so a genuine Discord gateway redelivery of
+   the *same* logical event almost never carries an identical timestamp. The current
+   exclusion of `occurred_at` from the hash is exactly what lets real redeliveries
+   dedupe today; including it would silently disable replay-idempotency for every
+   event type in the app (member joins, role/channel/automod changes, everything
+   `guild_event()` produces), not just this one detector's input — a blast radius far
+   larger than this task's fix, and outside this task's own file list
+   (`events.py`/`models.py`) besides.
+2. **Observe the raw event before it reaches storage, the same way
+   `SpamWaveDetector` observes message content before any storage layer exists for
+   it** (see `krubit.services.raid_detection`'s module docstring). `record_webhook_
+   event(guild_id, channel_id, now)` is a small, bounded, in-memory-only, per-guild
+   cache — structurally identical to `SpamWaveDetector._messages` — fed by whichever
+   runtime handles the raw `on_webhooks_update` gateway callback, *before* that
+   callback's event reaches `accept_event`'s dedup. Because this cache never goes
+   through `guild_events`, it is immune to the hash-collision collapse by
+   construction, and a burst of same-channel calls is counted exactly. This is
+   additive to the existing durable distinct-channel signal, not a replacement: the
+   durable signal still independently catches an attacker spreading across several
+   channels, using only data already in storage with no wiring required; the
+   in-memory signal catches the single-channel case the durable signal structurally
+   cannot see. `evaluate` fires if *either* signal clears its threshold. Like
+   `SpamWaveDetector`, no runtime calls `record_webhook_event` yet (that wiring is
+   Task 7's job, matching the design doc's "message-content-dependent signals degrade
+   honestly" precedent extended here to this same-channel-burst signal) — until then
+   `evaluate`'s in-memory path is correctly and honestly inert, while its
+   durable-storage path (distinct channels) works today.
+
 ## Threshold design (safety-sensitive — read before changing)
 
 - `_WEBHOOK_ABUSE_WINDOW = 10 minutes`, `_WEBHOOK_ABUSE_CHANNEL_THRESHOLD = 3`: three
@@ -66,6 +114,12 @@ config merely being edited a couple of times.
   integration) is ordinary configuration churn; three-plus distinct channels in a
   tight window is consistent with an attacker probing/creating/reconfiguring webhooks
   across the guild for exfiltration, not routine setup.
+- `_WEBHOOK_SAME_CHANNEL_THRESHOLD = 3`: three or more observed `record_webhook_event`
+  calls for the *same* channel within the same ten-minute window. Kept equal to the
+  distinct-channel threshold for the same reasoning (one or two is ordinary editing;
+  three-plus in a tight window is not) — see "The distinct-channel signal alone
+  misses same-channel repeated abuse" above for why this second, independent signal
+  exists at all.
 - `_ROLE_GRANT_LOOKBACK = 30 minutes`: how far back `PermissionRiskDetector` looks for
   a `member_roles_updated` event that added an elevated-permission role. Thirty
   minutes is short enough that the grant is still "recent" relative to `now` (this is
@@ -89,6 +143,7 @@ config merely being edited a couple of times.
 
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from typing import Final
@@ -102,6 +157,8 @@ from krubit.storage.sqlite import SQLiteStore
 
 _WEBHOOK_ABUSE_WINDOW: Final[timedelta] = timedelta(minutes=10)
 _WEBHOOK_ABUSE_CHANNEL_THRESHOLD: Final[int] = 3
+_WEBHOOK_SAME_CHANNEL_THRESHOLD: Final[int] = 3
+_WEBHOOK_EVENT_CACHE_LIMIT: Final[int] = 200
 _WEBHOOK_EVENT_TYPE: Final[str] = "webhooks_updated"
 _WEBHOOK_SIGNAL_WEIGHT: Final[int] = 7
 _WEBHOOK_SIGNAL_CONFIDENCE: Final[float] = 0.7
@@ -163,9 +220,19 @@ def _role_ids_from_payload(payload: Mapping[str, JSONValue], key: str) -> frozen
 class WebhookAbuseDetector:
     """Fire a `WEBHOOK_ABUSE` incident on a burst of webhook config-change events.
 
-    See the module docstring's "What Phase 1's `webhooks_updated` event actually
-    contains" section for why config-change burst frequency, not message-send rate,
-    is the signal this detector can honestly compute without new tracking.
+    Two independent signals, either of which is sufficient to fire:
+
+    1. A durable, storage-backed signal: >= `channel_threshold` distinct channels
+       with a `webhooks_updated` event in `SQLiteStore` within `window`. Works today
+       with no extra wiring, but structurally cannot see repeated changes to a single
+       channel — see the module docstring's "The distinct-channel signal alone misses
+       same-channel repeated abuse" section for why.
+    2. An in-memory signal fed by `record_webhook_event`: >= `same_channel_threshold`
+       observed calls for the *same* channel within `window`. Mirrors
+       `SpamWaveDetector`'s own in-memory correlation cache and closes exactly the
+       gap signal 1 cannot see, at the cost of needing a runtime to call
+       `record_webhook_event` per raw gateway callback (not yet wired — see the same
+       module docstring section).
     """
 
     def __init__(
@@ -174,21 +241,43 @@ class WebhookAbuseDetector:
         *,
         window: timedelta = _WEBHOOK_ABUSE_WINDOW,
         channel_threshold: int = _WEBHOOK_ABUSE_CHANNEL_THRESHOLD,
+        same_channel_threshold: int = _WEBHOOK_SAME_CHANNEL_THRESHOLD,
         evidence_builder: EvidencePacketBuilder = _default_evidence_builder,
     ) -> None:
         if window <= timedelta(0):
             raise ValueError("window must be positive")
         if channel_threshold < 1:
             raise ValueError("channel_threshold must be positive")
+        if same_channel_threshold < 1:
+            raise ValueError("same_channel_threshold must be positive")
         self._store = store
         self._window = window
         self._channel_threshold = channel_threshold
+        self._same_channel_threshold = same_channel_threshold
         self._evidence_builder = evidence_builder
+        self._channel_events: dict[int, deque[tuple[int, datetime]]] = defaultdict(
+            lambda: deque(maxlen=_WEBHOOK_EVENT_CACHE_LIMIT)
+        )
+
+    def record_webhook_event(self, guild_id: int, channel_id: int, now: datetime) -> None:
+        """Remember one raw `on_webhooks_update` observation for `channel_id`.
+
+        In-memory only, bounded, and never written to `SQLiteStore` -- see the module
+        docstring's "The distinct-channel signal alone misses same-channel repeated
+        abuse" section. Call this from wherever the raw gateway callback is handled,
+        *before* (or independent of) that callback also calling `accept_event`, so a
+        burst of same-channel, same-payload calls is counted here even though only
+        the first of them survives storage's dedup.
+        """
+        _require_aware("now", now)
+        self._channel_events[guild_id].append((channel_id, now))
 
     async def evaluate(self, guild_id: int, now: datetime) -> Incident | None:
         _require_aware("now", now)
-        events = await self._store.list_events(guild_id, limit=_EVENTS_SCAN_LIMIT)
         cutoff = now - self._window
+        signals: list[RiskSignal] = []
+
+        events = await self._store.list_events(guild_id, limit=_EVENTS_SCAN_LIMIT)
         recent_webhook_events = [
             event
             for event in events
@@ -197,28 +286,73 @@ class WebhookAbuseDetector:
         # Count distinct channels, not raw rows -- see the module docstring's "Why
         # this detector counts distinct channels, not raw event rows" section.
         affected_channels = {str(event.payload.get("entity_id")) for event in recent_webhook_events}
-        if len(affected_channels) < self._channel_threshold:
+        if len(affected_channels) >= self._channel_threshold:
+            signals.append(
+                RiskSignal(
+                    name="webhook_config_change_burst",
+                    weight=_WEBHOOK_SIGNAL_WEIGHT,
+                    detail=(
+                        f"{len(affected_channels)} distinct channels had webhook "
+                        f"configuration-change events in this guild within "
+                        f"{int(self._window.total_seconds())} seconds"
+                    ),
+                    confidence=_WEBHOOK_SIGNAL_CONFIDENCE,
+                )
+            )
+
+        hot_channel = self._hottest_same_channel(guild_id, cutoff, now)
+        if hot_channel is not None:
+            channel_id, occurrences = hot_channel
+            signals.append(
+                RiskSignal(
+                    name="webhook_same_channel_reconfig_burst",
+                    weight=_WEBHOOK_SIGNAL_WEIGHT,
+                    detail=(
+                        f"channel {channel_id} had {occurrences} webhook "
+                        f"configuration-change observations within "
+                        f"{int(self._window.total_seconds())} seconds (observed "
+                        "directly via record_webhook_event, independent of "
+                        "guild_events storage deduplication)"
+                    ),
+                    confidence=_WEBHOOK_SIGNAL_CONFIDENCE,
+                )
+            )
+
+        if not signals:
             return None
 
-        signal = RiskSignal(
-            name="webhook_config_change_burst",
-            weight=_WEBHOOK_SIGNAL_WEIGHT,
-            detail=(
-                f"{len(affected_channels)} distinct channels had webhook "
-                f"configuration-change events in this guild within "
-                f"{int(self._window.total_seconds())} seconds"
-            ),
-            confidence=_WEBHOOK_SIGNAL_CONFIDENCE,
-        )
         return await _record_incident(
             self._store,
             guild_id=guild_id,
             kind=IncidentKind.WEBHOOK_ABUSE,
-            signals=(signal,),
+            signals=tuple(signals),
             recommended_action=_WEBHOOK_RECOMMENDED_ACTION,
             evidence_builder=self._evidence_builder,
             now=now,
         )
+
+    def _hottest_same_channel(
+        self, guild_id: int, cutoff: datetime, now: datetime
+    ) -> tuple[int, int] | None:
+        """Return `(channel_id, count)` for the channel with the most in-window
+        `record_webhook_event` observations, if any clears `same_channel_threshold`.
+        """
+        del now
+        cache = self._channel_events.get(guild_id)
+        if not cache:
+            return None
+        counts: dict[int, int] = {}
+        for channel_id, observed_at in cache:
+            if observed_at < cutoff:
+                continue
+            counts[channel_id] = counts.get(channel_id, 0) + 1
+        if not counts:
+            return None
+        hottest_channel_id = max(counts, key=lambda channel_id: counts[channel_id])
+        hottest_count = counts[hottest_channel_id]
+        if hottest_count < self._same_channel_threshold:
+            return None
+        return hottest_channel_id, hottest_count
 
 
 class PermissionRiskDetector:

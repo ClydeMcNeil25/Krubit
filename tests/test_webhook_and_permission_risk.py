@@ -129,18 +129,68 @@ async def test_webhook_abuse_detector_does_not_fire_on_spread_out_config_changes
 
 
 @pytest.mark.asyncio
-async def test_webhook_abuse_detector_does_not_fire_on_repeated_same_channel_updates(
+async def test_webhook_abuse_detector_storage_path_alone_cannot_see_same_channel_repeats(
     store: SQLiteStore,
 ) -> None:
     # `on_webhooks_update`'s payload only ever carries the channel name, so repeated
     # updates to the *same* channel hash identically and collapse to one stored row
-    # (see `guild_event`'s docstring and this module's "Why this detector counts
-    # distinct channels" section) -- this is a real, known limitation of the
-    # underlying Phase 1 event, not a detector bug: three genuine same-channel
-    # updates in a burst still only ever produce one distinguishable event here.
+    # (see `guild_event`'s docstring and this module's "The distinct-channel signal
+    # alone misses same-channel repeated abuse" section) -- this is a real, known
+    # limitation of the underlying Phase 1 event, not a detector bug: three genuine
+    # same-channel updates in a burst still only ever produce one distinguishable
+    # stored row. Without a corresponding `record_webhook_event` call, the detector
+    # correctly cannot see this pattern from storage alone -- see the next test for
+    # the fix (the in-memory `record_webhook_event` path).
     for offset in (0, 60, 120):
         await seed_webhook_event(store, entity_id=555, occurred_at=NOW - timedelta(seconds=offset))
     assert await WebhookAbuseDetector(store).evaluate(GUILD_ID, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_webhook_abuse_detector_fires_on_repeated_same_channel_updates_via_ingestion(
+    store: SQLiteStore,
+) -> None:
+    # This is the fix for the gap proven by the previous test: `record_webhook_event`
+    # observes each raw same-channel update directly, sidestepping `guild_events`'
+    # storage-layer dedup entirely (mirrors `SpamWaveDetector.record_message`'s
+    # in-memory correlation cache). Note the underlying `guild_events` table only
+    # ever stores one distinguishable row for this channel (as the previous test
+    # shows) -- the fix does not depend on storage capturing all three.
+    detector = WebhookAbuseDetector(store)
+    for offset in (0, 60, 120):
+        detector.record_webhook_event(GUILD_ID, 555, NOW - timedelta(seconds=offset))
+
+    incident = await detector.evaluate(GUILD_ID, now=NOW)
+    assert incident is not None
+    assert incident.kind is IncidentKind.WEBHOOK_ABUSE
+    assert incident.band is RiskBand.INCIDENT
+
+    stored = await store.get_incident(GUILD_ID, incident.incident_id)
+    assert stored == incident
+    receipts = await store.list_sniff_receipts(GUILD_ID)
+    assert any(receipt.action == "incident_recorded" for receipt in receipts)
+
+
+@pytest.mark.asyncio
+async def test_webhook_abuse_detector_does_not_fire_below_same_channel_threshold(
+    store: SQLiteStore,
+) -> None:
+    detector = WebhookAbuseDetector(store)
+    for offset in (0, 60):
+        detector.record_webhook_event(GUILD_ID, 555, NOW - timedelta(seconds=offset))
+    assert await detector.evaluate(GUILD_ID, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_webhook_abuse_detector_ignores_same_channel_observations_outside_window(
+    store: SQLiteStore,
+) -> None:
+    detector = WebhookAbuseDetector(store)
+    detector.record_webhook_event(GUILD_ID, 555, NOW - timedelta(minutes=30))
+    detector.record_webhook_event(GUILD_ID, 555, NOW - timedelta(minutes=20))
+    detector.record_webhook_event(GUILD_ID, 555, NOW)
+    # Only the most recent observation is within the 10-minute window.
+    assert await detector.evaluate(GUILD_ID, now=NOW) is None
 
 
 @pytest.mark.asyncio
