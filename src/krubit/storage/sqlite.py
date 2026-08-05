@@ -382,6 +382,7 @@ class SQLiteStore:
                 guild_id INTEGER NOT NULL,
                 platform TEXT NOT NULL,
                 external_id TEXT NOT NULL,
+                transition_seq INTEGER NOT NULL CHECK (transition_seq > 0),
                 account_id TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
@@ -389,7 +390,7 @@ class SQLiteStore:
                 discord_message_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, platform, external_id),
+                PRIMARY KEY (guild_id, platform, external_id, transition_seq),
                 FOREIGN KEY (guild_id, platform, external_id)
                     REFERENCES content_events (guild_id, platform, external_id)
             );
@@ -401,13 +402,14 @@ class SQLiteStore:
                 guild_id INTEGER NOT NULL,
                 platform TEXT NOT NULL,
                 external_id TEXT NOT NULL,
+                transition_seq INTEGER NOT NULL CHECK (transition_seq > 0),
                 attempt INTEGER NOT NULL CHECK (attempt > 0),
                 status TEXT NOT NULL,
                 detail_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, platform, external_id, attempt),
-                FOREIGN KEY (guild_id, platform, external_id)
-                    REFERENCES content_deliveries (guild_id, platform, external_id)
+                PRIMARY KEY (guild_id, platform, external_id, transition_seq, attempt),
+                FOREIGN KEY (guild_id, platform, external_id, transition_seq)
+                    REFERENCES content_deliveries (guild_id, platform, external_id, transition_seq)
             );
 
             CREATE TABLE IF NOT EXISTS content_correlations (
@@ -1729,15 +1731,40 @@ class SQLiteStore:
     async def get_content_delivery(
         self, guild_id: int, platform: Platform, external_id: str
     ) -> ContentDelivery | None:
+        """Return the most recently claimed delivery for one content item, if any.
+
+        A content item can accumulate more than one delivery over its lifetime — one
+        per genuine publish/live transition (see `record_content_observations`) — so
+        this returns the highest `transition_seq` row. Use `list_content_deliveries`
+        for the full claim history.
+        """
         _require_guild_id(guild_id)
         cursor = await self._connection.execute(
             """
             SELECT * FROM content_deliveries
             WHERE guild_id = ? AND platform = ? AND external_id = ?
+            ORDER BY transition_seq DESC
+            LIMIT 1
             """,
             (guild_id, platform.value, external_id),
         )
         return content_delivery_from_row(await cursor.fetchone())
+
+    async def list_content_deliveries(
+        self, guild_id: int, platform: Platform, external_id: str
+    ) -> list[ContentDelivery]:
+        """Return every delivery claimed for one content item, oldest transition first."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_deliveries
+            WHERE guild_id = ? AND platform = ? AND external_id = ?
+            ORDER BY transition_seq ASC
+            """,
+            (guild_id, platform.value, external_id),
+        )
+        deliveries = [content_delivery_from_row(row) for row in await cursor.fetchall()]
+        return [delivery for delivery in deliveries if delivery is not None]
 
     async def list_pending_content_deliveries(self, guild_id: int) -> list[ContentDelivery]:
         _require_guild_id(guild_id)
@@ -1767,12 +1794,16 @@ class SQLiteStore:
         The first successful call for `(guild_id, account_id)` is the baseline page:
         every observation is stored as an identity but nothing is ever claimed. Every
         later call upserts each observation's lifecycle state and claims exactly one
-        pending delivery for an item that newly reaches `PUBLISHED` or `LIVE` (that is,
-        its previously stored state — if any — had not already reached one of those
-        states). The whole page is one write transaction, so concurrent or duplicate
-        calls observing the same transition can never double-claim: the delivery claim
-        is an `INSERT OR IGNORE` against `content_deliveries`'s
-        `(guild_id, platform, external_id)` primary key.
+        fresh delivery per item that newly reaches `PUBLISHED` or `LIVE` (that is, its
+        previously stored state — if any — had not already reached one of those
+        states). A content item can be claimed more than once over its lifetime — for
+        example a stream that goes `live`, `ended`, then `live` again claims a second,
+        independent delivery — each claim gets the next `transition_seq` for that
+        `(guild_id, platform, external_id)`. The whole page is one write transaction,
+        so concurrent or duplicate calls observing the *same* transition can never
+        double-claim it: the delivery claim is an `INSERT OR IGNORE` against
+        `content_deliveries`'s `(guild_id, platform, external_id, transition_seq)`
+        primary key.
         """
         _require_guild_id(guild_id)
         async with self._write_transaction(immediate=True):
@@ -1839,17 +1870,31 @@ class SQLiteStore:
                     and reaches_publish_or_live(observation.state)
                     and not previously_reached
                 ):
+                    next_seq_cursor = await self._connection.execute(
+                        """
+                        SELECT COALESCE(MAX(transition_seq), 0) + 1 AS next_seq
+                        FROM content_deliveries
+                        WHERE guild_id = ? AND platform = ? AND external_id = ?
+                        """,
+                        (guild_id, platform.value, observation.external_id),
+                    )
+                    next_seq_row = await next_seq_cursor.fetchone()
+                    if next_seq_row is None:
+                        raise RuntimeError("next transition_seq query returned no row")
+                    next_seq = int(next_seq_row["next_seq"])
                     claim_cursor = await self._connection.execute(
                         """
                         INSERT OR IGNORE INTO content_deliveries (
-                            guild_id, platform, external_id, account_id, status, attempt,
-                            discord_channel_id, discord_message_id, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, 'pending', 1, NULL, NULL, ?, ?)
+                            guild_id, platform, external_id, transition_seq, account_id,
+                            status, attempt, discord_channel_id, discord_message_id,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'pending', 1, NULL, NULL, ?, ?)
                         """,
                         (
                             guild_id,
                             platform.value,
                             observation.external_id,
+                            next_seq,
                             account_id,
                             now.isoformat(),
                             now.isoformat(),
@@ -1859,17 +1904,31 @@ class SQLiteStore:
                         await self._connection.execute(
                             """
                             INSERT INTO content_delivery_attempts (
-                                guild_id, platform, external_id, attempt, status, detail_json,
-                                created_at
-                            ) VALUES (?, ?, ?, 1, 'pending', '{}', ?)
+                                guild_id, platform, external_id, transition_seq, attempt,
+                                status, detail_json, created_at
+                            ) VALUES (?, ?, ?, ?, 1, 'pending', '{}', ?)
                             """,
-                            (guild_id, platform.value, observation.external_id, now.isoformat()),
+                            (
+                                guild_id,
+                                platform.value,
+                                observation.external_id,
+                                next_seq,
+                                now.isoformat(),
+                            ),
                         )
                         claimed_event = await self.get_content_event(
                             guild_id, platform, observation.external_id
                         )
-                        claimed_delivery = await self.get_content_delivery(
-                            guild_id, platform, observation.external_id
+                        claimed_delivery_cursor = await self._connection.execute(
+                            """
+                            SELECT * FROM content_deliveries
+                            WHERE guild_id = ? AND platform = ? AND external_id = ?
+                                AND transition_seq = ?
+                            """,
+                            (guild_id, platform.value, observation.external_id, next_seq),
+                        )
+                        claimed_delivery = content_delivery_from_row(
+                            await claimed_delivery_cursor.fetchone()
                         )
                         if claimed_event is None or claimed_delivery is None:
                             raise RuntimeError("claimed content delivery could not be read back")

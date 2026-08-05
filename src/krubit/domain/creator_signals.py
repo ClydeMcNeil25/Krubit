@@ -355,16 +355,20 @@ _DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
 
 @dataclass(frozen=True, slots=True)
 class ContentDelivery:
-    """A durable, at-most-once claim to announce one content event.
+    """A durable claim to announce one publish/live transition of a content event.
 
-    Identity matches its `ContentEvent`'s `(guild_id, platform, external_id)`, so a
-    given piece of content can never accumulate more than one claim, however many times
-    it is observed or how many times it re-enters a publish/live state.
+    Identity is `(guild_id, platform, external_id, transition_seq)`: a given content
+    item can never accumulate more than one claim for the *same* transition (guarded by
+    storage's `INSERT OR IGNORE`), but a genuine later transition — for example a
+    livestream that goes `live` again after `ended`, or a post that is `corrected` and
+    then `published` again — claims a fresh delivery with the next `transition_seq`.
+    `transition_seq` starts at 1 and increases by 1 per claimed delivery for that item.
     """
 
     guild_id: int
     platform: Platform
     external_id: str
+    transition_seq: int
     account_id: str
     status: str
     attempt: int
@@ -378,6 +382,8 @@ class ContentDelivery:
         if type(self.platform) is not Platform:
             raise ValueError("platform must be a Platform")
         _require_text("external_id", self.external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+        if self.transition_seq <= 0:
+            raise ValueError("transition_seq must be positive")
         _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
         if self.status not in _DELIVERY_STATUSES:
             raise ValueError(f"status must be one of {sorted(_DELIVERY_STATUSES)}")

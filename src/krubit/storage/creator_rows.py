@@ -116,6 +116,7 @@ def content_delivery_from_row(row: aiosqlite.Row | None) -> ContentDelivery | No
         guild_id=int(row["guild_id"]),
         platform=Platform(str(row["platform"])),
         external_id=str(row["external_id"]),
+        transition_seq=int(row["transition_seq"]),
         account_id=str(row["account_id"]),
         status=str(row["status"]),
         attempt=int(row["attempt"]),

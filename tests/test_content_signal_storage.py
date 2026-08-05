@@ -18,6 +18,7 @@ import pytest
 from krubit.domain.creator_signals import (
     ContentKind,
     ContentObservation,
+    ContentPlan,
     ContentState,
     CreatorAccount,
     Platform,
@@ -214,6 +215,7 @@ async def test_scheduled_to_live_transition_claims_delivery_once(store: SQLiteSt
         now=EVEN_LATER,
     )
     assert [plan.event.external_id for plan in live_plans] == ["v2"]
+    assert live_plans[0].delivery.transition_seq == 1
     del live_cursor
 
     # Ending the stream is a lifecycle update, not a new publish/live transition.
@@ -230,6 +232,124 @@ async def test_scheduled_to_live_transition_claims_delivery_once(store: SQLiteSt
     event = await store.get_content_event(GUILD_ID, Platform.YOUTUBE, "v2")
     assert event is not None
     assert event.state is ContentState.ENDED
+
+
+@pytest.mark.asyncio
+async def test_recurring_live_transition_claims_a_new_delivery_each_time(
+    store: SQLiteStore,
+) -> None:
+    """A stream that goes live, ends, and goes live again claims two deliveries.
+
+    `content_deliveries` must not silently swallow the second "went live" event just
+    because a first delivery already exists for this `external_id` — each genuine
+    publish/live transition gets its own claim with the next `transition_seq`.
+    """
+    account = await _seeded_account(store)
+    await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("v1"),),
+        cursor_value="c1",
+        now=NOW,
+    )
+
+    _, first_live_plans = await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.LIVE),),
+        cursor_value="c2",
+        now=LATER,
+    )
+    assert [plan.event.external_id for plan in first_live_plans] == ["s1"]
+    first_delivery = first_live_plans[0].delivery
+    assert first_delivery.transition_seq == 1
+
+    _, ended_plans = await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.ENDED),),
+        cursor_value="c3",
+        now=EVEN_LATER,
+    )
+    assert ended_plans == ()
+
+    _, second_live_plans = await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.LIVE),),
+        cursor_value="c4",
+        now=EVEN_LATER + timedelta(minutes=1),
+    )
+    assert [plan.event.external_id for plan in second_live_plans] == ["s1"]
+    second_delivery = second_live_plans[0].delivery
+    assert second_delivery.transition_seq == 2
+    assert second_delivery.transition_seq != first_delivery.transition_seq
+
+    history = await store.list_content_deliveries(GUILD_ID, Platform.YOUTUBE, "s1")
+    assert [delivery.transition_seq for delivery in history] == [1, 2]
+
+    latest = await store.get_content_delivery(GUILD_ID, Platform.YOUTUBE, "s1")
+    assert latest == second_delivery
+
+
+@pytest.mark.asyncio
+async def test_concurrent_second_transition_claims_exactly_one_new_delivery(
+    store: SQLiteStore,
+) -> None:
+    """Two coroutines racing to claim a *second* live transition still claim only once.
+
+    Extends the single-claim concurrency guarantee to the case where a delivery
+    already exists for this `external_id` from an earlier transition — the race is
+    over the next `transition_seq`, not over whether any row exists at all.
+    """
+    account = await _seeded_account(store)
+    await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("v1"),),
+        cursor_value="c1",
+        now=NOW,
+    )
+    await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.LIVE),),
+        cursor_value="c2",
+        now=LATER,
+    )
+    await store.record_content_observations(
+        guild_id=GUILD_ID,
+        account_id=account.account_id,
+        platform=Platform.YOUTUBE,
+        observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.ENDED),),
+        cursor_value="c3",
+        now=EVEN_LATER,
+    )
+
+    async def ingest_live_again() -> tuple[ContentPlan, ...]:
+        _, plans = await store.record_content_observations(
+            guild_id=GUILD_ID,
+            account_id=account.account_id,
+            platform=Platform.YOUTUBE,
+            observations=(observation("s1", kind=ContentKind.LIVE, state=ContentState.LIVE),),
+            cursor_value="c4",
+            now=EVEN_LATER + timedelta(minutes=1),
+        )
+        return plans
+
+    results = await asyncio.gather(ingest_live_again(), ingest_live_again(), ingest_live_again())
+    claimed = [plan for plans in results for plan in plans]
+
+    assert len(claimed) == 1
+    assert claimed[0].delivery.transition_seq == 2
+    history = await store.list_content_deliveries(GUILD_ID, Platform.YOUTUBE, "s1")
+    assert [delivery.transition_seq for delivery in history] == [1, 2]
 
 
 @pytest.mark.asyncio

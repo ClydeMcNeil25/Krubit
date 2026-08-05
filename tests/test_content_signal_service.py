@@ -136,6 +136,7 @@ async def test_scheduled_to_live_transition_claims_exactly_one_delivery(
     assert [plan.event.external_id for plan in live.plans] == ["s1"]
     assert live.plans[0].event.state is ContentState.LIVE
     assert live.plans[0].delivery.status == "pending"
+    assert live.plans[0].delivery.transition_seq == 1
 
     # Re-observing the same live state again must not reclaim a second delivery.
     repeat = await service.ingest_page(
@@ -144,6 +145,40 @@ async def test_scheduled_to_live_transition_claims_exactly_one_delivery(
         now=EVEN_LATER,
     )
     assert repeat.plans == ()
+
+
+@pytest.mark.asyncio
+async def test_recurring_live_transition_claims_a_new_delivery_each_time(
+    store: SQLiteStore,
+) -> None:
+    """A restart (`live -> ended -> live`) claims a second, independent delivery."""
+    service = ContentSignalService(store)
+    await service.ingest_page(account(), page(items=(video("v1"),), cursor="c1"), now=NOW)
+    first_live = await service.ingest_page(
+        account(),
+        page(items=(live_stream("s1", state=ContentState.LIVE),), cursor="c2"),
+        now=LATER,
+    )
+    assert [plan.event.external_id for plan in first_live.plans] == ["s1"]
+    assert first_live.plans[0].delivery.transition_seq == 1
+
+    ended = await service.ingest_page(
+        account(),
+        page(items=(live_stream("s1", state=ContentState.ENDED),), cursor="c3"),
+        now=EVEN_LATER,
+    )
+    assert ended.plans == ()
+
+    second_live = await service.ingest_page(
+        account(),
+        page(items=(live_stream("s1", state=ContentState.LIVE),), cursor="c4"),
+        now=EVEN_LATER + timedelta(minutes=1),
+    )
+    assert [plan.event.external_id for plan in second_live.plans] == ["s1"]
+    assert second_live.plans[0].delivery.transition_seq == 2
+
+    history = await store.list_content_deliveries(111, Platform.YOUTUBE, "s1")
+    assert [delivery.transition_seq for delivery in history] == [1, 2]
 
 
 @pytest.mark.asyncio
