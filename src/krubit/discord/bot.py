@@ -38,6 +38,7 @@ from krubit.services.foundation import (
     GuildDisabledError,
 )
 from krubit.services.health import HealthService
+from krubit.services.incident_evidence import correlate_automod_action
 from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
 
@@ -848,3 +849,26 @@ class KrubitBot(discord.Client):
                 "channel_id": str(execution.channel_id),
             },
         )
+        # Correlate, never enforce: `correlate_automod_action` only reads the event
+        # Discord already fired and acted on above; it makes no Discord API call and
+        # takes no action of its own. Recording it as a sniff receipt is evidence-only
+        # bookkeeping (redacted at storage, matching every other receipt write in this
+        # class) — it does not feed a live risk-band re-evaluation or open/escalate an
+        # incident here, since no Phase 3 watchdog service is wired into `KrubitBot`
+        # yet (that wiring is later work; see `krubit.services.incident_evidence`'s
+        # module docstring).
+        signal = correlate_automod_action(execution, datetime.now(UTC))
+        if signal is not None:
+            await self._service.store.record_sniff_receipt(
+                guild_id=execution.guild_id,
+                receipt_id=f"automod-correlation:{uuid4().hex}",
+                member_id=execution.user_id,
+                action="automod_action_correlated",
+                detail={
+                    "signal_name": signal.name,
+                    "detail": signal.detail,
+                    "weight": signal.weight,
+                    "confidence": signal.confidence,
+                },
+                created_at=datetime.now(UTC),
+            )

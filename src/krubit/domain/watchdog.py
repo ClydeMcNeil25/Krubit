@@ -56,6 +56,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from krubit.domain.models import JSONValue
+from krubit.security.redaction import redact
+
 _MAX_NAME_LENGTH = 64
 _MAX_DETAIL_LENGTH = 300
 _MAX_EXPLANATION_LENGTH = 4_000
@@ -307,9 +310,20 @@ class EvidencePacket:
     Evidence Packets section. `message_links` are jump-URLs (not full message
     content, unless the specific message triggered the signal — in which case only
     that message's redacted content plus the trigger reason belongs in the matching
-    `RiskSignal.detail`, not in this field). This packet is expected to pass through
-    the existing `redact()` utility before storage; that redaction happens at the
-    storage layer, not here — this type only models the packet's shape.
+    `RiskSignal.detail`, not in this field).
+
+    `to_storage_dict()` is the only supported way to obtain this packet's persisted
+    representation, and it always calls `redact()` on every free-text field itself
+    (see its docstring) — this is a deliberate strengthening of Task 1's original
+    "redaction happens at the storage layer" note: rather than trusting every future
+    caller to remember to redact before writing an `EvidencePacket` to storage, the
+    guarantee is now structural, on the type itself. Redaction is intentionally
+    still safe to apply twice: `krubit.services.incident_evidence.build_evidence_packet`
+    (Task 6) also redacts each signal's `detail` before constructing this dataclass,
+    so a packet built through the normal path is redacted once at assembly and once
+    again here, as defense in depth. `to_storage_dict()` covers a packet built any
+    other way too — directly, in a test, or by future code that never goes through
+    `build_evidence_packet`.
     """
 
     guild_id: int
@@ -337,6 +351,36 @@ class EvidencePacket:
         for event_id in self.event_ids:
             _require_text("event_ids entry", event_id, limit=_MAX_EVENT_ID_LENGTH)
         _require_aware("created_at", self.created_at)
+
+    def to_storage_dict(self) -> dict[str, JSONValue]:
+        """Return this packet's redacted, JSON-safe representation for storage.
+
+        Always passes the full payload through `redact()` before returning it — see
+        the class docstring for why this method, not a caller convention, is the
+        redaction boundary. There is no other method on this type that exposes a
+        dict/JSON representation, so this is structurally the only path to a
+        storage-ready value.
+        """
+        payload: JSONValue = {
+            "guild_id": self.guild_id,
+            "incident_id": self.incident_id,
+            "signals": [
+                {
+                    "name": signal.name,
+                    "weight": signal.weight,
+                    "detail": signal.detail,
+                    "confidence": signal.confidence,
+                }
+                for signal in self.signals
+            ],
+            "message_links": list(self.message_links),
+            "event_ids": list(self.event_ids),
+            "created_at": self.created_at.isoformat(),
+        }
+        redacted = redact(payload)
+        if not isinstance(redacted, dict):
+            raise TypeError("redact() must return a dict for a dict payload")
+        return redacted
 
 
 @dataclass(frozen=True, slots=True)
