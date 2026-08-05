@@ -32,6 +32,43 @@ vouched for them." Both halves are implemented here, not in the pure
   black-box score" from the design doc's Evidence Packets section. The explanation
   states the override plainly rather than reusing `evaluate_risk_band`'s generated
   text, which would otherwise misleadingly read "no signals observed."
+
+## Known limitation: `join_velocity`/`join_cluster_similarity` depend on the live
+## gateway member cache, not a durable store
+
+`_recent_join_fingerprints` builds `recent_joins` entirely from `discord.Guild.
+members` — discord.py's in-memory gateway cache — with no durable fallback. This is
+the *only* input to `join_velocity` and `join_cluster_similarity`, two of the three
+signals in `watchdog_events.py` allowed to clear `SUSPICIOUS` alone, and they are the
+design doc's named raid-detection mechanism ("Raid: join-velocity spike correlated
+with join-cluster similarity"). The gap this creates is real and lands at the worst
+possible moment: in the seconds-to-tens-of-seconds window immediately after a bot
+process reconnects or restarts, `guild.members` is still repopulating from Discord's
+member-chunk gateway responses, so a raid landing in exactly that window is undercounted
+or missed by these two signals — precisely the highest-value moment for an attacker
+to strike, and precisely when this signal pair is weakest. Every other join signal in
+`extract_join_signals` is unaffected (they only read the joining member's own fields).
+This is an accepted interim scope decision for this task, not an oversight: durable,
+cross-restart join-history storage (a new table, or reconstructable data attached to
+`entry_sniff_assessments`) is plausibly later Phase 3 work once raid detection proper
+is built; today, `entry_sniff_assessments` only stores redacted `signals_json`/
+`explanation`, not the raw `created_at`/`avatar` facts needed to reconstruct comparable
+`recent_joins` entries from storage. If raid detection during the first minutes after a
+restart proves too weak in practice, revisit this before or alongside that raid-
+detection work.
+
+## Known scope-narrowing: invite code and `MemberFlags` are not read here
+
+The design doc's Entry Sniff Assessment section names "invite code used where Discord
+exposes it" and "`MemberFlags` for Rules Screening state" as candidate inputs.
+`extract_join_signals`'s brief-specified signature (`member, recent_joins, now`) omits
+an invite parameter entirely, and this module only reads `Member.pending` for Rules
+Screening (not the broader `MemberFlags` bitfield) — both are intentional narrowing to
+match this task's brief, not omissions. Adding invite-source correlation would require
+threading Discord's invite-tracking API/audit-log data through a new parameter, and
+`MemberFlags` fields beyond `pending` (e.g. `completed_onboarding`) would be marginal
+corroboration on top of what `pending` already captures; either is reasonable future
+work, not required by this task.
 """
 
 from __future__ import annotations
