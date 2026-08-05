@@ -461,4 +461,54 @@ async def test_recover_pending_delivers_the_guilds_pending_backlog(
     recovered = await runtime.recover_pending(as_guild(guild))
 
     assert recovered == 1
-    assert len(guild.channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_plans_delivers_every_freshly_claimed_plan_from_one_page(
+    env: tuple[ContentRuntime, SQLiteStore, FakeGuild],
+) -> None:
+    """A connector's `IngestionResult.plans` (e.g. from `YouTubeConnector.fetch_page`)
+    is applied in one batch, mirroring how a future polling/push scheduler would call
+    `apply_plans` right after `ContentSignalService.ingest_page`."""
+    runtime, store, guild = env
+    service = ContentSignalService(store)
+    await service.ingest_page(
+        account(),
+        ConnectorPage(
+            items=(
+                live_item("stream-a", state=ContentState.SCHEDULED),
+                live_item("stream-b", state=ContentState.SCHEDULED),
+            )
+        ),
+        now=NOW,
+    )
+    result = await service.ingest_page(
+        account(),
+        ConnectorPage(
+            items=(
+                live_item("stream-a", state=ContentState.LIVE),
+                live_item("stream-b", state=ContentState.LIVE),
+            )
+        ),
+        now=NOW,
+    )
+    assert len(result.plans) == 2
+
+    applied = await runtime.apply_plans(as_guild(guild), result.plans)
+
+    assert applied == 2
+    assert len(guild.channel.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_plans_counts_only_the_plans_that_actually_applied(
+    env: tuple[ContentRuntime, SQLiteStore, FakeGuild],
+) -> None:
+    runtime, store, guild = env
+    plan = await claim_live_plan(store)
+    await store.set_guild_enabled(111, False)
+
+    applied = await runtime.apply_plans(as_guild(guild), (plan,))
+
+    assert applied == 0
+    assert guild.channel.sent == []

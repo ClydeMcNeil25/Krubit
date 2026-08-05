@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol, cast
@@ -24,12 +25,93 @@ from krubit.domain.live_signals import (
     LiveSignalPlan,
     StreamingObservation,
 )
+from krubit.integrations.youtube import normalize_youtube_video_url
 from krubit.services.foundation import FoundationService
 from krubit.services.live_signals import LiveSignalService
 from krubit.storage.sqlite import SQLiteStore
 
 LIVE_CHANNEL_NAME = "live-notifications"
 STREAMING_ROLE_NAME = "Streaming Now"
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubeStreamingPresence:
+    """Presence-only detection of a validated YouTube live/watch streaming activity.
+
+    Deliberately lighter-weight than Twitch's `StreamingObservation`: no durable
+    session, role, or announcement pipeline consumes this yet — YouTube live delivery
+    is carried entirely by the content ledger (`ContentSignalService`/`ContentRuntime`)
+    fed by `YouTubeConnector`, not by this module's Twitch-specific session machinery.
+    This type exists so `extract_streaming_observation` can honestly report "yes, this
+    member's Rich Presence is a recognized YouTube stream" as groundwork for a future
+    YouTube presence-session pipeline, without disturbing the existing Twitch one.
+    """
+
+    guild_id: int
+    member_id: int
+    video_id: str
+    url: str
+    activity_started_at: datetime | None
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.guild_id <= 0:
+            raise ValueError("guild_id must be positive")
+        if self.member_id <= 0:
+            raise ValueError("member_id must be positive")
+        if not self.video_id.strip():
+            raise ValueError("video_id must not be blank")
+        if not self.url.startswith("https://"):
+            raise ValueError("url must use https")
+        for timestamp in (self.activity_started_at, self.observed_at):
+            if timestamp is not None and (
+                timestamp.tzinfo is None or timestamp.utcoffset() is None
+            ):
+                raise ValueError("timestamps must include a timezone")
+
+
+def extract_streaming_observation(
+    member: discord.Member, observed_at: datetime | None = None
+) -> StreamingObservation | YouTubeStreamingPresence | None:
+    """Detect a validated Twitch or YouTube streaming presence for `member`.
+
+    Twitch detection delegates unchanged to `extract_twitch_observation` — the
+    existing Twitch session/role/announcement pipeline in this module keeps calling
+    that function directly and is completely unaffected by this wrapper. YouTube
+    detection validates the streaming activity's URL as a canonical
+    `youtube.com/watch?v=...` or `youtube.com/live/...` link and returns a
+    `YouTubeStreamingPresence` — presence-only groundwork, not a durable session.
+    """
+    at = observed_at if observed_at is not None else datetime.now(UTC)
+    twitch = extract_twitch_observation(member, observed_at=at)
+    if twitch is not None:
+        return twitch
+    if member.bot:
+        return None
+    for activity in member.activities:
+        if activity.type is not discord.ActivityType.streaming:
+            continue
+        url = getattr(activity, "url", None)
+        if not isinstance(url, str):
+            continue
+        video_id = normalize_youtube_video_url(url)
+        if video_id is None:
+            continue
+        started = getattr(activity, "start", None)
+        started_at = (
+            started
+            if isinstance(started, datetime) and started.tzinfo is not None
+            else None
+        )
+        return YouTubeStreamingPresence(
+            guild_id=member.guild.id,
+            member_id=member.id,
+            video_id=video_id,
+            url=url,
+            activity_started_at=started_at,
+            observed_at=at,
+        )
+    return None
 
 
 class LiveSignalRuntime:

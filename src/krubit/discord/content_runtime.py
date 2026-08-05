@@ -22,7 +22,7 @@ to no mention without ever blocking or duplicating the underlying delivery.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol, cast
@@ -136,6 +136,21 @@ class ContentRuntime:
                 return False
             card = self._render(plan.event.content_kind, group, decision.mention)
             return await self._deliver_fresh(guild, channel, current, card)
+
+    async def apply_plans(self, guild: discord.Guild, plans: Iterable[ContentPlan]) -> int:
+        """Apply every freshly claimed plan from one connector page's `IngestionResult`.
+
+        The scheduler that polls or receives a push for a connector (for example
+        `YouTubeConnector`) calls this with `IngestionResult.plans` right after
+        `ContentSignalService.ingest_page`; each plan goes through the same idempotent
+        `apply_plan` path `recover_pending` and `retry_delivery` already use, so a
+        partial failure here never double-delivers on a later retry.
+        """
+        applied = 0
+        for plan in plans:
+            if await self.apply_plan(guild, plan):
+                applied += 1
+        return applied
 
     async def recover_pending(self, guild: discord.Guild) -> int:
         """Sweep this guild's still-pending deliveries back through `apply_plan`."""
