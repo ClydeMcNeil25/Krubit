@@ -143,6 +143,9 @@ class MentionBudgetReceipt:
     created_at: datetime
 
 
+_CONTENT_DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
+
+
 class SQLiteStore:
     """A single database whose public APIs always require tenant scope."""
 
@@ -1793,6 +1796,94 @@ class SQLiteStore:
             (guild_id, platform.value, external_id),
         )
         return content_delivery_from_row(await cursor.fetchone())
+
+    async def get_content_delivery_by_seq(
+        self, guild_id: int, platform: Platform, external_id: str, transition_seq: int
+    ) -> ContentDelivery | None:
+        """Return the exact delivery row for one claimed transition, if any.
+
+        Unlike `get_content_delivery` (highest `transition_seq`), this fetches a
+        specific, already-known transition — what `ContentRuntime` needs to act on the
+        exact delivery a `ContentPlan` or a staff-supplied `delivery_id` names.
+        """
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_deliveries
+            WHERE guild_id = ? AND platform = ? AND external_id = ? AND transition_seq = ?
+            """,
+            (guild_id, platform.value, external_id, transition_seq),
+        )
+        return content_delivery_from_row(await cursor.fetchone())
+
+    async def update_content_delivery(
+        self,
+        *,
+        guild_id: int,
+        platform: Platform,
+        external_id: str,
+        transition_seq: int,
+        status: str,
+        attempt: int,
+        channel_id: int | None,
+        message_id: int | None,
+        now: datetime,
+    ) -> ContentDelivery:
+        """Record the outcome of one Discord delivery attempt for a claimed transition.
+
+        Used by `ContentRuntime` after every send/edit/retry/retract attempt. Also
+        appends a durable `content_delivery_attempts` audit row for this `attempt`
+        number (ignored if that attempt was already recorded), matching the audit
+        trail `record_content_observations` starts at attempt 1.
+        """
+        _require_guild_id(guild_id)
+        if status not in _CONTENT_DELIVERY_STATUSES:
+            raise ValueError(f"status must be one of {sorted(_CONTENT_DELIVERY_STATUSES)}")
+        if attempt <= 0:
+            raise ValueError("attempt must be positive")
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                UPDATE content_deliveries
+                SET status = ?, attempt = ?, discord_channel_id = ?, discord_message_id = ?,
+                    updated_at = ?
+                WHERE guild_id = ? AND platform = ? AND external_id = ? AND transition_seq = ?
+                """,
+                (
+                    status,
+                    attempt,
+                    channel_id,
+                    message_id,
+                    now.isoformat(),
+                    guild_id,
+                    platform.value,
+                    external_id,
+                    transition_seq,
+                ),
+            )
+            await self._connection.execute(
+                """
+                INSERT OR IGNORE INTO content_delivery_attempts (
+                    guild_id, platform, external_id, transition_seq, attempt, status,
+                    detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?)
+                """,
+                (
+                    guild_id,
+                    platform.value,
+                    external_id,
+                    transition_seq,
+                    attempt,
+                    status,
+                    now.isoformat(),
+                ),
+            )
+        updated = await self.get_content_delivery_by_seq(
+            guild_id, platform, external_id, transition_seq
+        )
+        if updated is None:
+            raise RuntimeError("content delivery could not be read back after update")
+        return updated
 
     async def list_content_deliveries(
         self, guild_id: int, platform: Platform, external_id: str

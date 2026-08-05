@@ -110,6 +110,28 @@ def render_live_embed(
     return embed
 
 
+def safe_display_text(value: str, *, limit: int) -> str:
+    """Escape markdown/mentions and bound length; shared by every card renderer.
+
+    Extracted so `krubit.discord.content_cards` renders platform-neutral cards with the
+    same neutralization rules already approved for the Twitch live-signal card, instead
+    of re-implementing them.
+    """
+    return _safe_text(value, limit=limit)
+
+
+def https_preview_url(value: str) -> str | None:
+    """Resolve a templated preview URL to a bounded, https-only canonical URL.
+
+    Substitutes the conventional `{width}`/`{height}` template tokens with a fixed
+    640x360 size and returns `None` for anything too long, unparsable, or not https —
+    the caller renders a reduced card (no image) rather than trust unsafe media.
+    Extracted so `krubit.discord.content_cards` reuses the same media-safety rule
+    already approved for the Twitch live-signal card.
+    """
+    return _thumbnail_url(value)
+
+
 def build_live_view(twitch_url: str) -> discord.ui.View:
     """Build a temporary link-only view for an already normalized Twitch channel."""
     twitch_login = normalize_twitch_channel(twitch_url)
