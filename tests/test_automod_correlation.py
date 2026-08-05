@@ -6,6 +6,13 @@ Discord's own AutoMod system, and maps it to a `RiskSignal`. It must never call 
 Discord API and must never create/edit an AutoMod rule or take any enforcement action
 (timeout/kick/ban/delete) — it only *reads* an event that already happened and
 *names* it as a signal for Krubit's own, independent risk-evaluation path.
+
+`matched_keyword`/`matched_content` are message content, so a family of tests below
+covers the `member_has_open_watch_window` gate: the plan's global constraint is that
+Krubit reads message content only for a member with an actively open watch window,
+so the literal matched text must never appear in the returned signal's `detail` when
+that flag is `False`, even though the fact that AutoMod fired is still useful,
+content-free evidence either way.
 """
 
 from __future__ import annotations
@@ -68,7 +75,9 @@ def automod_action(
 
 
 def test_automod_action_becomes_a_correlated_risk_signal_not_a_new_enforcement() -> None:
-    signal = correlate_automod_action(automod_action(rule_trigger="spam"), now=NOW)
+    signal = correlate_automod_action(
+        automod_action(rule_trigger="spam"), now=NOW, member_has_open_watch_window=False
+    )
 
     assert signal is not None
     assert isinstance(signal, RiskSignal)
@@ -76,20 +85,57 @@ def test_automod_action_becomes_a_correlated_risk_signal_not_a_new_enforcement()
 
 
 def test_correlated_signal_names_the_triggered_rule_type() -> None:
-    signal = correlate_automod_action(automod_action(rule_trigger="keyword_preset"), now=NOW)
+    signal = correlate_automod_action(
+        automod_action(rule_trigger="keyword_preset"),
+        now=NOW,
+        member_has_open_watch_window=False,
+    )
 
     assert signal is not None
     assert signal.name == "automod_correlated_keyword_preset"
     assert "222" in signal.detail  # names the rule_id, per bot.py's existing payload
 
 
-def test_correlated_signal_carries_the_matched_keyword_when_present() -> None:
+def test_correlated_signal_carries_the_matched_keyword_when_member_has_open_watch_window() -> None:
     signal = correlate_automod_action(
-        automod_action(rule_trigger="keyword", matched_keyword="badword"), now=NOW
+        automod_action(rule_trigger="keyword", matched_keyword="badword"),
+        now=NOW,
+        member_has_open_watch_window=True,
     )
 
     assert signal is not None
     assert "badword" in signal.detail
+
+
+def test_correlated_signal_withholds_matched_content_without_an_open_watch_window() -> None:
+    """The plan's global constraint: Krubit reads message content only for a member
+    with an actively open watch window. `matched_keyword`/`matched_content` are
+    literal substrings of the member's own message, so they must never reach the
+    signal's `detail` for a member outside any watch window — only the fact that
+    AutoMod fired, and which rule/category, may.
+    """
+    signal = correlate_automod_action(
+        automod_action(rule_trigger="keyword", matched_keyword="badword"),
+        now=NOW,
+        member_has_open_watch_window=False,
+    )
+
+    assert signal is not None
+    assert "badword" not in signal.detail
+    assert signal.name == "automod_correlated_keyword"
+
+
+def test_correlated_signal_also_withholds_matched_content_field_without_open_watch_window() -> None:
+    signal = correlate_automod_action(
+        automod_action(
+            rule_trigger="harmful_link", matched_content="evil-secret-payload.example"
+        ),
+        now=NOW,
+        member_has_open_watch_window=False,
+    )
+
+    assert signal is not None
+    assert "evil-secret-payload.example" not in signal.detail
 
 
 def test_correlation_returns_none_without_a_recognizable_trigger_type() -> None:
@@ -104,11 +150,13 @@ def test_correlation_returns_none_without_a_recognizable_trigger_type() -> None:
         SimpleNamespace(guild_id=111, rule_id=222, user_id=333, channel_id=444),
     )
 
-    assert correlate_automod_action(minimal, now=NOW) is None
+    assert correlate_automod_action(minimal, now=NOW, member_has_open_watch_window=False) is None
 
 
 def test_correlate_automod_action_requires_an_aware_datetime() -> None:
     with pytest.raises(ValueError):
         correlate_automod_action(
-            automod_action(rule_trigger="spam"), now=datetime(2026, 8, 5, 12, 0)
+            automod_action(rule_trigger="spam"),
+            now=datetime(2026, 8, 5, 12, 0),
+            member_has_open_watch_window=False,
         )

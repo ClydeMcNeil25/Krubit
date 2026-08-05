@@ -9,13 +9,13 @@ Task 6 of the Phase 3 Watchdog plan. Two independent, pure, I/O-free functions:
   builder did not exist yet when they were written. This task does not change those
   detectors — wiring this real builder into them is later work — it only builds the
   function itself.
-- `correlate_automod_action(action, now) -> RiskSignal | None`: reads the payload of
-  Discord's own `on_automod_action` event (already wired in
-  `src/krubit/discord/bot.py`, `KrubitBot.on_automod_action`) and turns it into a
-  `RiskSignal` that can feed the same `evaluate_risk_band` path every other detector
-  in this phase feeds. It adds no new AutoMod rule creation and no enforcement call
-  of any kind (no `.create_rule(`, `.timeout(`, `.kick(`, `.ban(`, `.delete(`) — it
-  is a read-only correlation of an event Discord already acted on.
+- `correlate_automod_action(action, now, *, member_has_open_watch_window) -> RiskSignal
+  | None`: reads the payload of Discord's own `on_automod_action` event (already
+  wired in `src/krubit/discord/bot.py`, `KrubitBot.on_automod_action`) and turns it
+  into a `RiskSignal` that can feed the same `evaluate_risk_band` path every other
+  detector in this phase feeds. It adds no new AutoMod rule creation and no
+  enforcement call of any kind (no `.create_rule(`, `.timeout(`, `.kick(`, `.ban(`,
+  `.delete(`) — it is a read-only correlation of an event Discord already acted on.
 
 ## Redaction boundary (safety-sensitive — read before changing)
 
@@ -27,19 +27,32 @@ later leak through a redaction regex that fails to catch some new secret shape. 
 also matches `EvidencePacket`'s own docstring in `krubit/domain/watchdog.py`, which
 reserves message *content* for the one case where a specific message directly
 triggered a signal — and in that case, the caller is expected to have already folded
-that (still-unredacted) content into the corresponding `RiskSignal.detail` before
-calling this function, exactly like `krubit.discord.watchdog_events.
-extract_message_signals` already does (e.g. its `message contains a URL with a
-{reason}: {url[:200]}` signal detail).
+that content into the corresponding `RiskSignal.detail` before calling this function,
+exactly like `krubit.discord.watchdog_events.extract_message_signals` already does
+(e.g. its `message contains a URL with a {reason}: {url[:200]}` signal detail).
 
-`raw_signals` entries, unlike raw message content, legitimately need to reach the
-packet — that is the entire point of an evidence packet: named, explainable signals,
-never an opaque score. So every signal's `detail` is passed through `redact()` here,
-before an `EvidencePacket` is ever constructed. This is defense-in-depth layered on
-top of `EvidencePacket.to_storage_dict()`'s own independent, structural redaction
-guarantee (see that method's docstring) — a caller who bypasses this builder entirely
-and constructs an `EvidencePacket` by hand still cannot produce an unredacted storage
-dict, because `to_storage_dict()` redacts unconditionally, not by convention.
+`RiskSignal.detail` itself is now redacted unconditionally in
+`RiskSignal.__post_init__` (`krubit/domain/watchdog.py`) — every signal, from any
+caller, anywhere, is redacted the moment it is constructed. `build_evidence_packet`
+still explicitly redacts each `raw_signals` entry's `detail` again before building
+the packet; this is now a documented no-op (`redact()` is idempotent) kept as
+defense-in-depth against a future change to `RiskSignal` that might relax its own
+guarantee, layered on top of `EvidencePacket.to_storage_dict()`'s independent,
+structural redaction guarantee (see that method's docstring). A caller who bypasses
+this builder entirely and constructs a `RiskSignal`/`EvidencePacket` by hand still
+cannot produce unredacted content, at any of these three layers.
+
+## `on_automod_action`'s watch-window boundary
+
+`correlate_automod_action` never reads message content on its own authority: Discord
+AutoMod's `matched_keyword`/`matched_content` fields are literal substrings of the
+member's own message, so including them unconditionally would violate the plan's
+"Krubit reads message content only for a member with an actively open watch window"
+constraint for every member whose message trips any AutoMod rule, watched or not.
+`correlate_automod_action` is kept side-effect-free (no storage access), so
+`KrubitBot.on_automod_action` looks up whether the affected member currently has an
+open watch window and passes that boolean in explicitly — see
+`correlate_automod_action`'s own docstring for what happens on each branch.
 """
 
 from __future__ import annotations
@@ -130,7 +143,12 @@ def build_evidence_packet(
     )
 
 
-def correlate_automod_action(action: discord.AutoModAction, now: datetime) -> RiskSignal | None:
+def correlate_automod_action(
+    action: discord.AutoModAction,
+    now: datetime,
+    *,
+    member_has_open_watch_window: bool,
+) -> RiskSignal | None:
     """Turn an already-fired Discord AutoMod action into a `RiskSignal`, or `None`.
 
     Reads only fields already present on the event `KrubitBot.on_automod_action`
@@ -147,6 +165,20 @@ def correlate_automod_action(action: discord.AutoModAction, now: datetime) -> Ri
     minimal/legacy payload) rather than guessing — matching the "degrade honestly"
     stance the rest of this phase uses for degraded inputs (see
     `raid_detection.py`'s `SpamWaveDetector`, `watch_window.py`'s module docstring).
+
+    ## `member_has_open_watch_window` (safety-sensitive — read before changing)
+
+    `matched_keyword`/`matched_content` are literal substrings of the member's own
+    message that Discord's AutoMod matched — i.e. message content. The plan's global
+    constraint is that "Krubit reads message content only for a member with an
+    actively open watch window, never DMs." This function is deliberately kept
+    side-effect-free (no storage access of its own), so it cannot check that itself;
+    the caller (`KrubitBot.on_automod_action`) looks up whether the affected member
+    currently has an open watch window and passes the answer in. When `False`, the
+    fact that AutoMod fired — and which rule/category it was — is still useful,
+    evidence-only-of-Discord's-own-action information and is still returned as a
+    signal; only the literal matched text is withheld, matching the same boundary
+    `WatchWindowService.inspect_message` enforces for Krubit's own message reads.
     """
     _require_aware("now", now)
 
@@ -155,10 +187,15 @@ def correlate_automod_action(action: discord.AutoModAction, now: datetime) -> Ri
     if not trigger_name:
         return None
 
-    matched = getattr(action, "matched_keyword", None) or getattr(action, "matched_content", None)
     detail = f"Discord AutoMod rule {action.rule_id} triggered ({trigger_name})"
-    if matched:
-        detail = f"{detail}: matched {matched!r}"
+    if member_has_open_watch_window:
+        matched = getattr(action, "matched_keyword", None) or getattr(
+            action, "matched_content", None
+        )
+        if matched:
+            detail = f"{detail}: matched {matched!r}"
+    else:
+        detail = f"{detail}; matched content withheld (member has no open watch window)"
     if len(detail) > _MAX_DETAIL_LENGTH:
         detail = detail[: _MAX_DETAIL_LENGTH - 1] + "…"
 

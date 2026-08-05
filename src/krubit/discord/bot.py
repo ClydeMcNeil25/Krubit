@@ -857,7 +857,21 @@ class KrubitBot(discord.Client):
         # incident here, since no Phase 3 watchdog service is wired into `KrubitBot`
         # yet (that wiring is later work; see `krubit.services.incident_evidence`'s
         # module docstring).
-        signal = correlate_automod_action(execution, datetime.now(UTC))
+        #
+        # `matched_keyword`/`matched_content` are message content, so
+        # `correlate_automod_action` only includes them for a member with an actively
+        # open watch window, matching the plan's global message-content boundary —
+        # this lookup is what supplies that answer (the function itself stays
+        # side-effect-free).
+        open_windows = await self._service.store.list_open_watch_windows(execution.guild_id)
+        member_has_open_watch_window = any(
+            window.member_id == execution.user_id for window in open_windows
+        )
+        signal = correlate_automod_action(
+            execution,
+            datetime.now(UTC),
+            member_has_open_watch_window=member_has_open_watch_window,
+        )
         if signal is not None:
             await self._service.store.record_sniff_receipt(
                 guild_id=execution.guild_id,

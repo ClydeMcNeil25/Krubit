@@ -139,6 +139,19 @@ class RiskSignal:
     this *kind* of signal matters in the abstract; `confidence` is how sure the
     detector is that this particular observation is real. See the module docstring
     for how the two combine.
+
+    `detail` is redacted (via `redact()`) unconditionally in `__post_init__`, before
+    this frozen instance ever becomes visible to a caller. This is deliberately a
+    structural guarantee, not a caller convention: there is no way to construct a
+    `RiskSignal` — anywhere in the codebase, including a test, a future detector, or
+    a hand-built instance that skips every other helper in this phase — whose
+    `.detail` holds unredacted content. That in turn makes `repr()`/`str()` of a
+    `RiskSignal` (and of any `EvidencePacket` holding one, since its default `repr`
+    recurses into `.signals`) safe by construction, closing the same class of "repr
+    leaks a secret" bug `krubit.config.Settings` and
+    `krubit.integrations.meta.MetaOAuthGrant` were fixed for in Phase 2 — here via
+    redacting the value itself rather than hiding the field from `repr` entirely,
+    since (unlike a token) `detail` is meant to stay human-readable evidence.
     """
 
     name: str
@@ -157,6 +170,10 @@ class RiskSignal:
             )
         if not (0.0 <= self.confidence <= 1.0):
             raise ValueError("confidence must be between 0.0 and 1.0")
+        redacted_detail = redact(self.detail)
+        if not isinstance(redacted_detail, str):
+            raise TypeError("redact() must return a str for a str input")
+        object.__setattr__(self, "detail", redacted_detail)
 
 
 def evaluate_risk_band(signals: tuple[RiskSignal, ...]) -> tuple[RiskBand, str]:

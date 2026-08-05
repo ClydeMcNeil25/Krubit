@@ -19,6 +19,7 @@ one builder function.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
@@ -164,3 +165,49 @@ def test_evidence_packet_to_storage_dict_redacts_even_when_constructed_directly(
     storage_repr = str(packet.to_storage_dict())
     assert "abcd1234plaintextvalue" not in storage_repr
     assert "[REDACTED]" in storage_repr
+
+
+def test_risk_signal_detail_is_redacted_at_construction_not_just_at_storage_time() -> None:
+    """The deeper structural fix: `RiskSignal.detail` is redacted unconditionally in
+    `__post_init__`, so it is impossible to construct a `RiskSignal` — bypassing
+    `build_evidence_packet` entirely — whose `.detail` ever holds unredacted content
+    in memory, not just in `to_storage_dict()`'s output.
+    """
+    signal = RiskSignal(
+        name="leaked",
+        weight=3,
+        detail="access_token: abcd1234plaintextvalue",
+        confidence=0.5,
+    )
+
+    assert "abcd1234plaintextvalue" not in signal.detail
+    assert "[REDACTED]" in signal.detail
+
+
+def test_repr_of_a_hand_constructed_evidence_packet_never_leaks_secret_shaped_content() -> None:
+    """Guards the exact bug class found twice in Phase 2 (`Settings`,
+    `MetaOAuthGrant`): a debug log, an uncaught-exception frame dump, or
+    `logging.info("%s", packet)` stringifying a dataclass via its default `repr`.
+    Because `RiskSignal.detail` is redacted at construction (see the test above),
+    `repr()`/`str()` of a hand-constructed `EvidencePacket` holding it is safe by
+    construction too — no separate `__repr__` override is needed.
+    """
+    packet = EvidencePacket(
+        guild_id=GUILD_ID,
+        incident_id="raid:repr-bypass",
+        signals=(
+            RiskSignal(
+                name="leaked",
+                weight=3,
+                detail="password=hunter2-plaintext-in-repr",
+                confidence=0.5,
+            ),
+        ),
+        message_links=("https://discord.com/channels/1/2/3",),
+        event_ids=("evt-1",),
+        created_at=NOW,
+    )
+
+    assert "hunter2-plaintext-in-repr" not in repr(packet)
+    assert "hunter2-plaintext-in-repr" not in str(packet)
+    assert "hunter2-plaintext-in-repr" not in str(asdict(packet))
