@@ -5,15 +5,19 @@ configured, so a deployment with no social platform credentials never opens a
 listening socket. Once configured, it enforces an HTTPS public base, a 1 MiB body
 limit per request, one HTTP method per registered route, a request timeout, and
 redacted error responses: unregistered paths return 404, oversized bodies return
-413, and any unhandled handler exception is logged locally but rendered to the
-caller as a generic message that never echoes exception text (which could contain
-platform payload contents).
+413, and any unhandled handler exception is rendered to the caller as a generic
+message that never echoes exception text (which could contain platform payload or
+signature contents). The local log record for such an exception is redacted the
+same way: only the exception's type name and a correlation id are logged, never
+`str(exc)` or a traceback, since either could carry the same sensitive content the
+HTTP response withholds.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -68,9 +72,16 @@ async def _redacted_errors_middleware(
         raise
     except TimeoutError:
         return web.json_response({"error": "request timed out"}, status=504)
-    except Exception:
-        _logger.exception("unhandled callback ingress error")
-        return web.json_response({"error": "internal error"}, status=500)
+    except Exception as exc:
+        correlation_id = uuid.uuid4().hex
+        _logger.error(
+            "unhandled callback ingress error [correlation_id=%s, kind=%s]",
+            correlation_id,
+            type(exc).__name__,
+        )
+        return web.json_response(
+            {"error": "internal error", "correlation_id": correlation_id}, status=500
+        )
 
 
 class CallbackServer:

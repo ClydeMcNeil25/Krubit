@@ -187,3 +187,31 @@ def test_require_credential_encryption_key_returns_configured_key() -> None:
         {**base_env(), "KRUBIT_CREDENTIAL_ENCRYPTION_KEY": "a-long-random-encryption-key"}
     )
     assert settings.require_credential_encryption_key() == "a-long-random-encryption-key"
+
+
+def test_settings_repr_never_renders_configured_secret_values() -> None:
+    secret_values = {
+        "DISCORD_KRUBIT_BOT_TOKEN": "bot-token-value",
+        "TWITCH_KRUBIT_CLIENT_SECRET": "twitch-secret-value",
+        "YOUTUBE_KRUBIT_API_KEY": "youtube-api-key-value",
+        "YOUTUBE_KRUBIT_PUSH_CALLBACK_SECRET": "youtube-push-secret-value",
+        "X_KRUBIT_BEARER_TOKEN": "x-bearer-token-value",
+        "META_KRUBIT_APP_SECRET": "meta-app-secret-value",
+        "TIKTOK_KRUBIT_CLIENT_SECRET": "tiktok-client-secret-value",
+        "KRUBIT_CREDENTIAL_ENCRYPTION_KEY": "credential-encryption-key-value",
+    }
+    non_secret_values = {
+        "TWITCH_KRUBIT_CLIENT_ID": "twitch-client-id-visible",
+        "META_KRUBIT_APP_ID": "meta-app-id-visible",
+    }
+    settings = Settings.from_env({**base_env(), **secret_values, **non_secret_values})
+
+    rendered = repr(settings)
+    assert rendered == str(settings)
+    for secret_value in secret_values.values():
+        assert secret_value not in rendered
+
+    # Non-secret identifiers remain visible for diagnostics: repr=False is applied
+    # selectively to secrets, not blanket-removed from every field.
+    for non_secret_value in non_secret_values.values():
+        assert non_secret_value in rendered

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -62,11 +63,24 @@ async def test_callback_ingress_rejects_wrong_method_on_a_registered_route(
 
 async def test_callback_ingress_redacts_unhandled_handler_errors(
     client: TestClient[web.Request, web.Application],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    response = await client.post("/callbacks/boom", data=b"x")
+    with caplog.at_level(logging.ERROR):
+        response = await client.post("/callbacks/boom", data=b"x")
     assert response.status == 500
     body = await response.text()
     assert "secret-token-xyz" not in body
+    assert "secret-token-xyz" not in caplog.text
+
+
+async def test_callback_ingress_error_response_carries_a_correlation_id_not_the_exception(
+    client: TestClient[web.Request, web.Application],
+) -> None:
+    response = await client.post("/callbacks/boom", data=b"x")
+    payload = await response.json()
+    assert payload["error"] == "internal error"
+    assert isinstance(payload["correlation_id"], str) and payload["correlation_id"]
+    assert "RuntimeError" not in payload["correlation_id"]
 
 
 def test_callback_server_rejects_non_https_public_base_url() -> None:

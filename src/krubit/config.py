@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -23,25 +23,33 @@ def _parse_bool(name: str, raw: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    """Environment-derived runtime configuration.
+
+    Secret-bearing fields are marked `repr=False` so `repr(settings)`/`str(settings)`
+    (and anything that stringifies this object — a debug log, an uncaught-exception
+    frame dump) never renders a plaintext secret. Non-secret identifiers (client IDs,
+    app IDs, callback base URLs) are intentionally left visible for diagnostics.
+    """
+
     application_id: int
     database_path: Path
-    bot_token: str | None = None
+    bot_token: str | None = field(default=None, repr=False)
     staff_channel_id: int | None = None
     twitch_client_id: str | None = None
-    twitch_client_secret: str | None = None
+    twitch_client_secret: str | None = field(default=None, repr=False)
     live_signals_enabled: bool = False
-    youtube_api_key: str | None = None
-    youtube_push_callback_secret: str | None = None
-    x_bearer_token: str | None = None
+    youtube_api_key: str | None = field(default=None, repr=False)
+    youtube_push_callback_secret: str | None = field(default=None, repr=False)
+    x_bearer_token: str | None = field(default=None, repr=False)
     meta_app_id: str | None = None
-    meta_app_secret: str | None = None
+    meta_app_secret: str | None = field(default=None, repr=False)
     meta_callback_base_url: str | None = None
     tiktok_client_key: str | None = None
-    tiktok_client_secret: str | None = None
+    tiktok_client_secret: str | None = field(default=None, repr=False)
     tiktok_callback_base_url: str | None = None
     creator_signals_enabled: bool = False
     social_delivery_enabled: bool = False
-    credential_encryption_key: str | None = None
+    credential_encryption_key: str | None = field(default=None, repr=False)
     callback_public_base_url: str | None = None
     callback_port: int | None = None
 
