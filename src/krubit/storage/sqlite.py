@@ -3083,6 +3083,36 @@ class SQLiteStore:
         row = await cursor.fetchone()
         return entry_sniff_assessment_from_row(row)
 
+    async def list_recent_entry_sniff_assessments(
+        self, guild_id: int, *, since: datetime, until: datetime, limit: int = 500
+    ) -> tuple[EntrySniffAssessment, ...]:
+        """Return every assessment in `guild_id` with `joined_at` in `[since, until]`.
+
+        The only cross-member `entry_sniff_assessments` query in this phase's storage
+        layer — `get_entry_sniff_assessment` above is scoped to one member (matching
+        `/fetch sniff <member>` and `EntrySniffService`'s own read-after-write), but
+        `RaidDetector` (Task 5) needs to see every recent join across a guild at once
+        to detect a join-velocity/cluster spike, so this adds the one genuinely new
+        query this task requires rather than duplicating join tracking elsewhere.
+        """
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, joined_at, band, signals_json, explanation, created_at
+            FROM entry_sniff_assessments
+            WHERE guild_id = ? AND joined_at >= ? AND joined_at <= ?
+            ORDER BY joined_at DESC
+            LIMIT ?
+            """,
+            (guild_id, since.isoformat(), until.isoformat(), limit),
+        )
+        rows = await cursor.fetchall()
+        return tuple(
+            cast(EntrySniffAssessment, entry_sniff_assessment_from_row(row)) for row in rows
+        )
+
     async def _get_watch_window(self, guild_id: int, member_id: int) -> WatchWindow | None:
         cursor = await self._connection.execute(
             """
