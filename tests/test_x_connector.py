@@ -44,6 +44,19 @@ X_TIMELINE_FIXTURE = {
     "meta": {"newest_id": "103", "oldest_id": "101", "result_count": 3},
 }
 
+X_TIMELINE_WITH_QUOTE_TWEET_FIXTURE = {
+    "data": [
+        {"id": "203", "text": "Original post", "created_at": "2026-08-05T10:00:00.000Z"},
+        {
+            "id": "202",
+            "text": "Quoting with commentary",
+            "created_at": "2026-08-05T09:00:00.000Z",
+            "referenced_tweets": [{"type": "quoted", "id": "60"}],
+        },
+    ],
+    "meta": {"newest_id": "203", "oldest_id": "202", "result_count": 2},
+}
+
 
 class FakeResponse:
     def __init__(self, status: int, payload: object) -> None:
@@ -107,6 +120,15 @@ async def test_x_connector_uses_since_id_and_ignores_replies_and_reposts() -> No
     page = await x_connector(X_TIMELINE_FIXTURE).fetch_page(x_account(), cursor="100")
     assert [event.get("external_id") for event in page.items] == ["103"]
     assert page.next_cursor == "103"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_ignores_quote_tweets() -> None:
+    page = await x_connector(X_TIMELINE_WITH_QUOTE_TWEET_FIXTURE).fetch_page(
+        x_account(), cursor="200"
+    )
+    assert [event.get("external_id") for event in page.items] == ["203"]
+    assert page.next_cursor == "203"
 
 
 @pytest.mark.asyncio

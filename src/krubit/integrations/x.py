@@ -9,13 +9,17 @@ a durable `since_id` watermark rather than an opaque page token.
 `resolve_account` turns a handle into X's stable numeric user id via
 `GET /2/users/by/username/{username}`. `fetch_page` polls
 `GET /2/users/{id}/tweets` with `since_id=cursor` (omitted on the first poll) and
-`exclude=replies,retweets` so the API itself does most of the filtering; the
-response is still walked defensively and any tweet carrying a `referenced_tweets`
-entry of type `replied_to` or `retweeted` is dropped, so a reply or repost can never
-reach the content ledger even if the server-side `exclude` ever changes behavior.
-`next_cursor` is the API's own `meta.newest_id` for the fetched (unfiltered) page; if
-the API reports no new tweets at all, the caller's own cursor is preserved so the
-watermark never regresses.
+`exclude=replies,retweets` so the API itself does most of the filtering. The
+`exclude` parameter only recognizes `replies` and `retweets` — it does not cover
+quote-tweets ("retweet with comment"), which the API still returns as ordinary
+tweets. The response is therefore still walked defensively and any tweet carrying a
+`referenced_tweets` entry of type `replied_to`, `retweeted`, or `quoted` is dropped,
+so a reply, repost, or quote-tweet can never reach the content ledger even if the
+server-side `exclude` ever changes behavior — quote-tweets are exactly the "ordinary
+share" pattern the platform vocabulary excludes by default alongside replies and
+reposts. `next_cursor` is the API's own `meta.newest_id` for the fetched
+(unfiltered) page; if the API reports no new tweets at all, the caller's own cursor
+is preserved so the watermark never regresses.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ USER_TWEETS_URL = "https://api.x.com/2/users/{id}/tweets"
 
 _MAX_PAGE_SIZE = 100
 _MAX_TEXT_LENGTH = 300
-_REPLY_OR_REPOST_TYPES = frozenset({"replied_to", "retweeted"})
+_REPLY_OR_REPOST_TYPES = frozenset({"replied_to", "retweeted", "quoted"})
 
 _HEALTH_STATE_BY_FAILURE: Mapping[ConnectorFailureKind, CapabilityState] = {
     ConnectorFailureKind.AUTHORIZATION: CapabilityState.AUTHORIZATION_REQUIRED,
@@ -113,7 +117,7 @@ def _list(value: object) -> list[object] | None:
     return list(cast(list[object], value))
 
 
-def _is_reply_or_repost(tweet: Mapping[str, object]) -> bool:
+def _is_reply_repost_or_quote(tweet: Mapping[str, object]) -> bool:
     referenced = _list(tweet.get("referenced_tweets"))
     if not referenced:
         return False
@@ -186,7 +190,7 @@ class XConnector:
         items: list[Mapping[str, JSONValue]] = []
         for entry in tweets:
             tweet = _mapping(entry)
-            if tweet is None or _is_reply_or_repost(tweet):
+            if tweet is None or _is_reply_repost_or_quote(tweet):
                 continue
             mapped = self._map_tweet(tweet, account.handle)
             if mapped is not None:
