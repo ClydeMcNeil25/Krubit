@@ -142,13 +142,32 @@ Advance when Krubit can run continuously for an agreed canary period without dup
 
 ## Phase 2: Creator Signal and Notification Hub
 
-**Implementation status (2026-08-04):** Phase 2A implements only the Twitch/Discord-
-presence live-signal slice: public Discord Streaming activity can trigger a durable Twitch
-lookup, `Streaming Now` role handling, a `#live-notifications` card, recovery, and
-staff-only `/fetch live` controls. A member must choose to share their Twitch Streaming
-activity publicly in Discord for Krubit to observe it; Krubit does not read private
-connected accounts. YouTube, additional social connectors, and the remaining Phase 2
-deliverables below remain pending. The controlled live canary has not run.
+**Implementation status (2026-08-05):** The full multi-platform architecture described
+by the deliverables below is implemented and automated-test-verified: a guild-scoped
+creator registry, a connector catalog covering all ten listed platforms with honest
+per-capability state, a normalized content ledger with cross-platform correlation,
+shared quiet-hours/mention-budget policy, a shared durable Discord delivery engine
+covering both `#live-notifications` and the new `#social-notifications`, Discord
+Scheduled Event synchronization, and the full `/fetch creator`/`/fetch notification`
+command surface. The Phase 2A Twitch/Discord-presence slice is migrated behind these
+same shared contracts without changing its accepted presentation or safety guarantees.
+
+Two things keep this short of production-ready for every listed platform, both
+documented prominently in the
+[Phase 2 operations guide](../operations/phase-2-creator-signal-hub.md): Instagram,
+Facebook, Threads, and TikTok connectors are fully built and tested but not wired into
+the polling scheduler yet (each needs per-account OAuth credential resolution this
+build does not implement, so a shared bot-wide token would be actively wrong rather
+than merely incomplete); and the OAuth/push callback server is implemented and tested
+but never started by the running process, so no live OAuth consent, YouTube push, or
+Meta webhook can be completed yet. YouTube, X, Bluesky, and Twitch are the connectors
+reachable in this build.
+
+No controlled `#live-notifications` or `#social-notifications` production canary has
+run against a live Discord guild or real platform credentials; the
+[Phase 2 completion audit](../operations/phase-2-completion-audit.md) records this
+explicitly rather than claiming it. The exit gate below therefore remains open pending
+an operator running that canary with real credentials.
 
 ### Goal
 
