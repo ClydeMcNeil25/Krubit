@@ -23,10 +23,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from uuid import uuid4
 
 import discord
 
 from krubit.domain.creator_signals import ContentState, Platform
+from krubit.domain.models import JSONValue
 from krubit.storage.sqlite import ScheduledEventMapping, SQLiteStore
 
 _MAX_NAME_LENGTH = 100
@@ -244,7 +246,10 @@ class ScheduledEventSynchronizer:
                 image=image,
                 reason=_reason(event),
             )
-        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError) as exc:
+            await self._record_discord_error(
+                event, action="scheduled_event_create_failed", desired_status="scheduled", error=exc
+            )
             return ScheduledEventOutcome.SKIPPED_DISCORD_ERROR
         now = self._now()
         mapping = ScheduledEventMapping(
@@ -302,7 +307,14 @@ class ScheduledEventSynchronizer:
                 )
             else:
                 await discord_event.edit(status=status, reason=_reason(event))
-        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError):
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, ValueError) as exc:
+            await self._record_discord_error(
+                event,
+                action="scheduled_event_update_failed",
+                desired_status=desired_status,
+                error=exc,
+                discord_event_id=existing.discord_event_id,
+            )
             return ScheduledEventOutcome.SKIPPED_DISCORD_ERROR
 
         mapping = ScheduledEventMapping(
@@ -318,3 +330,38 @@ class ScheduledEventSynchronizer:
             updated_at=self._now(),
         )
         return await self._store.save_scheduled_event_mapping(mapping)
+
+    async def _record_discord_error(
+        self,
+        event: ScheduledStreamEvent,
+        *,
+        action: str,
+        desired_status: str,
+        error: Exception,
+        discord_event_id: int | None = None,
+    ) -> None:
+        """Durable failure receipt for a Discord API error, matching the
+        `record_content_receipt`/`update_content_delivery` convention used elsewhere
+        (`ContentSignalService._record_malformed_item`, `ContentRuntime`'s send/edit
+        paths): a failed create/update against a real Discord event must never be
+        silently invisible after `apply` returns — this is what lets staff (or a
+        later reconciliation sweep) distinguish "never attempted" from "attempted and
+        failed" for one exact `(guild_id, platform, external_id)`.
+        """
+        detail: dict[str, JSONValue] = {
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "desired_status": desired_status,
+        }
+        if discord_event_id is not None:
+            detail["discord_event_id"] = str(discord_event_id)
+        await self._store.record_content_receipt(
+            guild_id=event.guild_id,
+            receipt_id=f"scheduled_event:{uuid4().hex}",
+            account_id=event.account_id,
+            platform=event.platform,
+            external_id=event.external_id,
+            action=action,
+            detail=detail,
+            created_at=self._now(),
+        )

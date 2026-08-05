@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import discord
 import pytest
@@ -75,6 +75,7 @@ class FakeGuild:
         self.events: dict[int, FakeScheduledEvent] = {}
         self.created_events = 0
         self.create_kwargs: list[dict[str, object]] = []
+        self.create_failure: BaseException | None = None
         self._next_id = 9000
         granted = (
             permissions
@@ -84,6 +85,8 @@ class FakeGuild:
         self.me = SimpleNamespace(guild_permissions=granted)
 
     async def create_scheduled_event(self, **kwargs: object) -> FakeScheduledEvent:
+        if self.create_failure is not None:
+            raise self.create_failure
         self._next_id += 1
         self.create_kwargs.append(kwargs)
         event = FakeScheduledEvent(
@@ -439,3 +442,61 @@ async def test_restart_recovery_finds_mapping_by_exact_id_never_by_name(
     assert live.discord_event_id == created.discord_event_id
     assert guild.events[event_id].status == discord.EventStatus.active
     assert guild.created_events == 1
+
+
+@pytest.mark.asyncio
+async def test_create_failure_records_a_durable_failure_receipt(
+    env: EnvFixture,
+) -> None:
+    sync, store, guild = env
+    guild.create_failure = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="boom", headers={})), "boom"
+    )
+
+    outcome = await sync.apply(scheduled_youtube_event(external_id="yt-1"))
+
+    assert outcome is ScheduledEventOutcome.SKIPPED_DISCORD_ERROR
+    assert guild.created_events == 0
+    assert (
+        await store.get_scheduled_event_mapping(GUILD_ID, Platform.YOUTUBE, "yt-1") is None
+    )
+    receipts = await store.list_content_receipts(GUILD_ID)
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt.action == "scheduled_event_create_failed"
+    assert receipt.account_id == account().account_id
+    assert receipt.platform is Platform.YOUTUBE
+    assert receipt.external_id == "yt-1"
+    assert receipt.detail["desired_status"] == "scheduled"
+    assert "boom" in str(receipt.detail["error"])
+
+
+@pytest.mark.asyncio
+async def test_update_failure_records_a_durable_failure_receipt_and_keeps_prior_mapping(
+    env: EnvFixture,
+) -> None:
+    sync, store, guild = env
+    created = await sync.apply(scheduled_youtube_event(external_id="yt-1"))
+    assert isinstance(created, ScheduledEventMapping)
+    event_id = created.discord_event_id
+    assert event_id is not None
+    guild.events[event_id].edit_failure = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="boom", headers={})), "boom"
+    )
+
+    outcome = await sync.apply(live_youtube_event(external_id="yt-1"))
+
+    assert outcome is ScheduledEventOutcome.SKIPPED_DISCORD_ERROR
+    # The prior mapping (still "scheduled", still owned) must remain untouched.
+    unchanged = await store.get_scheduled_event_mapping(GUILD_ID, Platform.YOUTUBE, "yt-1")
+    assert unchanged is not None
+    assert unchanged.discord_status == "scheduled"
+    assert unchanged.discord_event_id == event_id
+    receipts = await store.list_content_receipts(GUILD_ID)
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt.action == "scheduled_event_update_failed"
+    assert receipt.external_id == "yt-1"
+    assert receipt.detail["desired_status"] == "active"
+    assert receipt.detail["discord_event_id"] == str(event_id)
+    assert "boom" in str(receipt.detail["error"])
