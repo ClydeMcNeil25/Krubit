@@ -8,17 +8,27 @@ random 96-bit nonce, so sealing the same plaintext twice never produces the same
 ciphertext. The key is derived from an operator-supplied secret string (for example
 `KRUBIT_CREDENTIAL_ENCRYPTION_KEY`) via SHA-256, so any sufficiently long random
 string works as the key material without requiring a specific encoding.
+
+`seal_json`/`open_json` are a thin convenience layer over `seal`/`open` for the
+structured secrets an OAuth grant actually is (an access token, an optional refresh
+token, and an expiry) — a Meta connector never needs its own JSON encoding step, and
+never handles the unsealed grant as anything but a short-lived in-memory mapping.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
+from collections.abc import Mapping
 from hashlib import sha256
+from typing import cast
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from krubit.domain.models import JSONValue
 
 _VERSION_PREFIX = "v1:"
 _NONCE_LENGTH = 12  # 96-bit nonce, the size AES-GCM is designed for.
@@ -71,3 +81,18 @@ class CredentialVault:
             return self._aesgcm.decrypt(nonce, ciphertext, None)
         except InvalidTag as exc:
             raise CredentialVaultError("sealed value failed authentication") from exc
+
+    def seal_json(self, value: Mapping[str, JSONValue]) -> str:
+        """Encrypt a JSON-shaped mapping (for example an OAuth grant) into a sealed token."""
+        return self.seal(json.dumps(value, sort_keys=True).encode("utf-8"))
+
+    def open_json(self, sealed: str) -> dict[str, JSONValue]:
+        """Verify, decrypt, and JSON-decode a token produced by `seal_json`."""
+        plaintext = self.open(sealed)
+        try:
+            decoded: object = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CredentialVaultError("sealed value is not valid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise CredentialVaultError("sealed value is not a JSON object")
+        return cast("dict[str, JSONValue]", decoded)

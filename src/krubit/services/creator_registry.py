@@ -16,6 +16,7 @@ from uuid import uuid4
 from krubit.domain.creator_signals import (
     Capability,
     CreatorAccount,
+    Platform,
     RecognizedAccountUrl,
     creator_account_id,
 )
@@ -187,6 +188,47 @@ class CreatorRegistry:
             detail={
                 "previous_owner_member_id": existing.owner_member_id,
                 "new_owner_member_id": new_owner_member_id,
+            },
+            now=now,
+        )
+        return saved
+
+    async def record_oauth_authorization(
+        self,
+        *,
+        guild_id: int,
+        actor_member_id: int,
+        account_id: str,
+        platform: Platform,
+        capability: Capability,
+        expires_at: datetime | None,
+        now: datetime,
+    ) -> CreatorAccount:
+        """Unpause an account once a member completes its Meta OAuth authorization.
+
+        Called only after the caller has already validated and single-use-consumed the
+        signed OAuth state and exchanged the authorization code for a token — this
+        method never receives the token itself (sealed or otherwise), only the fact that
+        `capability` is now authorized for `account_id` and, if the provider supplied
+        one, when that authorization expires. The audit receipt it records reflects the
+        same: capability and expiry only, never a credential reference.
+        """
+        existing = await self._existing_account(guild_id, account_id)
+        if existing.platform is not platform:
+            raise ValueError(
+                f"account {account_id!r} is registered for {existing.platform.value}, "
+                f"not {platform.value}"
+            )
+        updated = replace(existing, paused=False, updated_at=now)
+        saved = await self._store.save_creator_account(updated)
+        await self._record_receipt(
+            guild_id=guild_id,
+            account_id=account_id,
+            action="authorize_connector",
+            actor_member_id=actor_member_id,
+            detail={
+                "capability": capability.value,
+                "expires_at": expires_at.isoformat() if expires_at is not None else None,
             },
             now=now,
         )

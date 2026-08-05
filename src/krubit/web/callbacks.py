@@ -20,6 +20,13 @@ gets 404, not an echoed challenge; a POST whose signature does not verify agains
 shared secret gets 403 and `handle_notification` is never called. This module stays
 platform-neutral: `PushSubscription`'s callables are supplied by the platform-specific
 connector module (for example `krubit.integrations.youtube`), never imported here.
+
+`build_oauth_redirect_route` and `build_signed_webhook_route` extend the same
+scaffold to member-facing OAuth (starting with Meta): a single GET authorization
+redirect whose query-parameter handling is fully owned by the caller-supplied
+`OAuthRedirect`, and a single signed POST webhook (for example a platform's
+deauthorization/data-deletion callback) whose signature is verified before
+`handle_notification` ever runs, exactly like `build_push_route`'s POST half.
 """
 
 from __future__ import annotations
@@ -200,3 +207,65 @@ def build_push_route(
         CallbackRoute(path=path, method="GET", handler=handle_get),
         CallbackRoute(path=path, method="POST", handler=handle_post),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRedirect:
+    """One OAuth authorization-code redirect's state validation and code exchange.
+
+    `handle_redirect` receives the callback GET's raw query parameters and returns the
+    response body text shown to the member who completed the browser redirect. It
+    raises `ValueError` for anything that fails state validation (expired, already
+    used, tampered, or guild/member-mismatched) or code exchange; the route renders
+    that as a generic 400 rather than echoing the raised message, which could carry
+    provider diagnostic text.
+    """
+
+    handle_redirect: Callable[[Mapping[str, str]], Awaitable[str]]
+
+
+def build_oauth_redirect_route(*, path: str, redirect: OAuthRedirect) -> CallbackRoute:
+    """Build the single GET route for one OAuth authorization-code redirect endpoint."""
+
+    async def handle_get(request: web.Request) -> web.StreamResponse:
+        query = {key: value for key, value in request.query.items()}
+        try:
+            body = await redirect.handle_redirect(query)
+        except ValueError:
+            return web.Response(status=400, text="authorization request could not be completed")
+        return web.Response(status=200, text=body)
+
+    return CallbackRoute(path=path, method="GET", handler=handle_get)
+
+
+@dataclass(frozen=True, slots=True)
+class SignedWebhook:
+    """A signed webhook POST's verification and ingestion behavior.
+
+    Mirrors `PushSubscription`'s POST half for platforms (starting with Meta) whose
+    webhook is a single signed POST with no GET challenge step. `verify_signature`
+    always runs against the raw body before `handle_notification` is ever called.
+    """
+
+    verify_signature: Callable[[bytes, str | None], bool]
+    handle_notification: Callable[[bytes], Awaitable[None]]
+
+
+def build_signed_webhook_route(
+    *, path: str, header_name: str, webhook: SignedWebhook
+) -> CallbackRoute:
+    """Build the single POST route for one signed webhook endpoint.
+
+    An unverified body is rejected with 403 and `handle_notification` is never
+    called, matching `build_push_route`'s POST verification-before-ingestion order.
+    """
+
+    async def handle_post(request: web.Request) -> web.StreamResponse:
+        body = await request.read()
+        signature = request.headers.get(header_name)
+        if not webhook.verify_signature(body, signature):
+            return web.Response(status=403)
+        await webhook.handle_notification(body)
+        return web.Response(status=204)
+
+    return CallbackRoute(path=path, method="POST", handler=handle_post)
