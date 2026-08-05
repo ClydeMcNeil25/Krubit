@@ -71,9 +71,12 @@ is a certain fact, not an inferred pattern.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from krubit.domain.watchdog import RiskSignal
 
@@ -89,6 +92,75 @@ _CLUSTER_SIMILARITY_ELEVATED = 5
 _CLUSTER_SIMILARITY_HIGH = 8
 
 _GARBAGE_USERNAME_PATTERN = re.compile(r"^\d+$")
+
+# -- Message-signal thresholds (safety-sensitive — read before changing) ----------
+#
+# `extract_message_signals` is only ever called for a member with a currently open
+# watch window (see `krubit.services.watch_window.WatchWindowService.inspect_message`),
+# so, unlike the join signals above, every signal here already carries an implicit
+# prior: this member already looked worth a second look. That does NOT mean these
+# thresholds should be loose — a false accusation against an already-anxious watched
+# member is still a worse failure mode than a slow catch — so every weight/confidence
+# pair below is chosen the same way the join signals were: no single message-signal
+# should clear `_SUSPICIOUS_THRESHOLD` (3.0) alone.
+#
+# - `mass_mentions` (weight 3 @ 0.5 = 1.5 at >= 8 combined user/role mentions; weight 6
+#   @ 0.7 = 4.2 at >= 15, and unconditionally at the same weight/confidence for an
+#   `@everyone`/`@here` ping): an ordinary message rarely pings more than a handful of
+#   people; a burst of mentions is the classic "ping the whole server" spam/raid
+#   pattern. The `@everyone`/`@here` tier intentionally matches the high tier's
+#   weight/confidence regardless of the accompanying explicit-mention count, since a
+#   guild-wide ping is already maximally disruptive on its own — counting explicit
+#   mentions on top of it would not make it more or less alarming.
+# - `malicious_link_shape` (weight 4 @ 0.6 = 2.4): fires on structural URL red flags
+#   only — a bare IP-address host, `userinfo@host` credential/redirect tricks (the
+#   classic `https://real-site.com@evil.tld/` phishing shape), or a known link-
+#   shortener domain (redirect-shortener detection, matching the design doc's
+#   wording) — never a fetched blocklist and never content classification of *what*
+#   the link claims to be. Kept at a single weight regardless of which structural
+#   pattern matched: distinguishing "this is a phishing link" from "this happens to be
+#   a shortened link" is exactly the kind of intent judgment this module must not make.
+# - `repeated_content` (weight 3 @ 0.5 = 1.5): fires when a single message's own word
+#   sequence is dominated by repetition (a "buy now buy now buy now" pattern) — a
+#   proxy for keyboard-spam/copy-paste-flood content. Requires both a minimum word
+#   count and a repetition ratio so a short casual repeat ("lol lol") never fires; see
+#   `_REPEATED_CONTENT_MIN_WORDS`/`_REPEATED_CONTENT_RATIO`. This is intentionally
+#   distinct from `WatchWindowService`'s own `repeated_content_near_duplicate` signal,
+#   which compares a message against the *same* member's own prior messages within the
+#   watch window (a stateful, service-level check this pure function cannot make).
+_MASS_MENTIONS_ELEVATED = 8
+_MASS_MENTIONS_HIGH = 15
+_MASS_MENTIONS_ELEVATED_WEIGHT = 3
+_MASS_MENTIONS_ELEVATED_CONFIDENCE = 0.5
+_MASS_MENTIONS_HIGH_WEIGHT = 6
+_MASS_MENTIONS_HIGH_CONFIDENCE = 0.7
+
+_LINK_SHAPE_WEIGHT = 4
+_LINK_SHAPE_CONFIDENCE = 0.6
+_URL_PATTERN = re.compile(r"https?://\S+")
+# A small, fixed, offline set of well-known redirect-shortener domain *shapes* — never
+# fetched, never updated at runtime, matching the design doc's "URL structure and
+# redirect-shortener detection, not ... a fetched blocklist" requirement.
+_KNOWN_SHORTENER_DOMAINS = frozenset(
+    {
+        "bit.ly",
+        "tinyurl.com",
+        "t.co",
+        "is.gd",
+        "ow.ly",
+        "buff.ly",
+        "rebrand.ly",
+        "cutt.ly",
+        "shorturl.at",
+        "tiny.cc",
+        "rb.gy",
+    }
+)
+
+_REPEATED_CONTENT_MIN_WORDS = 4
+_REPEATED_CONTENT_RATIO = 2.0
+_REPEATED_CONTENT_WEIGHT = 3
+_REPEATED_CONTENT_CONFIDENCE = 0.5
 
 
 class JoinSubject(Protocol):
@@ -306,3 +378,136 @@ class JoinFingerprint:
             pending=member.pending,
             name=member.name,
         )
+
+
+class MessageSubject(Protocol):
+    """Structural shape `extract_message_signals` needs from a guild text message.
+
+    Deliberately narrow, matching `JoinSubject`'s convention: only fields already
+    present on `discord.Message` are named here, and never full-history/network-
+    fetchable fields. `content` is public-guild-channel message text the bot already
+    receives via the gateway (never a DM — see the design doc's Non-Negotiable
+    Boundaries; the caller, `WatchWindowService.inspect_message`, is responsible for
+    only ever being invoked with a guild message in the first place).
+    """
+
+    @property
+    def content(self) -> str: ...
+    @property
+    def mentions(self) -> Sequence[object]: ...
+    @property
+    def role_mentions(self) -> Sequence[object]: ...
+    @property
+    def mention_everyone(self) -> bool: ...
+
+
+def extract_message_signals(message: MessageSubject, now: datetime) -> tuple[RiskSignal, ...]:
+    """Deterministically extract bounded, named `RiskSignal`s from one guild message.
+
+    Pure: no I/O, no clock reads beyond the supplied `now`, no storage/history lookup
+    (that is `WatchWindowService`'s job, after this function returns — it is the only
+    caller responsible for ensuring this function only ever runs for a member with a
+    currently open watch window). Two calls with equal inputs always return an equal
+    result. See the module docstring's "Message-signal thresholds" section for the
+    weight/confidence rationale behind each signal below.
+    """
+    _require_aware("now", now)
+
+    signals: list[RiskSignal] = []
+
+    mention_signal = _mass_mentions_signal(message)
+    if mention_signal is not None:
+        signals.append(mention_signal)
+
+    link_signal = _malicious_link_shape_signal(message)
+    if link_signal is not None:
+        signals.append(link_signal)
+
+    repeated_signal = _repeated_content_signal(message)
+    if repeated_signal is not None:
+        signals.append(repeated_signal)
+
+    return tuple(signals)
+
+
+def _mass_mentions_signal(message: MessageSubject) -> RiskSignal | None:
+    mention_count = len(message.mentions) + len(message.role_mentions)
+    if message.mention_everyone:
+        return RiskSignal(
+            name="mass_mentions",
+            weight=_MASS_MENTIONS_HIGH_WEIGHT,
+            detail=(
+                f"message pings @everyone/@here (plus {mention_count} explicit "
+                "user/role mention(s))"
+            ),
+            confidence=_MASS_MENTIONS_HIGH_CONFIDENCE,
+        )
+    if mention_count >= _MASS_MENTIONS_HIGH:
+        return RiskSignal(
+            name="mass_mentions",
+            weight=_MASS_MENTIONS_HIGH_WEIGHT,
+            detail=f"message mentions {mention_count} users/roles at once",
+            confidence=_MASS_MENTIONS_HIGH_CONFIDENCE,
+        )
+    if mention_count >= _MASS_MENTIONS_ELEVATED:
+        return RiskSignal(
+            name="mass_mentions",
+            weight=_MASS_MENTIONS_ELEVATED_WEIGHT,
+            detail=f"message mentions {mention_count} users/roles at once",
+            confidence=_MASS_MENTIONS_ELEVATED_CONFIDENCE,
+        )
+    return None
+
+
+def _malicious_link_shape_signal(message: MessageSubject) -> RiskSignal | None:
+    for url in _URL_PATTERN.findall(message.content):
+        reason = _suspicious_url_reason(url)
+        if reason is not None:
+            return RiskSignal(
+                name="malicious_link_shape",
+                weight=_LINK_SHAPE_WEIGHT,
+                detail=f"message contains a URL with a {reason}: {url[:200]}",
+                confidence=_LINK_SHAPE_CONFIDENCE,
+            )
+    return None
+
+
+def _suspicious_url_reason(url: str) -> str | None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.hostname is None:
+        return None
+    if parsed.username is not None:
+        return "credential/redirect trick (userinfo before hostname)"
+    try:
+        ip_address(parsed.hostname)
+    except ValueError:
+        pass
+    else:
+        return "bare IP-address host"
+    if parsed.hostname.lower() in _KNOWN_SHORTENER_DOMAINS:
+        return "known link-shortener domain shape"
+    return None
+
+
+def _repeated_content_signal(message: MessageSubject) -> RiskSignal | None:
+    words = message.content.lower().split()
+    if len(words) < _REPEATED_CONTENT_MIN_WORDS:
+        return None
+    distinct = len(set(words))
+    if distinct == 0:
+        return None
+    ratio = len(words) / distinct
+    if ratio >= _REPEATED_CONTENT_RATIO:
+        return RiskSignal(
+            name="repeated_content",
+            weight=_REPEATED_CONTENT_WEIGHT,
+            detail=(
+                f"message repeats the same word(s) within itself "
+                f"({len(words)} words, only {distinct} distinct)"
+            ),
+            confidence=_REPEATED_CONTENT_CONFIDENCE,
+        )
+    return None
