@@ -5,6 +5,13 @@ import pytest
 from krubit.config import Settings, SettingsError
 
 
+def base_env() -> dict[str, str]:
+    return {
+        "DISCORD_KRUBIT_APPLICATION_ID": "123456789012345678",
+        "KRUBIT_DATABASE_PATH": "state/test.db",
+    }
+
+
 def test_settings_load_without_requiring_token() -> None:
     settings = Settings.from_env(
         {
@@ -84,3 +91,99 @@ def test_settings_rejects_invalid_live_signals_enabled_value() -> None:
                 "KRUBIT_LIVE_SIGNALS_ENABLED": "yes",
             }
         )
+
+
+def test_missing_social_credentials_do_not_prevent_bot_startup() -> None:
+    settings = Settings.from_env(base_env())
+    assert settings.youtube_api_key is None
+    assert settings.x_bearer_token is None
+    assert settings.meta_app_secret is None
+    assert settings.tiktok_client_secret is None
+
+
+def test_missing_social_settings_all_default_to_none_or_disabled() -> None:
+    settings = Settings.from_env(base_env())
+    assert settings.youtube_push_callback_secret is None
+    assert settings.meta_app_id is None
+    assert settings.meta_callback_base_url is None
+    assert settings.tiktok_client_key is None
+    assert settings.tiktok_callback_base_url is None
+    assert settings.creator_signals_enabled is False
+    assert settings.social_delivery_enabled is False
+    assert settings.credential_encryption_key is None
+    assert settings.callback_public_base_url is None
+    assert settings.callback_port is None
+
+
+def test_settings_parse_configured_social_and_callback_settings() -> None:
+    settings = Settings.from_env(
+        {
+            **base_env(),
+            "YOUTUBE_KRUBIT_API_KEY": "youtube-api-key",
+            "YOUTUBE_KRUBIT_PUSH_CALLBACK_SECRET": "youtube-push-secret",
+            "X_KRUBIT_BEARER_TOKEN": "x-bearer-token",
+            "META_KRUBIT_APP_ID": "meta-app-id",
+            "META_KRUBIT_APP_SECRET": "meta-app-secret",
+            "META_KRUBIT_CALLBACK_BASE_URL": "https://callbacks.example.com/meta",
+            "TIKTOK_KRUBIT_CLIENT_KEY": "tiktok-client-key",
+            "TIKTOK_KRUBIT_CLIENT_SECRET": "tiktok-client-secret",
+            "TIKTOK_KRUBIT_CALLBACK_BASE_URL": "https://callbacks.example.com/tiktok",
+            "KRUBIT_CREATOR_SIGNALS_ENABLED": "true",
+            "KRUBIT_SOCIAL_DELIVERY_ENABLED": "true",
+            "KRUBIT_CREDENTIAL_ENCRYPTION_KEY": "a-long-random-encryption-key",
+            "KRUBIT_CALLBACK_PUBLIC_BASE_URL": "https://callbacks.example.com",
+            "KRUBIT_CALLBACK_PORT": "8443",
+        }
+    )
+    assert settings.youtube_api_key == "youtube-api-key"
+    assert settings.youtube_push_callback_secret == "youtube-push-secret"
+    assert settings.x_bearer_token == "x-bearer-token"
+    assert settings.meta_app_id == "meta-app-id"
+    assert settings.meta_app_secret == "meta-app-secret"
+    assert settings.meta_callback_base_url == "https://callbacks.example.com/meta"
+    assert settings.tiktok_client_key == "tiktok-client-key"
+    assert settings.tiktok_client_secret == "tiktok-client-secret"
+    assert settings.tiktok_callback_base_url == "https://callbacks.example.com/tiktok"
+    assert settings.creator_signals_enabled is True
+    assert settings.social_delivery_enabled is True
+    assert settings.credential_encryption_key == "a-long-random-encryption-key"
+    assert settings.callback_public_base_url == "https://callbacks.example.com"
+    assert settings.callback_port == 8443
+
+
+def test_settings_rejects_invalid_creator_signals_enabled_value() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_CREATOR_SIGNALS_ENABLED"):
+        Settings.from_env({**base_env(), "KRUBIT_CREATOR_SIGNALS_ENABLED": "sure"})
+
+
+def test_settings_rejects_invalid_social_delivery_enabled_value() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_SOCIAL_DELIVERY_ENABLED"):
+        Settings.from_env({**base_env(), "KRUBIT_SOCIAL_DELIVERY_ENABLED": "nope"})
+
+
+def test_settings_rejects_non_https_callback_public_base_url() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_CALLBACK_PUBLIC_BASE_URL"):
+        Settings.from_env(
+            {**base_env(), "KRUBIT_CALLBACK_PUBLIC_BASE_URL": "http://callbacks.example.com"}
+        )
+
+
+def test_settings_rejects_invalid_callback_port() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_CALLBACK_PORT"):
+        Settings.from_env({**base_env(), "KRUBIT_CALLBACK_PORT": "not-a-port"})
+
+    with pytest.raises(SettingsError, match="KRUBIT_CALLBACK_PORT"):
+        Settings.from_env({**base_env(), "KRUBIT_CALLBACK_PORT": "70000"})
+
+
+def test_require_credential_encryption_key_rejects_missing_key() -> None:
+    settings = Settings.from_env(base_env())
+    with pytest.raises(SettingsError, match="KRUBIT_CREDENTIAL_ENCRYPTION_KEY"):
+        settings.require_credential_encryption_key()
+
+
+def test_require_credential_encryption_key_returns_configured_key() -> None:
+    settings = Settings.from_env(
+        {**base_env(), "KRUBIT_CREDENTIAL_ENCRYPTION_KEY": "a-long-random-encryption-key"}
+    )
+    assert settings.require_credential_encryption_key() == "a-long-random-encryption-key"

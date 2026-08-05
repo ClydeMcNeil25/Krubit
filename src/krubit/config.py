@@ -12,6 +12,15 @@ class SettingsError(ValueError):
     """Raised when Krubit's runtime configuration is invalid."""
 
 
+_BOOL_VALUES = {"true", "false", "1", "0"}
+
+
+def _parse_bool(name: str, raw: str) -> bool:
+    if raw not in _BOOL_VALUES:
+        raise SettingsError(f"{name} must be one of true, false, 1, or 0")
+    return raw in {"true", "1"}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     application_id: int
@@ -21,6 +30,20 @@ class Settings:
     twitch_client_id: str | None = None
     twitch_client_secret: str | None = None
     live_signals_enabled: bool = False
+    youtube_api_key: str | None = None
+    youtube_push_callback_secret: str | None = None
+    x_bearer_token: str | None = None
+    meta_app_id: str | None = None
+    meta_app_secret: str | None = None
+    meta_callback_base_url: str | None = None
+    tiktok_client_key: str | None = None
+    tiktok_client_secret: str | None = None
+    tiktok_callback_base_url: str | None = None
+    creator_signals_enabled: bool = False
+    social_delivery_enabled: bool = False
+    credential_encryption_key: str | None = None
+    callback_public_base_url: str | None = None
+    callback_port: int | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -44,10 +67,47 @@ class Settings:
             raise SettingsError(
                 "KRUBIT_STAFF_CHANNEL_ID must be a positive numeric Discord snowflake"
             )
-        if raw_live_signals_enabled not in {"true", "false", "1", "0"}:
-            raise SettingsError(
-                "KRUBIT_LIVE_SIGNALS_ENABLED must be one of true, false, 1, or 0"
-            )
+        live_signals_enabled = _parse_bool("KRUBIT_LIVE_SIGNALS_ENABLED", raw_live_signals_enabled)
+
+        raw_youtube_api_key = values.get("YOUTUBE_KRUBIT_API_KEY", "").strip()
+        raw_youtube_push_callback_secret = values.get(
+            "YOUTUBE_KRUBIT_PUSH_CALLBACK_SECRET", ""
+        ).strip()
+        raw_x_bearer_token = values.get("X_KRUBIT_BEARER_TOKEN", "").strip()
+        raw_meta_app_id = values.get("META_KRUBIT_APP_ID", "").strip()
+        raw_meta_app_secret = values.get("META_KRUBIT_APP_SECRET", "").strip()
+        raw_meta_callback_base_url = values.get("META_KRUBIT_CALLBACK_BASE_URL", "").strip()
+        raw_tiktok_client_key = values.get("TIKTOK_KRUBIT_CLIENT_KEY", "").strip()
+        raw_tiktok_client_secret = values.get("TIKTOK_KRUBIT_CLIENT_SECRET", "").strip()
+        raw_tiktok_callback_base_url = values.get("TIKTOK_KRUBIT_CALLBACK_BASE_URL", "").strip()
+        raw_creator_signals_enabled = values.get(
+            "KRUBIT_CREATOR_SIGNALS_ENABLED", "false"
+        ).strip()
+        raw_social_delivery_enabled = values.get(
+            "KRUBIT_SOCIAL_DELIVERY_ENABLED", "false"
+        ).strip()
+        raw_credential_encryption_key = values.get("KRUBIT_CREDENTIAL_ENCRYPTION_KEY", "").strip()
+        raw_callback_public_base_url = values.get("KRUBIT_CALLBACK_PUBLIC_BASE_URL", "").strip()
+        raw_callback_port = values.get("KRUBIT_CALLBACK_PORT", "").strip()
+
+        creator_signals_enabled = _parse_bool(
+            "KRUBIT_CREATOR_SIGNALS_ENABLED", raw_creator_signals_enabled
+        )
+        social_delivery_enabled = _parse_bool(
+            "KRUBIT_SOCIAL_DELIVERY_ENABLED", raw_social_delivery_enabled
+        )
+        if raw_callback_public_base_url and not raw_callback_public_base_url.startswith(
+            "https://"
+        ):
+            raise SettingsError("KRUBIT_CALLBACK_PUBLIC_BASE_URL must use https")
+        callback_port: int | None = None
+        if raw_callback_port:
+            if not raw_callback_port.isdigit() or not (1 <= int(raw_callback_port) <= 65_535):
+                raise SettingsError(
+                    "KRUBIT_CALLBACK_PORT must be a port number between 1 and 65535"
+                )
+            callback_port = int(raw_callback_port)
+
         return cls(
             application_id=int(raw_application_id),
             database_path=Path(raw_path),
@@ -55,7 +115,21 @@ class Settings:
             staff_channel_id=int(raw_staff_channel) if raw_staff_channel else None,
             twitch_client_id=raw_twitch_client_id or None,
             twitch_client_secret=raw_twitch_client_secret or None,
-            live_signals_enabled=raw_live_signals_enabled in {"true", "1"},
+            live_signals_enabled=live_signals_enabled,
+            youtube_api_key=raw_youtube_api_key or None,
+            youtube_push_callback_secret=raw_youtube_push_callback_secret or None,
+            x_bearer_token=raw_x_bearer_token or None,
+            meta_app_id=raw_meta_app_id or None,
+            meta_app_secret=raw_meta_app_secret or None,
+            meta_callback_base_url=raw_meta_callback_base_url or None,
+            tiktok_client_key=raw_tiktok_client_key or None,
+            tiktok_client_secret=raw_tiktok_client_secret or None,
+            tiktok_callback_base_url=raw_tiktok_callback_base_url or None,
+            creator_signals_enabled=creator_signals_enabled,
+            social_delivery_enabled=social_delivery_enabled,
+            credential_encryption_key=raw_credential_encryption_key or None,
+            callback_public_base_url=raw_callback_public_base_url or None,
+            callback_port=callback_port,
         )
 
     def require_token(self) -> str:
@@ -70,3 +144,11 @@ class Settings:
                 "when KRUBIT_LIVE_SIGNALS_ENABLED=true"
             )
         return self.twitch_client_id, self.twitch_client_secret
+
+    def require_credential_encryption_key(self) -> str:
+        if self.credential_encryption_key is None:
+            raise SettingsError(
+                "KRUBIT_CREDENTIAL_ENCRYPTION_KEY is required to store or read creator "
+                "OAuth grants"
+            )
+        return self.credential_encryption_key
