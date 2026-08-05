@@ -53,7 +53,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from krubit.discord.content_commands import CommandResult, CommandStatus
-from krubit.domain.models import Card, CardField, JSONValue
+from krubit.domain.models import Card, CardField
 from krubit.domain.watchdog import EvidencePacket, Incident, RiskBand, RiskSignal
 from krubit.services.incident_evidence import build_evidence_packet
 
@@ -65,6 +65,22 @@ _INCIDENT_RECEIPT_SCAN_LIMIT = 500
 _PLACEHOLDER_SIGNAL_WEIGHT = 1
 _PLACEHOLDER_SIGNAL_CONFIDENCE = 1.0
 _HIGH_BANDS = (RiskBand.SUSPICIOUS, RiskBand.INCIDENT)
+
+# `_reconstruct_signals` below rebuilds one `RiskSignal` per recovered signal *name*
+# only -- the detector's real weight, confidence, detail text, message links, and
+# event IDs are not durably stored anywhere Task 1-7 wrote to (see the module
+# docstring's "Why incident/evidence reconstruct signals" section). Neither
+# `incident()` nor `evidence()` may ever render `_PLACEHOLDER_SIGNAL_WEIGHT`/
+# `_PLACEHOLDER_SIGNAL_CONFIDENCE`/an empty `message_links`/`event_ids` as if they
+# were the detector's genuine output -- a uniform, hardcoded confidence is exactly
+# the "opaque risk score with no explanation" the design doc prohibits. Both
+# commands surface this notice instead of any of those fabricated fields.
+_RECONSTRUCTION_NOTICE = (
+    "Note: full evidence detail (per-signal weight, confidence, detail text, "
+    "message links, and event IDs) was not persisted for this incident -- only "
+    "the contributing signal names are recoverable. Nothing below is a genuine "
+    "detector-computed confidence or message-link count."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,7 +264,8 @@ class WatchdogCommandService:
             description=(
                 f"Kind: **{record.kind.value}**\n"
                 f"Band: **{record.band.value}**\n"
-                f"Opened: {record.opened_at.isoformat()}"
+                f"Opened: {record.opened_at.isoformat()}\n\n"
+                f"{_RECONSTRUCTION_NOTICE}"
             ),
             fields=(
                 CardField("Recommended action", record.recommended_action, False),
@@ -260,11 +277,10 @@ class WatchdogCommandService:
                     True,
                 ),
                 CardField(
-                    "Contributing signals",
+                    "Contributing signals (names only)",
                     ", ".join(signal.name for signal in packet.signals),
                     False,
                 ),
-                CardField("Message links", str(len(packet.message_links)), True),
             ),
         )
         return CommandResult(
@@ -278,9 +294,16 @@ class WatchdogCommandService:
     ) -> CommandResult:
         """Render `incident_id`'s raw, redacted evidence export.
 
-        Always the packet's `to_storage_dict()` representation — `EvidencePacket`'s
-        one supported redacted-JSON view (see its docstring) — never a hand-rolled
-        formatting path that could accidentally bypass that redaction.
+        Deliberately does NOT dump `EvidencePacket.to_storage_dict()` wholesale:
+        that representation includes `_reconstruct_signals`'s placeholder
+        `weight`/`confidence`/`detail`, and an always-empty `message_links`/
+        `event_ids` (see the module-level `_RECONSTRUCTION_NOTICE` docstring for
+        why those are never the detector's genuine output). Only the genuinely
+        recoverable fields — `incident_id`, `guild_id`, `created_at`, and the
+        recovered signal *names* — are rendered, each still passed through the
+        same redacted `EvidencePacket`/`RiskSignal` construction path
+        (`build_evidence_packet`) `incident()` uses, so this is still "reuse the
+        Task 6 builder's redaction," just a narrower render of its output.
         """
         if not actor.is_staff:
             return _denied()
@@ -289,8 +312,17 @@ class WatchdogCommandService:
             return found
         record = found
         packet = await self._evidence_packet_for(record)
-        export: dict[str, JSONValue] = packet.to_storage_dict()
-        lines = [f"{key}: {value}" for key, value in sorted(export.items())]
+        signal_names = ", ".join(signal.name for signal in packet.signals)
+        lines = [
+            _RECONSTRUCTION_NOTICE,
+            "",
+            f"incident_id: {packet.incident_id}",
+            f"guild_id: {packet.guild_id}",
+            f"created_at: {packet.created_at.isoformat()}",
+            f"signal_names: {signal_names}",
+            "message_links: not recoverable (not persisted for this incident)",
+            "event_ids: not recoverable (not persisted for this incident)",
+        ]
         card = Card(
             kind="fetched",
             title=f"Fetched: Evidence Export {record.incident_id}",

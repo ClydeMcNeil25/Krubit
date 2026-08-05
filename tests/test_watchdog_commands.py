@@ -248,6 +248,33 @@ async def test_incident_fails_for_unknown_incident_id(
     assert result.status is CommandStatus.FAILED
 
 
+@pytest.mark.asyncio
+async def test_incident_card_never_presents_fabricated_confidence_or_message_links(
+    store: SQLiteStore, commands: WatchdogCommandService
+) -> None:
+    """`_reconstruct_signals` fabricates a placeholder weight/confidence and
+    `build_evidence_packet` is always called with zero messages (see
+    `WatchdogCommandService`'s module docstring) -- none of that may ever be
+    rendered as if it were the detector's genuine output. The rendered card must
+    instead disclose that only signal names were recoverable."""
+    incident = await _seed_incident(store)
+    result = await commands.incident(actor=staff_member(), incident_id=incident.incident_id)
+    assert result.card is not None
+    # Only the disclosure notice may mention these words (to explain what is
+    # missing) -- no field name/value pair may present a fabricated number under
+    # them, which is what would happen if a "Confidence"/"Weight"/"Message links"
+    # field were rendered again.
+    field_names = {field.name.lower() for field in result.card.fields}
+    assert "confidence" not in field_names
+    assert "weight" not in field_names
+    assert "message links" not in field_names
+    rendered = result.card.description + " ".join(
+        f"{field.name}:{field.value}" for field in result.card.fields
+    )
+    assert "1.0" not in rendered
+    assert "not persisted" in rendered.lower()
+
+
 # -- evidence ---------------------------------------------------------------------------
 
 
@@ -261,6 +288,29 @@ async def test_evidence_command_never_renders_unredacted_content(
     assert result.card is not None
     assert "secret" not in result.card.description
     assert "secretvalue123" not in result.card.description
+
+
+@pytest.mark.asyncio
+async def test_evidence_card_discloses_reconstruction_and_omits_fabricated_numbers(
+    store: SQLiteStore, commands: WatchdogCommandService
+) -> None:
+    """A raid incident that (per real detector behavior) involved real messages and
+    a detector-computed confidence must never render as `confidence: 1.0` /
+    `message_links: []` looking like genuine detector output -- see the Task 8
+    review finding this test guards against."""
+    incident = await _seed_incident(store)
+    result = await commands.evidence(actor=staff_member(), incident_id=incident.incident_id)
+    assert result.card is not None
+    description = result.card.description
+    assert "not persisted" in description.lower()
+    # The disclosure notice legitimately names "confidence"/"weight" to explain
+    # what is missing; what must never appear is a fabricated *value* for them, or
+    # an evidence-implying-empty "message_links: []"/"event_ids: []" pair.
+    assert "confidence:" not in description.lower()
+    assert "weight:" not in description.lower()
+    assert "1.0" not in description
+    assert "message_links: []" not in description
+    assert "event_ids: []" not in description
 
 
 @pytest.mark.asyncio
