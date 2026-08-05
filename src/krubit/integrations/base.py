@@ -159,6 +159,17 @@ class ConnectorFailure:
         return cls(ConnectorFailureKind.NOT_FOUND, detail)
 
 
+class UnsupportedConnectorError(RuntimeError):
+    """Raised by a connector whose declared capability is permanently `UNSUPPORTED`.
+
+    Distinct from every `ConnectorFailure`-based error: those describe a transient or
+    configuration-dependent failure a retry, a fresh token, or an operator action could
+    clear. This error means the platform capability itself is not (yet) offered at
+    all — no network call was attempted, and a connector raising this must never
+    attempt one either, regardless of what credentials or account state it is given.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectorHealth:
     """A connector's currently observed state for one capability."""
