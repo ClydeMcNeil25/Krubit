@@ -6,6 +6,13 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
 
+from krubit.domain.creator_signals import (
+    ContentKind,
+    ContentState,
+    CreatorAccount,
+    Platform,
+    creator_account_id,
+)
 from krubit.domain.live_signals import (
     LiveSignalAction,
     LiveSignalPlan,
@@ -41,6 +48,101 @@ def _delivery_key(session: LiveSignalSession) -> str:
     return f"provisional:{session.session_key}"
 
 
+async def _link_twitch_content(
+    store: SQLiteStore, session: LiveSignalSession, *, channel_id: int, message_id: int
+) -> None:
+    """Mirror one delivered Twitch announcement into the shared content ledger.
+
+    Shared by the one-time Phase 2A `migrate_twitch_content` backfill and every future
+    live delivery (`_record_delivery_result`), so both paths produce identical
+    `content_events`/`content_deliveries` identities keyed on the real Twitch
+    `stream.stream_id`. Only ever called once a Discord message genuinely exists for
+    this stream (a `succeeded` delivery) — this only records that history, it never
+    sends or edits a Discord message itself, and Twitch's own role/announcement
+    pipeline in `krubit.discord.live_runtime` is completely unaffected: this call is
+    additive bookkeeping on top of an already-decided outcome.
+    """
+    stream = session.stream
+    if stream is None:
+        return
+    observed_at = session.last_twitch_at or session.detected_at
+    account = await store.save_creator_account(
+        CreatorAccount(
+            guild_id=session.guild_id,
+            account_id=creator_account_id(Platform.TWITCH, session.twitch_login),
+            owner_member_id=session.member_id,
+            platform=Platform.TWITCH,
+            handle=session.twitch_login,
+            canonical_url=session.twitch_url,
+            external_id=session.twitch_login,
+            paused=True,
+            created_at=session.detected_at,
+            updated_at=observed_at,
+        )
+    )
+    await store.migrate_content_identity(
+        guild_id=session.guild_id,
+        account_id=account.account_id,
+        platform=Platform.TWITCH,
+        external_id=stream.stream_id,
+        content_kind=ContentKind.LIVE,
+        state=ContentState.LIVE if session.ended_at is None else ContentState.ENDED,
+        canonical_url=session.twitch_url,
+        title=stream.title,
+        published_at=stream.started_at,
+        first_observed_at=session.detected_at,
+        last_observed_at=observed_at,
+        channel_id=channel_id,
+        message_id=message_id,
+    )
+
+
+async def migrate_twitch_content(store: SQLiteStore, guild_id: int) -> int:
+    """Idempotently link one guild's Phase 2A Twitch history into the content ledger.
+
+    Reads only from the Phase 2A tables (`live_signal_sessions`/`live_signal_deliveries`
+    via `SQLiteStore.list_live_sessions_with_stream`/`get_live_delivery`) and never
+    mutates them — they stay in place as rollback evidence. Only sessions with a
+    `succeeded` delivery that already carries a real Discord message id are linked;
+    anything still `claimed`, `failed`, or `cancelled` never had a message sent for it
+    and is correctly left out of the unified ledger rather than invented. Every write
+    goes through `_link_twitch_content`, the same idempotent upsert/`INSERT OR IGNORE`
+    path a live delivery uses, so running this twice (or racing it against a live
+    delivery for the same stream) links the same identity again without creating a
+    second delivery, claiming a mention budget, or sending anything to Discord.
+    Returns the number of sessions linked (or re-confirmed) this call.
+    """
+    linked = 0
+    for session in await store.list_live_sessions_with_stream(guild_id):
+        if session.stream is None:
+            continue
+        delivery = await store.get_live_delivery(guild_id, f"stream:{session.stream.stream_id}")
+        if (
+            delivery is None
+            or delivery.status != "succeeded"
+            or delivery.channel_id is None
+            or delivery.message_id is None
+        ):
+            continue
+        await _link_twitch_content(
+            store, session, channel_id=delivery.channel_id, message_id=delivery.message_id
+        )
+        linked += 1
+    return linked
+
+
+async def migrate_all_twitch_content(store: SQLiteStore) -> int:
+    """Run `migrate_twitch_content` for every guild with Phase 2A configuration.
+
+    Called once at startup (see `krubit.__main__._run_bot`); safe to call on every
+    boot since `migrate_twitch_content` is itself idempotent per guild.
+    """
+    linked = 0
+    for guild_id in await store.list_live_signal_guild_ids():
+        linked += await migrate_twitch_content(store, guild_id)
+    return linked
+
+
 class LiveSignalService:
     """Own the state machine while Discord adapters execute its durable plans."""
 
@@ -56,9 +158,7 @@ class LiveSignalService:
             self._guild_locks[guild_id] = lock
         return lock
 
-    async def observe(
-        self, observation: StreamingObservation, *, now: datetime
-    ) -> LiveSignalPlan:
+    async def observe(self, observation: StreamingObservation, *, now: datetime) -> LiveSignalPlan:
         """Compatibility helper that begins durable state before enrichment."""
         begun = await self.begin_presence(observation, now=now)
         enriched = await self.enrich_presence(observation, now=now)
@@ -138,9 +238,7 @@ class LiveSignalService:
         async with self._guild_lock(observation.guild_id):
             return await self._observe(observation, now=now)
 
-    async def _observe(
-        self, observation: StreamingObservation, *, now: datetime
-    ) -> LiveSignalPlan:
+    async def _observe(self, observation: StreamingObservation, *, now: datetime) -> LiveSignalPlan:
         _require_aware("now", now)
         existing = await self._store.open_live_session(
             observation.guild_id, observation.member_id, observation.twitch_login
@@ -223,19 +321,11 @@ class LiveSignalService:
         """Rebuild runtime-only execution plans from durable claimed deliveries."""
         async with self._guild_lock(guild_id):
             plans: list[LiveSignalPlan] = []
-            for session in await self._store.list_terminal_live_sessions_with_owned_roles(
-                guild_id
-            ):
-                plans.append(
-                    self._plan(session, (LiveSignalAction.REMOVE_ROLE,), recovery=True)
-                )
+            for session in await self._store.list_terminal_live_sessions_with_owned_roles(guild_id):
+                plans.append(self._plan(session, (LiveSignalAction.REMOVE_ROLE,), recovery=True))
             for session in await self._store.list_active_live_sessions(guild_id):
                 if session.stream is None and session.announcement_message_id is None:
-                    actions = (
-                        (LiveSignalAction.ENSURE_ROLE,)
-                        if session.role_id is None
-                        else ()
-                    )
+                    actions = (LiveSignalAction.ENSURE_ROLE,) if session.role_id is None else ()
                     if actions:
                         plans.append(self._plan(session, actions, recovery=True))
             for delivery in await self._store.list_claimed_live_deliveries(guild_id):
@@ -308,9 +398,8 @@ class LiveSignalService:
                     last_twitch_at=now,
                 )
             )
-            if (
-                saved.announcement_message_id is not None
-                and (session.status is not LiveSignalStatus.LIVE or session.stream != saved.stream)
+            if saved.announcement_message_id is not None and (
+                session.status is not LiveSignalStatus.LIVE or session.stream != saved.stream
             ):
                 return self._plan(saved, (LiveSignalAction.EDIT_ANNOUNCEMENT,))
             if saved.announcement_message_id is None:
@@ -452,13 +541,17 @@ class LiveSignalService:
         if not completed:
             raise ValueError("stale delivery attempt")
         if status == "succeeded":
-            await self._store.save_live_session(
+            saved = await self._store.save_live_session(
                 replace(
                     session,
                     announcement_channel_id=channel_id,
                     announcement_message_id=message_id,
                 )
             )
+            if message_id is not None:
+                await _link_twitch_content(
+                    self._store, saved, channel_id=channel_id, message_id=message_id
+                )
 
     async def status(self, guild_id: int) -> tuple[LiveSignalSession, ...]:
         """Return guild-scoped active sessions for factual staff status rendering."""

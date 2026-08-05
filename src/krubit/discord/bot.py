@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, time
 from uuid import uuid4
 
@@ -18,13 +19,16 @@ from krubit.discord.content_commands import (
     CreatorCommands,
     NotificationCommands,
 )
+from krubit.discord.content_runtime import ConnectorScheduler, ContentRuntime
 from krubit.discord.events import guild_event
 from krubit.discord.install import phase_two_intents, phase_two_permissions
 from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
 from krubit.domain.companion import SnapshotRecord
+from krubit.domain.creator_signals import ContentPlan, Platform
 from krubit.domain.models import Card, CardField, GuildEvent
+from krubit.integrations.base import Connector
 from krubit.integrations.twitch import TwitchClient, UnavailableTwitchClient
 from krubit.services.daily_summary import DailySummaryResult, DailySummaryService
 from krubit.services.foundation import (
@@ -373,9 +377,7 @@ class BackupCommands(app_commands.Group):
         inventory = await capture_inventory(
             guild, required_permissions=phase_two_permissions(), configured_channel_id=None
         )
-        diff = await self._parent.snapshots.preview_restore(
-            guild.id, target.snapshot_id, inventory
-        )
+        diff = await self._parent.snapshots.preview_restore(guild.id, target.snapshot_id, inventory)
         await self._parent.finish(
             interaction,
             action="fetch_backup_preview",
@@ -395,6 +397,7 @@ class KrubitBot(discord.Client):
         *,
         connector: BaseConnector | None = None,
         twitch: TwitchClient | None = None,
+        content_connectors: Mapping[Platform, Connector] | None = None,
     ) -> None:
         super().__init__(
             intents=phase_two_intents(),
@@ -417,6 +420,15 @@ class KrubitBot(discord.Client):
             live_signals,
             receipts=service,
         )
+        self._content_runtime = ContentRuntime(service.store)
+        self._content_connectors = dict(content_connectors or {})
+        self._content_scheduler_enabled = bool(self._content_connectors)
+        self._content_scheduler = ConnectorScheduler(
+            service.store,
+            self._content_connectors,
+            guild_ids=lambda: tuple(guild.id for guild in self.guilds),
+            on_plans=self._deliver_content_plans,
+        )
         self.tree.add_command(
             FetchCommands(
                 service,
@@ -436,11 +448,34 @@ class KrubitBot(discord.Client):
         self.daily_health_summary.start()
         if self._live_runtime_enabled:
             self.live_signal_reconciliation.start()
+        if self._content_scheduler_enabled:
+            self.content_scheduler_cycle.start()
 
     async def close(self) -> None:
         self.daily_health_summary.cancel()
         self.live_signal_reconciliation.cancel()
+        self.content_scheduler_cycle.cancel()
         await super().close()
+
+    async def _deliver_content_plans(self, guild_id: int, plans: tuple[ContentPlan, ...]) -> None:
+        """Apply one connector poll's freshly claimed plans to their real Discord guild.
+
+        A guild the scheduler polled for but that is not (or no longer) in this
+        process's cache — for example between a restart and the next `GUILD_CREATE`
+        — simply leaves the claimed deliveries `pending`; `recover_pending` sweeps
+        them once `on_guild_available` runs, so nothing already claimed is lost.
+        """
+        guild = self.get_guild(guild_id)
+        if guild is not None:
+            await self._content_runtime.apply_plans(guild, plans)
+
+    @tasks.loop(seconds=60)
+    async def content_scheduler_cycle(self) -> None:
+        await self._content_scheduler.run_cycle()
+
+    @content_scheduler_cycle.before_loop
+    async def before_content_scheduler_cycle(self) -> None:
+        await self.wait_until_ready()
 
     async def run_daily_summary_for_guild(
         self, guild: discord.Guild, summary_date: date
@@ -510,9 +545,7 @@ class KrubitBot(discord.Client):
                 database_healthy=True,
                 gateway_ready=self.is_ready(),
             )
-            await channel.send(
-                embed=render_health_card(report, title="Krubit Daily Server Health")
-            )
+            await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))
         except Exception as exc:
             return await self._record_daily_summary_outcome(
                 guild.id,
@@ -583,10 +616,12 @@ class KrubitBot(discord.Client):
     async def on_guild_available(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
         await self._live_runtime.bootstrap_guild(guild)
+        await self._content_runtime.recover_pending(guild)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._record_guild_connection(guild)
         await self._live_runtime.bootstrap_guild(guild)
+        await self._content_runtime.recover_pending(guild)
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member) -> None:
         await self._live_runtime.handle_presence(before, after)

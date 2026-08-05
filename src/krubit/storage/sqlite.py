@@ -17,9 +17,11 @@ import aiosqlite
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
 from krubit.domain.creator_signals import (
+    CapabilityState,
     ContentCursor,
     ContentDelivery,
     ContentEvent,
+    ContentKind,
     ContentObservation,
     ContentPlan,
     ContentState,
@@ -181,6 +183,29 @@ class CreatorBootstrap:
     creator_role_id: int
     notification_channel_id: int
     created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ContentScheduleState:
+    """One account's durable next-poll bookkeeping for `ConnectorScheduler`.
+
+    Identity is `(guild_id, account_id, platform)`, matching `content_cursors`.
+    `next_poll_at` is the only field a scheduler restart needs to trust: a fresh
+    `ConnectorScheduler` instance reads it back exactly as the previous process left
+    it, so a restart never polls an account early just because in-memory state was
+    lost. `consecutive_failures` and `last_state`/`last_detail` are the backoff and
+    health-reporting bookkeeping `run_cycle` updates every time this account is polled.
+    """
+
+    guild_id: int
+    account_id: str
+    platform: Platform
+    next_poll_at: datetime
+    interval_seconds: int
+    consecutive_failures: int
+    last_state: CapabilityState
+    last_detail: str | None
     updated_at: datetime
 
 
@@ -550,6 +575,24 @@ class SQLiteStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS content_schedule (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                next_poll_at TEXT NOT NULL,
+                interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
+                consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+                last_state TEXT NOT NULL DEFAULT 'unconfigured',
+                last_detail TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id, platform),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_content_schedule_next_poll
+                ON content_schedule (next_poll_at ASC);
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -613,9 +656,7 @@ class SQLiteStore:
             saved_session = await self._save_live_session_in_transaction(session)
         return await self._read_saved_live_session(saved_session)
 
-    async def save_terminal_live_session(
-        self, session: LiveSignalSession
-    ) -> LiveSignalSession:
+    async def save_terminal_live_session(self, session: LiveSignalSession) -> LiveSignalSession:
         """Persist terminal session state and retire its claimed deliveries atomically."""
         _require_guild_id(session.guild_id)
         async with self._write_transaction(immediate=True):
@@ -685,9 +726,7 @@ class SQLiteStore:
         await self._upsert_live_session(saved_session)
         return await self._read_saved_live_session(saved_session)
 
-    async def _read_saved_live_session(
-        self, saved_session: LiveSignalSession
-    ) -> LiveSignalSession:
+    async def _read_saved_live_session(self, saved_session: LiveSignalSession) -> LiveSignalSession:
         session_key = saved_session.session_key
         if saved_session.stream is not None:
             cursor = await self._connection.execute(
@@ -855,9 +894,7 @@ class SQLiteStore:
         )
         return self._live_signal_session_from_row(await cursor.fetchone())
 
-    async def get_live_session(
-        self, guild_id: int, session_key: str
-    ) -> LiveSignalSession | None:
+    async def get_live_session(self, guild_id: int, session_key: str) -> LiveSignalSession | None:
         _require_guild_id(guild_id)
         cursor = await self._connection.execute(
             """
@@ -908,9 +945,7 @@ class SQLiteStore:
         )
         return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
 
-    async def claim_live_delivery(
-        self, guild_id: int, delivery_key: str, session_key: str
-    ) -> bool:
+    async def claim_live_delivery(self, guild_id: int, delivery_key: str, session_key: str) -> bool:
         attempt = await self.claim_live_delivery_attempt(guild_id, delivery_key, session_key)
         return attempt is not None
 
@@ -2497,9 +2532,7 @@ class SQLiteStore:
             """,
             (guild_id,),
         )
-        mappings = [
-            self._scheduled_event_mapping_from_row(row) for row in await cursor.fetchall()
-        ]
+        mappings = [self._scheduled_event_mapping_from_row(row) for row in await cursor.fetchall()]
         return [mapping for mapping in mappings if mapping is not None]
 
     @staticmethod
@@ -2616,3 +2649,182 @@ class SQLiteStore:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
+
+    async def get_content_schedule(
+        self, guild_id: int, account_id: str, platform: Platform
+    ) -> ContentScheduleState | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_schedule
+            WHERE guild_id = ? AND account_id = ? AND platform = ?
+            """,
+            (guild_id, account_id, platform.value),
+        )
+        return self._content_schedule_from_row(await cursor.fetchone())
+
+    async def save_content_schedule(self, state: ContentScheduleState) -> ContentScheduleState:
+        """Persist one account's durable next-poll bookkeeping.
+
+        `ConnectorScheduler.run_cycle` calls this after every poll attempt (success or
+        failure) so a restart's fresh scheduler instance reads back exactly the backoff
+        and `next_poll_at` the previous process computed, never polling early just
+        because in-memory scheduler state was lost.
+        """
+        _require_guild_id(state.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO content_schedule (
+                    guild_id, account_id, platform, next_poll_at, interval_seconds,
+                    consecutive_failures, last_state, last_detail, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id, platform) DO UPDATE SET
+                    next_poll_at = excluded.next_poll_at,
+                    interval_seconds = excluded.interval_seconds,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_state = excluded.last_state,
+                    last_detail = excluded.last_detail,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    state.guild_id,
+                    state.account_id,
+                    state.platform.value,
+                    state.next_poll_at.isoformat(),
+                    state.interval_seconds,
+                    state.consecutive_failures,
+                    state.last_state.value,
+                    state.last_detail,
+                    state.updated_at.isoformat(),
+                ),
+            )
+        saved = await self.get_content_schedule(state.guild_id, state.account_id, state.platform)
+        if saved is None:
+            raise RuntimeError("saved content schedule could not be read")
+        return saved
+
+    @staticmethod
+    def _content_schedule_from_row(row: aiosqlite.Row | None) -> ContentScheduleState | None:
+        if row is None:
+            return None
+        last_detail = row["last_detail"]
+        return ContentScheduleState(
+            guild_id=int(row["guild_id"]),
+            account_id=str(row["account_id"]),
+            platform=Platform(str(row["platform"])),
+            next_poll_at=datetime.fromisoformat(str(row["next_poll_at"])),
+            interval_seconds=int(row["interval_seconds"]),
+            consecutive_failures=int(row["consecutive_failures"]),
+            last_state=CapabilityState(str(row["last_state"])),
+            last_detail=str(last_detail) if last_detail is not None else None,
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    async def list_live_signal_guild_ids(self) -> list[int]:
+        """Return every guild with a configured Phase 2A live-signal channel/role.
+
+        Startup migration (`krubit.services.live_signals.migrate_all_twitch_content`)
+        uses this to discover which guilds might have Phase 2A history to link, without
+        requiring a live Discord connection or guild membership list.
+        """
+        cursor = await self._connection.execute(
+            "SELECT guild_id FROM live_signal_config ORDER BY guild_id ASC"
+        )
+        return [int(row["guild_id"]) for row in await cursor.fetchall()]
+
+    async def list_live_sessions_with_stream(self, guild_id: int) -> list[LiveSignalSession]:
+        """Return every session (any status, terminal included) with a known stream_id.
+
+        Migration's source of truth: only a session that reached a real Twitch stream
+        identity ever had a chance to claim and deliver an announcement, so this is the
+        complete candidate set `migrate_twitch_content` walks. Unlike
+        `list_active_live_sessions`, terminal (ended) sessions are included — Phase 2A
+        history to link is exactly the kind of session that has since ended.
+        """
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM live_signal_sessions
+            WHERE guild_id = ? AND stream_id IS NOT NULL
+            ORDER BY detected_at ASC, session_key ASC
+            """,
+            (guild_id,),
+        )
+        return [self._live_signal_session_from_stored_row(row) for row in await cursor.fetchall()]
+
+    async def migrate_content_identity(
+        self,
+        *,
+        guild_id: int,
+        account_id: str,
+        platform: Platform,
+        external_id: str,
+        content_kind: ContentKind,
+        state: ContentState,
+        canonical_url: str,
+        title: str | None,
+        published_at: datetime | None,
+        first_observed_at: datetime,
+        last_observed_at: datetime,
+        channel_id: int,
+        message_id: int,
+    ) -> None:
+        """Idempotently link one already-delivered item into the unified content ledger.
+
+        Used by both the one-time Twitch migration (Phase 2A's `live_signal_sessions`/
+        `live_signal_deliveries`) and the live mirror `LiveSignalService` performs on
+        every future successful Twitch announcement, so both paths produce identical
+        `content_events`/`content_deliveries` rows. `content_events` is a plain upsert
+        (safe to refresh state/timestamps on replay); `content_deliveries` is an
+        `INSERT OR IGNORE` at `transition_seq = 1` already marked `delivered` with the
+        real Discord ids — replaying this call, or racing the historical migration
+        against a live mirror for the same identity, can never insert a second delivery
+        row or change an already-recorded message id, so nothing is ever re-announced.
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction(immediate=True):
+            await self._connection.execute(
+                """
+                INSERT INTO content_events (
+                    guild_id, account_id, platform, external_id, content_kind, state,
+                    canonical_url, title, published_at, first_observed_at, last_observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, platform, external_id) DO UPDATE SET
+                    state = excluded.state,
+                    title = excluded.title,
+                    last_observed_at = excluded.last_observed_at
+                """,
+                (
+                    guild_id,
+                    account_id,
+                    platform.value,
+                    external_id,
+                    content_kind.value,
+                    state.value,
+                    canonical_url,
+                    title,
+                    _stored_timestamp(published_at),
+                    first_observed_at.isoformat(),
+                    last_observed_at.isoformat(),
+                ),
+            )
+            now_text = last_observed_at.isoformat()
+            await self._connection.execute(
+                """
+                INSERT OR IGNORE INTO content_deliveries (
+                    guild_id, platform, external_id, transition_seq, account_id, status,
+                    attempt, discord_channel_id, discord_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, 'delivered', 1, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    platform.value,
+                    external_id,
+                    account_id,
+                    channel_id,
+                    message_id,
+                    now_text,
+                    now_text,
+                ),
+            )

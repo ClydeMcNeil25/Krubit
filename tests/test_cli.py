@@ -81,16 +81,27 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
         )
 
         assert {command.name for command in fetch.commands} == {
-            "status", "test-card", "server-health", "changes",
-            "permissions", "integrations", "backup", "live",
-            "creator", "notifications", "latest", "schedule",
+            "status",
+            "test-card",
+            "server-health",
+            "changes",
+            "permissions",
+            "integrations",
+            "backup",
+            "live",
+            "creator",
+            "notifications",
+            "latest",
+            "schedule",
         }
         backup = cast(
             app_commands.Group,
             next(command for command in fetch.commands if command.name == "backup"),
         )
         assert {command.name for command in backup.commands} == {
-            "status", "create", "preview",
+            "status",
+            "create",
+            "preview",
         }
     finally:
         await bot.close()
@@ -183,12 +194,22 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
         async def initialize(self) -> None:
             return None
 
+        async def list_live_signal_guild_ids(self) -> list[int]:
+            return []
+
         async def close(self) -> None:
             closed.append("store")
 
     class FakeConnector:
         async def close(self) -> None:
             closed.append("connector")
+
+    class FakeSession:
+        def __init__(self, *, connector: FakeConnector) -> None:
+            self.connector = connector
+
+        async def close(self) -> None:
+            closed.append("session")
 
     class FakeBot:
         def __init__(self, *args: object, connector: FakeConnector, **kwargs: object) -> None:
@@ -209,13 +230,14 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
 
     monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
     monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
     monkeypatch.setattr(cli, "KrubitBot", FakeBot)
     settings = Settings(application_id=123, database_path=tmp_path / "krubit.db", bot_token="token")
 
     with pytest.raises(RuntimeError, match="start failure"):
         await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
 
-    assert closed == ["bot", "store", "connector"]
+    assert closed == ["bot", "store", "connector", "session", "connector"]
 
 
 @pytest.mark.asyncio

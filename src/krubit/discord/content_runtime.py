@@ -22,8 +22,19 @@ to no mention without ever blocking or duplicating the underlying delivery.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable
-from datetime import UTC, datetime
+import random
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -37,13 +48,17 @@ from krubit.discord.content_cards import (
     build_social_card,
 )
 from krubit.domain.creator_signals import (
+    CapabilityState,
     ContentDelivery,
     ContentEvent,
     ContentKind,
     ContentPlan,
+    CreatorAccount,
     CreatorRoute,
     Platform,
 )
+from krubit.integrations.base import Connector, ConnectorFailure, ConnectorFailureKind
+from krubit.services.content_signals import ContentSignalService
 from krubit.services.notification_policy import (
     DeliveryDecision,
     DeliveryDisposition,
@@ -51,7 +66,7 @@ from krubit.services.notification_policy import (
     MentionKind,
     NotificationPolicy,
 )
-from krubit.storage.sqlite import SQLiteStore
+from krubit.storage.sqlite import ContentScheduleState, SQLiteStore
 
 _HISTORY_RECOVERY_LIMIT = 25
 _RETRACTED_NOTICE = "⚠️ This announcement was retracted by a moderator."
@@ -261,9 +276,7 @@ class ContentRuntime:
         at = self._now()
         is_live = event.content_kind is ContentKind.LIVE
         budget_kind = "live_everyone" if is_live else "social_role"
-        limit = (
-            policy.live_everyone_budget.limit if is_live else policy.social_role_budget.limit
-        )
+        limit = policy.live_everyone_budget.limit if is_live else policy.social_role_budget.limit
 
         async def claim_mention() -> bool:
             if limit is None:
@@ -292,9 +305,7 @@ class ContentRuntime:
             ):
                 if (platform, external_id) == (event.platform, event.external_id):
                     continue
-                member_event = await self._store.get_content_event(
-                    guild_id, platform, external_id
-                )
+                member_event = await self._store.get_content_event(guild_id, platform, external_id)
                 if member_event is None:
                     continue
                 members.append(await self._group_member(guild_id, member_event))
@@ -485,3 +496,211 @@ async def _find_nonce_message(
 def delivery_id_for(platform: Platform, external_id: str, transition_seq: int) -> str:
     """The stable `delivery_id` used by `retry_delivery`/`retract_delivery`."""
     return f"{platform.value}:{external_id}:{transition_seq}"
+
+
+# --- Connector polling scheduler ------------------------------------------------
+#
+# Default healthy fallback polling intervals. Fanbase is deliberately absent: its
+# connector's declared capability is permanently `UNSUPPORTED` (Task 10 made
+# `FanbaseConnector.fetch_page` always raise `UnsupportedConnectorError`), so the
+# caller wiring `ConnectorScheduler` (`krubit.discord.bot`) never puts a `FANBASE`
+# entry in `connectors` — with no entry, `run_cycle` has nothing to iterate for it,
+# not even a skipped or disabled job.
+_DEFAULT_POLL_INTERVAL_SECONDS: Mapping[Platform, int] = {
+    Platform.YOUTUBE: 300,
+    Platform.X: 900,
+    Platform.BLUESKY: 120,
+    Platform.INSTAGRAM: 300,
+    Platform.FACEBOOK: 300,
+    Platform.FACEBOOK_PAGE: 300,
+    Platform.THREADS: 300,
+    Platform.TIKTOK: 300,
+}
+_MAX_POLL_INTERVAL_SECONDS = 6 * 60 * 60
+_DEFAULT_CONNECTOR_CONCURRENCY = 3
+_BACKOFF_JITTER_FRACTION = 0.2
+
+_SCHEDULER_FAILURE_STATE: Mapping[ConnectorFailureKind, CapabilityState] = {
+    ConnectorFailureKind.AUTHORIZATION: CapabilityState.AUTHORIZATION_REQUIRED,
+    ConnectorFailureKind.RATE_LIMITED: CapabilityState.DEGRADED,
+    ConnectorFailureKind.QUOTA_EXCEEDED: CapabilityState.QUOTA_LIMITED,
+    ConnectorFailureKind.UNAVAILABLE: CapabilityState.DEGRADED,
+    ConnectorFailureKind.INVALID_RESPONSE: CapabilityState.DEGRADED,
+    ConnectorFailureKind.TIMEOUT: CapabilityState.DEGRADED,
+    ConnectorFailureKind.NOT_FOUND: CapabilityState.DEGRADED,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerResult:
+    """One account's most recent poll outcome, as `ConnectorScheduler.result` reports it."""
+
+    guild_id: int
+    platform: Platform
+    account_id: str | None
+    state: CapabilityState
+    detail: str | None = None
+
+
+def _classify_scheduler_failure(
+    exc: Exception,
+) -> tuple[CapabilityState, str | None, float | None]:
+    """Classify a connector job failure without depending on any one connector module.
+
+    Every concrete connector raises its own `*ConnectorError` wrapping a classified
+    `ConnectorFailure` (see `krubit.integrations.x.XConnectorError` and its siblings);
+    rather than import each of those exception types here, this duck-types the shared
+    shape (`.failure: ConnectorFailure`) so a future connector needs no scheduler
+    change to report health correctly. `retry_after_seconds` is the forward-compatible
+    hook a connector can set on its own exception (none currently do — no connector
+    module surfaces a numeric rate-limit reset today) so a future one can hand the
+    scheduler an exact resume time; `_next_interval` never schedules sooner than it.
+    """
+    failure = getattr(exc, "failure", None)
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    retry_after_seconds = float(retry_after) if isinstance(retry_after, int | float) else None
+    if isinstance(failure, ConnectorFailure):
+        return (
+            _SCHEDULER_FAILURE_STATE.get(failure.kind, CapabilityState.DEGRADED),
+            failure.safe_detail,
+            retry_after_seconds,
+        )
+    return CapabilityState.DEGRADED, "the connector raised an unexpected error", retry_after_seconds
+
+
+class ConnectorScheduler:
+    """Poll every enrolled, non-paused account's connector on a durable schedule.
+
+    One bounded `asyncio.Semaphore` per platform (default 3, overridable via
+    `concurrency_limits`) caps how many accounts *on that platform* are ever fetched
+    concurrently; different platforms always run fully in parallel. Each account's poll
+    is its own isolated job: `_poll_once`'s `try`/`except` classifies and records a
+    connector failure without raising, and `_poll_account`'s outer `try`/`except` is a
+    second isolation layer against anything else going wrong (for example the
+    durable-schedule write itself). Because `run_cycle` gathers every job and no job
+    ever raises out of its own coroutine, one guild's or one platform's failing
+    connector can never cancel, delay, or otherwise affect any other guild's or
+    platform's job in the same cycle — including other accounts on the very same
+    platform, since each holds the shared semaphore only for its own fetch.
+
+    `next_poll_at` is read from and written to `SQLiteStore.content_schedule` on every
+    poll, so a fresh `ConnectorScheduler` built after a restart (a new process, a new
+    instance in a test) honors exactly the backoff the previous instance computed
+    rather than polling early just because in-memory state was lost.
+    """
+
+    def __init__(
+        self,
+        store: SQLiteStore,
+        connectors: Mapping[Platform, Connector],
+        *,
+        guild_ids: Callable[[], Sequence[int]],
+        signals: ContentSignalService | None = None,
+        now: Callable[[], datetime] | None = None,
+        jitter: Callable[[], float] | None = None,
+        default_intervals: Mapping[Platform, int] | None = None,
+        concurrency_limits: Mapping[Platform, int] | None = None,
+        on_plans: Callable[[int, tuple[ContentPlan, ...]], Awaitable[None]] | None = None,
+    ) -> None:
+        self._store = store
+        self._connectors = dict(connectors)
+        self._guild_ids = guild_ids
+        self._signals = signals or ContentSignalService(store)
+        self._now = now or (lambda: datetime.now(UTC))
+        self._jitter = jitter or (lambda: random.uniform(0.0, _BACKOFF_JITTER_FRACTION))
+        self._intervals = {**_DEFAULT_POLL_INTERVAL_SECONDS, **(default_intervals or {})}
+        self._semaphores = {
+            platform: asyncio.Semaphore(
+                (concurrency_limits or {}).get(platform, _DEFAULT_CONNECTOR_CONCURRENCY)
+            )
+            for platform in self._connectors
+        }
+        self._on_plans = on_plans
+        self._results: dict[tuple[int, Platform], SchedulerResult] = {}
+
+    def result(self, guild_id: int, platform: Platform) -> SchedulerResult | None:
+        """The most recent poll outcome for one guild+platform, or `None` if never polled."""
+        return self._results.get((guild_id, platform))
+
+    async def run_cycle(self) -> None:
+        """Poll every due, non-paused, connector-backed account exactly once."""
+        jobs: list[Coroutine[object, object, None]] = []
+        for guild_id in self._guild_ids():
+            for account in await self._store.list_creator_accounts(guild_id):
+                if account.paused or account.platform not in self._connectors:
+                    continue
+                jobs.append(self._poll_account(guild_id, account))
+        if jobs:
+            await asyncio.gather(*jobs)
+
+    async def _poll_account(self, guild_id: int, account: CreatorAccount) -> None:
+        async with self._semaphores[account.platform]:
+            # Isolation boundary: nothing this job does (including the connector fetch
+            # already isolated inside `_poll_once`) may ever propagate through
+            # `asyncio.gather` and affect any other guild's or platform's job.
+            with suppress(Exception):
+                await self._poll_once(guild_id, account)
+
+    async def _poll_once(self, guild_id: int, account: CreatorAccount) -> None:
+        now = self._now()
+        schedule = await self._store.get_content_schedule(
+            guild_id, account.account_id, account.platform
+        )
+        if schedule is not None and schedule.next_poll_at > now:
+            self._results[(guild_id, account.platform)] = SchedulerResult(
+                guild_id,
+                account.platform,
+                account.account_id,
+                schedule.last_state,
+                schedule.last_detail,
+            )
+            return
+        connector = self._connectors[account.platform]
+        consecutive_failures = schedule.consecutive_failures if schedule is not None else 0
+        retry_after: float | None = None
+        try:
+            cursor = await self._store.get_content_cursor(guild_id, account.account_id)
+            page = await connector.fetch_page(account, cursor=cursor.value if cursor else None)
+            ingestion = await self._signals.ingest_page(account, page, now=now)
+            state, detail = CapabilityState.READY, None
+            consecutive_failures = 0
+            if self._on_plans is not None and ingestion.plans:
+                await self._on_plans(guild_id, ingestion.plans)
+        except Exception as exc:
+            state, detail, retry_after = _classify_scheduler_failure(exc)
+            consecutive_failures += 1
+        interval = self._next_interval(account.platform, consecutive_failures, retry_after)
+        next_poll_at = now + timedelta(seconds=interval)
+        await self._store.save_content_schedule(
+            ContentScheduleState(
+                guild_id=guild_id,
+                account_id=account.account_id,
+                platform=account.platform,
+                next_poll_at=next_poll_at,
+                interval_seconds=interval,
+                consecutive_failures=consecutive_failures,
+                last_state=state,
+                last_detail=detail,
+                updated_at=now,
+            )
+        )
+        self._results[(guild_id, account.platform)] = SchedulerResult(
+            guild_id, account.platform, account.account_id, state, detail
+        )
+
+    def _next_interval(
+        self, platform: Platform, consecutive_failures: int, retry_after: float | None
+    ) -> int:
+        """The next poll delay: exponential backoff with jitter, floored by
+        whatever resume time the connector itself reported — this never produces a
+        faster loop than the connector actually allows, even though today's
+        connectors never report one (see `_classify_scheduler_failure`)."""
+        base = self._intervals.get(platform, 300)
+        backoff = (
+            min(base * (2 ** min(consecutive_failures, 6)), _MAX_POLL_INTERVAL_SECONDS)
+            if consecutive_failures > 0
+            else base
+        )
+        if retry_after is not None:
+            backoff = max(backoff, retry_after)
+        return max(1, round(backoff * (1 + self._jitter())))

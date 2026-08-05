@@ -99,9 +99,7 @@ def extract_streaming_observation(
             continue
         started = getattr(activity, "start", None)
         started_at = (
-            started
-            if isinstance(started, datetime) and started.tzinfo is not None
-            else None
+            started if isinstance(started, datetime) and started.tzinfo is not None else None
         )
         return YouTubeStreamingPresence(
             guild_id=member.guild.id,
@@ -520,9 +518,11 @@ class LiveSignalRuntime:
 
     @staticmethod
     def _role_is_usable(guild: discord.Guild, role: discord.Role) -> bool:
-        return not getattr(role, "managed", False) and _role_position(role) < _role_position(
-            guild.me.top_role
-        ) and bool(getattr(guild.me.guild_permissions, "manage_roles", False))
+        return (
+            not getattr(role, "managed", False)
+            and _role_position(role) < _role_position(guild.me.top_role)
+            and bool(getattr(guild.me.guild_permissions, "manage_roles", False))
+        )
 
 
 def _is_text_channel(channel: object | None) -> bool:

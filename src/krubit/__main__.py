@@ -14,10 +14,38 @@ import aiohttp
 from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
 from krubit.discord.install import install_url
+from krubit.domain.creator_signals import Platform
+from krubit.integrations.base import Connector
+from krubit.integrations.bluesky import BlueskyConnector
 from krubit.integrations.twitch import TwitchHelixClient
+from krubit.integrations.x import XConnector
+from krubit.integrations.youtube import YouTubeConnector
 from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
+from krubit.services.live_signals import migrate_all_twitch_content
 from krubit.storage.sqlite import SQLiteStore
+
+
+def _build_content_connectors(
+    settings: Settings, session: aiohttp.ClientSession
+) -> dict[Platform, Connector]:
+    """Build the statically-credentialed connectors `ConnectorScheduler` can poll.
+
+    Only the platforms with a single bot-wide credential in `Settings` are wired here:
+    YouTube (API key), X (bearer token), and Bluesky (no credential at all). Meta and
+    TikTok connectors need one access token *per enrolled creator account* resolved
+    from `connector_authorizations`/`CredentialVault` at poll time, not one fixed
+    bot-wide token — that per-account credential resolution is a distinct feature this
+    task does not build, so those platforms are intentionally left unscheduled for now
+    rather than wired with a token that cannot be correct for more than one account.
+    """
+    connectors: dict[Platform, Connector] = {}
+    if settings.youtube_api_key is not None:
+        connectors[Platform.YOUTUBE] = YouTubeConnector(session, settings.youtube_api_key)
+    if settings.x_bearer_token is not None:
+        connectors[Platform.X] = XConnector(session, settings.x_bearer_token)
+    connectors[Platform.BLUESKY] = BlueskyConnector(session)
+    return connectors
 
 
 def _positive_int(value: str) -> int:
@@ -81,6 +109,8 @@ async def _run_bot(settings: Settings) -> int:
     twitch_session: aiohttp.ClientSession | None = None
     twitch_connector: aiohttp.TCPConnector | None = None
     connector: aiohttp.TCPConnector | None = None
+    content_session: aiohttp.ClientSession | None = None
+    content_tcp_connector: aiohttp.TCPConnector | None = None
     store: SQLiteStore | None = None
     bot: KrubitBot | None = None
     twitch = None
@@ -93,15 +123,36 @@ async def _run_bot(settings: Settings) -> int:
             twitch = TwitchHelixClient(twitch_session, client_id, client_secret)
         store = await SQLiteStore.open(settings.database_path)
         await store.initialize()
+        # Idempotent: safe to run on every boot, links Phase 2A Twitch history into
+        # the unified content ledger without ever re-sending anything already
+        # delivered. The Phase 2A tables themselves are never mutated by this.
+        await migrate_all_twitch_content(store)
+        content_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+        content_session = aiohttp.ClientSession(connector=content_tcp_connector)
+        content_connectors = _build_content_connectors(settings, content_session)
         connector = aiohttp.TCPConnector(ssl=system_ssl_context())
-        bot = KrubitBot(settings, FoundationService(store), connector=connector, twitch=twitch)
+        bot = KrubitBot(
+            settings,
+            FoundationService(store),
+            connector=connector,
+            twitch=twitch,
+            content_connectors=content_connectors,
+        )
         await bot.start(settings.require_token())
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
         cleanup_error: BaseException | None = None
-        for resource in (bot, store, connector, twitch_session, twitch_connector):
+        for resource in (
+            bot,
+            store,
+            connector,
+            twitch_session,
+            twitch_connector,
+            content_session,
+            content_tcp_connector,
+        ):
             if resource is None:
                 continue
             try:
