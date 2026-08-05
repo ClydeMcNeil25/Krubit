@@ -53,7 +53,7 @@ import base64
 import binascii
 import hmac
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Protocol, cast
@@ -239,10 +239,16 @@ class MetaOAuthStates:
 
 @dataclass(frozen=True, slots=True)
 class MetaOAuthGrant:
-    """An unsealed OAuth grant, held only transiently between exchange and sealing."""
+    """An unsealed OAuth grant, held only transiently between exchange and sealing.
 
-    access_token: str
-    refresh_token: str | None = None
+    `access_token` and `refresh_token` are marked `repr=False`, matching
+    `krubit.config.Settings`'s existing convention for every secret-bearing field:
+    `repr(grant)`/`str(grant)` (and anything that stringifies this object — a debug
+    log, an uncaught-exception frame dump) must never render a plaintext token.
+    """
+
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(default=None, repr=False)
     expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -307,6 +313,8 @@ class _RequestContext(Protocol):
 
 class _Session(Protocol):
     def get(self, url: str, **kwargs: object) -> _RequestContext: ...
+
+    def post(self, url: str, **kwargs: object) -> _RequestContext: ...
 
 
 _HEALTH_STATE_BY_FAILURE: Mapping[ConnectorFailureKind, CapabilityState] = {
@@ -392,6 +400,108 @@ def _canonical_or_default(value: object, default: str) -> str:
     if isinstance(value, str) and value.startswith("https://"):
         return value
     return default
+
+
+# --------------------------------------------------------------------------------
+# Authorization-code exchange: the concrete production implementation of
+# `build_meta_oauth_redirect_route`'s injectable `exchange_code` callback
+# --------------------------------------------------------------------------------
+
+_THREADS_TOKEN_EXCHANGE_URL = "https://graph.threads.net/oauth/access_token"
+
+_TOKEN_EXCHANGE_URL_BY_PLATFORM: Mapping[Platform, str] = {
+    Platform.INSTAGRAM: f"{GRAPH_BASE}/oauth/access_token",
+    Platform.FACEBOOK_PAGE: f"{GRAPH_BASE}/oauth/access_token",
+    Platform.FACEBOOK: f"{GRAPH_BASE}/oauth/access_token",
+    Platform.THREADS: _THREADS_TOKEN_EXCHANGE_URL,
+}
+
+
+async def exchange_authorization_code(
+    session: object,
+    *,
+    platform: Platform,
+    code: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    now: Callable[[], datetime] = _utc_now,
+) -> MetaOAuthGrant:
+    """Exchange a Meta authorization code for an access token.
+
+    This is the concrete, real-HTTP-call implementation `build_meta_oauth_redirect_route`'s
+    `exchange_code` parameter is meant to be wired to in production — the same
+    injectable-`_Session` pattern `_graph_get` uses for every other Graph API call in
+    this module, but for `POST {GRAPH_BASE}/oauth/access_token` (or the Threads host's
+    equivalent endpoint) with the standard `client_id`/`client_secret`/`redirect_uri`/
+    `code` body. A caller still supplies its own `exchange_code` callable for
+    testability (matching this codebase's dependency-injection conventions elsewhere);
+    that callable is expected to be a thin partial application of this function bound
+    to a real session and the operator's app credentials.
+
+    Any non-2xx or malformed response is classified into the same `ConnectorFailure`
+    taxonomy `_graph_get` produces: 429 (or a Graph rate-limit error code) ->
+    `RATE_LIMITED`; any other non-success status (an invalid/expired code, an invalid
+    client secret, or any other rejection at the token endpoint all present this way)
+    -> `AUTHORIZATION`; a malformed 200 response missing `access_token` ->
+    `INVALID_RESPONSE`.
+    """
+    url = _TOKEN_EXCHANGE_URL_BY_PLATFORM[platform]
+    session_obj = cast(_Session, session)
+    request_data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "code": code,
+    }
+
+    def fail(failure: ConnectorFailure) -> MetaConnectorError:
+        return MetaConnectorError(failure)
+
+    try:
+        async with session_obj.post(url, data=request_data) as response:
+            try:
+                payload = await response.json()
+            except (
+                aiohttp.ClientPayloadError,
+                aiohttp.ContentTypeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise fail(ConnectorFailure.invalid_response()) from exc
+            status = response.status
+    except TimeoutError as exc:
+        raise fail(ConnectorFailure.timeout()) from exc
+    except aiohttp.ClientError as exc:
+        raise fail(ConnectorFailure.unavailable()) from exc
+
+    mapped_payload = _mapping(payload)
+    if status == 200 and mapped_payload is not None and "error" not in mapped_payload:
+        access_token = mapped_payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise fail(ConnectorFailure.invalid_response())
+        refresh_token = mapped_payload.get("refresh_token")
+        expires_in = mapped_payload.get("expires_in")
+        expires_at = (
+            now() + timedelta(seconds=expires_in)
+            if isinstance(expires_in, int) and expires_in > 0
+            else None
+        )
+        return MetaOAuthGrant(
+            access_token=access_token,
+            refresh_token=(
+                refresh_token if isinstance(refresh_token, str) and refresh_token else None
+            ),
+            expires_at=expires_at,
+        )
+
+    code_value = _graph_error_code(mapped_payload)
+    if status == 429 or code_value in _GRAPH_RATE_LIMIT_ERROR_CODES:
+        raise fail(ConnectorFailure.rate_limited())
+    has_error = mapped_payload is not None and "error" in mapped_payload
+    if status in {400, 401, 403} or has_error:
+        raise fail(ConnectorFailure.authorization())
+    raise fail(ConnectorFailure.invalid_response())
 
 
 # --------------------------------------------------------------------------------
@@ -900,6 +1010,11 @@ def build_meta_oauth_redirect_route(
     Meta itself. The state is validated and single-use-consumed via
     `oauth_states.consume` *before* `exchange_code` is ever called, so a replayed or
     forged redirect can never trigger a token exchange.
+
+    `exchange_code` is injectable for testability, but production wiring should bind
+    it to `exchange_authorization_code` (this module's concrete, real-HTTP-call
+    implementation) with a real session and the operator's app credentials, e.g.
+    `functools.partial(exchange_authorization_code, session, client_id=..., ...)`.
     """
 
     async def handle_redirect(query: Mapping[str, str]) -> str:

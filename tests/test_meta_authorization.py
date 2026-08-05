@@ -11,11 +11,14 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from krubit.domain.creator_signals import Capability, Platform, RecognizedAccountUrl
+from krubit.integrations.base import ConnectorFailureKind
 from krubit.integrations.meta import (
+    MetaConnectorError,
     MetaOAuthGrant,
     MetaOAuthStates,
     build_meta_deauthorization_route,
     build_meta_oauth_redirect_route,
+    exchange_authorization_code,
     open_oauth_grant,
     seal_oauth_grant,
     verify_meta_signed_request,
@@ -108,6 +111,188 @@ def test_oauth_grant_without_refresh_token_or_expiry_round_trips() -> None:
 
     reopened = open_oauth_grant(vault, seal_oauth_grant(vault, grant))
     assert reopened == grant
+
+
+def test_meta_oauth_grant_repr_and_str_never_leak_the_tokens() -> None:
+    grant = MetaOAuthGrant(
+        access_token="ig-secret-access-token",
+        refresh_token="ig-secret-refresh-token",
+        expires_at=NOW,
+    )
+    assert "ig-secret-access-token" not in repr(grant)
+    assert "ig-secret-access-token" not in str(grant)
+    assert "ig-secret-refresh-token" not in repr(grant)
+    assert "ig-secret-refresh-token" not in str(grant)
+
+
+# --------------------------------------------------------------------------------
+# Authorization-code exchange: the concrete production HTTP call
+# --------------------------------------------------------------------------------
+
+
+class _FakeTokenResponse:
+    def __init__(self, status: int, payload: object) -> None:
+        self.status = status
+        self.payload = payload
+
+    async def __aenter__(self) -> _FakeTokenResponse:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def json(self) -> object:
+        return self.payload
+
+
+class _FakeTokenSession:
+    def __init__(self, responses: list[_FakeTokenResponse]) -> None:
+        self.responses = responses
+        self.requests: list[tuple[str, dict[str, object]]] = []
+
+    def post(self, url: str, **kwargs: object) -> _FakeTokenResponse:
+        self.requests.append((url, kwargs))
+        return self.responses.pop(0)
+
+
+INSTAGRAM_TOKEN_RESPONSE_FIXTURE = {
+    "access_token": "ig-real-long-lived-access-token",
+    "token_type": "bearer",
+    "expires_in": 5_184_000,
+}
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_maps_a_successful_token_response() -> None:
+    session = _FakeTokenSession([_FakeTokenResponse(200, INSTAGRAM_TOKEN_RESPONSE_FIXTURE)])
+
+    grant = await exchange_authorization_code(
+        session,
+        platform=Platform.INSTAGRAM,
+        code="auth-code-abc",
+        client_id="app-id",
+        client_secret="app-secret",
+        redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+        now=lambda: NOW,
+    )
+
+    assert grant.access_token == "ig-real-long-lived-access-token"
+    assert grant.expires_at == NOW + timedelta(seconds=5_184_000)
+
+    url, kwargs = session.requests[0]
+    assert url == "https://graph.facebook.com/v19.0/oauth/access_token"
+    data = kwargs["data"]
+    assert data == {
+        "client_id": "app-id",
+        "client_secret": "app-secret",
+        "redirect_uri": "https://bot.example.com/callbacks/meta/oauth",
+        "code": "auth-code-abc",
+    }
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_uses_the_threads_token_endpoint() -> None:
+    session = _FakeTokenSession(
+        [_FakeTokenResponse(200, {"access_token": "threads-real-access-token"})]
+    )
+
+    grant = await exchange_authorization_code(
+        session,
+        platform=Platform.THREADS,
+        code="auth-code-xyz",
+        client_id="app-id",
+        client_secret="app-secret",
+        redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+        now=lambda: NOW,
+    )
+
+    assert grant.access_token == "threads-real-access-token"
+    assert grant.expires_at is None
+    url, _ = session.requests[0]
+    assert url == "https://graph.threads.net/oauth/access_token"
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_raises_authorization_on_invalid_code() -> None:
+    payload = {
+        "error": {
+            "message": "Invalid verification code format.",
+            "type": "OAuthException",
+            "code": 100,
+        }
+    }
+    session = _FakeTokenSession([_FakeTokenResponse(400, payload)])
+
+    with pytest.raises(MetaConnectorError) as excinfo:
+        await exchange_authorization_code(
+            session,
+            platform=Platform.INSTAGRAM,
+            code="already-used-or-expired-code",
+            client_id="app-id",
+            client_secret="app-secret",
+            redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+            now=lambda: NOW,
+        )
+    assert excinfo.value.failure.kind is ConnectorFailureKind.AUTHORIZATION
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_raises_authorization_on_invalid_client_secret() -> None:
+    payload = {
+        "error": {
+            "message": "Error validating application. Invalid application ID.",
+            "type": "OAuthException",
+            "code": 101,
+        }
+    }
+    session = _FakeTokenSession([_FakeTokenResponse(401, payload)])
+
+    with pytest.raises(MetaConnectorError) as excinfo:
+        await exchange_authorization_code(
+            session,
+            platform=Platform.INSTAGRAM,
+            code="auth-code-abc",
+            client_id="app-id",
+            client_secret="wrong-app-secret",
+            redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+            now=lambda: NOW,
+        )
+    assert excinfo.value.failure.kind is ConnectorFailureKind.AUTHORIZATION
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_raises_rate_limited_on_throttling() -> None:
+    payload = {"error": {"message": "Too many calls", "type": "OAuthException", "code": 4}}
+    session = _FakeTokenSession([_FakeTokenResponse(400, payload)])
+
+    with pytest.raises(MetaConnectorError) as excinfo:
+        await exchange_authorization_code(
+            session,
+            platform=Platform.INSTAGRAM,
+            code="auth-code-abc",
+            client_id="app-id",
+            client_secret="app-secret",
+            redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+            now=lambda: NOW,
+        )
+    assert excinfo.value.failure.kind is ConnectorFailureKind.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_exchange_authorization_code_raises_invalid_response_without_access_token() -> None:
+    session = _FakeTokenSession([_FakeTokenResponse(200, {"token_type": "bearer"})])
+
+    with pytest.raises(MetaConnectorError) as excinfo:
+        await exchange_authorization_code(
+            session,
+            platform=Platform.INSTAGRAM,
+            code="auth-code-abc",
+            client_id="app-id",
+            client_secret="app-secret",
+            redirect_uri="https://bot.example.com/callbacks/meta/oauth",
+            now=lambda: NOW,
+        )
+    assert excinfo.value.failure.kind is ConnectorFailureKind.INVALID_RESPONSE
 
 
 # --------------------------------------------------------------------------------
