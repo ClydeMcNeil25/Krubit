@@ -29,7 +29,7 @@ class CreatorAuthorityError(PermissionError):
     """Raised when the acting member lacks authority for a creator registry action."""
 
 
-def _require_authority(
+def require_creator_authority(
     *,
     actor_member_id: int,
     owner_member_id: int,
@@ -42,6 +42,12 @@ def _require_authority(
     pause, resume, transfer, route, or template any guild creator account. Members
     with the configured Creator role may manage only accounts owned by their own
     Discord member identity."
+
+    Public so every command surface that mutates a creator-owned resource (registry
+    mutation here, and routes/templates/delivery retry-retract in
+    `krubit.discord.content_commands`) enforces the identical authority rule rather
+    than each maintaining its own copy — this module remains the single place that
+    rule is defined.
     """
     if actor_is_admin:
         return
@@ -53,6 +59,10 @@ def _require_authority(
         raise CreatorAuthorityError(
             "self-service creator management requires the configured Creator role"
         )
+
+
+# Backward-compatible private alias for in-module use.
+_require_authority = require_creator_authority
 
 
 class CreatorRegistry:

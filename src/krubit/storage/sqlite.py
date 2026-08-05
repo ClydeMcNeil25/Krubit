@@ -168,6 +168,22 @@ class ScheduledEventMapping:
     updated_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class CreatorBootstrap:
+    """One guild's once-resolved creator-notification resources.
+
+    `creator_role_id` and `notification_channel_id` are resolved by exact Discord name
+    a single time (see `krubit.discord.content_commands`) and then persisted here so
+    every later lookup uses the stable ID rather than re-searching by a mutable name.
+    """
+
+    guild_id: int
+    creator_role_id: int
+    notification_channel_id: int
+    created_at: datetime
+    updated_at: datetime
+
+
 _CONTENT_DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
 
 
@@ -525,6 +541,14 @@ class SQLiteStore:
                 PRIMARY KEY (guild_id, platform, external_id),
                 FOREIGN KEY (guild_id, account_id)
                     REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS creator_bootstrap (
+                guild_id INTEGER PRIMARY KEY,
+                creator_role_id INTEGER NOT NULL,
+                notification_channel_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -2493,6 +2517,102 @@ class SQLiteStore:
             discord_status=str(row["discord_status"]),
             owned_by_krubit=bool(row["owned_by_krubit"]),
             content_hash=str(row["content_hash"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    async def list_recent_content_events(
+        self, guild_id: int, account_id: str, *, limit: int = 10
+    ) -> list[ContentEvent]:
+        """The account's most recently observed content items, newest first."""
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_events
+            WHERE guild_id = ? AND account_id = ?
+            ORDER BY last_observed_at DESC
+            LIMIT ?
+            """,
+            (guild_id, account_id, limit),
+        )
+        events = [content_event_from_row(row) for row in await cursor.fetchall()]
+        return [event for event in events if event is not None]
+
+    async def list_content_deliveries_for_account(
+        self, guild_id: int, account_id: str
+    ) -> list[ContentDelivery]:
+        """Every delivery ever claimed for one creator account, oldest first.
+
+        Unlike `list_content_deliveries` (one content item's claim history), this spans
+        every content item the account has ever published/gone live for — the basis for
+        `CreatorAnalyticsService`'s factual delivery counts and latency.
+        """
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_deliveries
+            WHERE guild_id = ? AND account_id = ?
+            ORDER BY created_at ASC, platform ASC, external_id ASC, transition_seq ASC
+            """,
+            (guild_id, account_id),
+        )
+        deliveries = [content_delivery_from_row(row) for row in await cursor.fetchall()]
+        return [delivery for delivery in deliveries if delivery is not None]
+
+    async def save_creator_bootstrap(
+        self,
+        *,
+        guild_id: int,
+        creator_role_id: int,
+        notification_channel_id: int,
+        now: datetime,
+    ) -> CreatorBootstrap:
+        """Persist a guild's once-resolved creator role/channel IDs.
+
+        Resolution by exact Discord name happens exactly once per guild; every later
+        call reuses the stored IDs (see `get_creator_bootstrap`) rather than searching
+        again, so a same-named role or channel created later never silently swaps in.
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO creator_bootstrap (
+                    guild_id, creator_role_id, notification_channel_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    creator_role_id = excluded.creator_role_id,
+                    notification_channel_id = excluded.notification_channel_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    creator_role_id,
+                    notification_channel_id,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+        saved = await self.get_creator_bootstrap(guild_id)
+        if saved is None:
+            raise RuntimeError("saved creator bootstrap could not be read")
+        return saved
+
+    async def get_creator_bootstrap(self, guild_id: int) -> CreatorBootstrap | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM creator_bootstrap WHERE guild_id = ?",
+            (guild_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return CreatorBootstrap(
+            guild_id=int(row["guild_id"]),
+            creator_role_id=int(row["creator_role_id"]),
+            notification_channel_id=int(row["notification_channel_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )

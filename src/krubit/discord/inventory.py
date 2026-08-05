@@ -8,7 +8,24 @@ from datetime import datetime
 import discord
 
 from krubit.domain.companion import CoverageIssue
-from krubit.domain.models import JSONValue
+from krubit.domain.creator_signals import CapabilityState
+from krubit.domain.models import Card, CardField, JSONValue
+from krubit.integrations.base import ConnectorHealth
+
+# Fixed, per-state descriptions — mirrors `ConnectorFailure.safe_detail`. Never derived
+# from `ConnectorHealth.detail`: that field is caller-supplied and, unlike
+# `ConnectorFailure`, carries no built-in redaction guarantee, so a raw provider error
+# string placed there (for example by a connector's exception handler) must never reach
+# this rendering.
+_SAFE_CAPABILITY_DETAIL: dict[CapabilityState, str] = {
+    CapabilityState.READY: "capability is ready",
+    CapabilityState.UNCONFIGURED: "capability is not configured",
+    CapabilityState.AUTHORIZATION_REQUIRED: "capability requires authorization",
+    CapabilityState.APPROVAL_REQUIRED: "capability requires platform approval",
+    CapabilityState.DEGRADED: "capability is degraded",
+    CapabilityState.QUOTA_LIMITED: "capability is quota limited",
+    CapabilityState.UNSUPPORTED: "capability is not supported",
+}
 
 _MUTATION_PERMISSIONS = (
     "administrator",
@@ -235,4 +252,25 @@ async def capture_inventory(
     return InventoryCapture(
         content=content,
         coverage=tuple(sorted(issues, key=lambda item: item.section)),
+    )
+
+
+def render_connector_health(health: ConnectorHealth) -> Card:
+    """Render one `ConnectorHealth` as a safe, secret-free card.
+
+    Only `capability` and `state` ever reach the returned `Card` — `health.detail` is
+    never read here, regardless of what it contains, matching the same never-echo-raw-
+    diagnostic-text discipline `ConnectorFailure.safe_detail` already enforces for
+    connector errors.
+    """
+    safe_detail = _SAFE_CAPABILITY_DETAIL[health.state]
+    description = f"{health.capability.value}: {health.state.value} — {safe_detail}"
+    return Card(
+        kind="fetched",
+        title="Fetched: Integration Status",
+        description=description,
+        fields=(
+            CardField("Capability", health.capability.value, True),
+            CardField("State", health.state.value, True),
+        ),
     )

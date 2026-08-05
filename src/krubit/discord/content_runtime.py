@@ -172,7 +172,7 @@ class ContentRuntime:
         """Re-attempt a previously failed delivery, bumping its attempt counter."""
         if not await self._store.guild_is_enabled(guild.id):
             return False
-        platform, external_id, transition_seq = _parse_delivery_id(delivery_id)
+        platform, external_id, transition_seq = parse_delivery_id(delivery_id)
         delivery = await self._store.get_content_delivery_by_seq(
             guild.id, platform, external_id, transition_seq
         )
@@ -203,7 +203,7 @@ class ContentRuntime:
         """
         if not await self._store.guild_is_enabled(guild.id):
             return False
-        platform, external_id, transition_seq = _parse_delivery_id(delivery_id)
+        platform, external_id, transition_seq = parse_delivery_id(delivery_id)
         async with self._guild_lock(guild.id):
             delivery = await self._store.get_content_delivery_by_seq(
                 guild.id, platform, external_id, transition_seq
@@ -452,10 +452,15 @@ def _delivery_nonce(
     return sha256(payload.encode()).hexdigest()[:25]
 
 
-def _parse_delivery_id(delivery_id: str) -> tuple[Platform, str, int]:
+def parse_delivery_id(delivery_id: str) -> tuple[Platform, str, int]:
     """Parse the `platform:external_id:transition_seq` id `retry_delivery`/
     `retract_delivery` are addressed by. `external_id` may itself contain `:`, so the
-    transition sequence and platform are peeled from the outside in."""
+    transition sequence and platform are peeled from the outside in.
+
+    Public so command surfaces (`krubit.discord.content_commands`) can validate a
+    staff-supplied `delivery_id` before ever calling `retry_delivery`/`retract_delivery`
+    themselves, without duplicating this parsing rule.
+    """
     remainder, _, seq_text = delivery_id.rpartition(":")
     platform_text, _, external_id = remainder.partition(":")
     try:

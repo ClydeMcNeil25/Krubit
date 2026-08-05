@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import cast
 
 from krubit.domain.companion import HealthFinding, HealthReport, SnapshotRecord
+from krubit.domain.creator_signals import CapabilityState, ContentCursor
 from krubit.domain.models import JSONValue
+from krubit.integrations.base import ConnectorHealth
+from krubit.services.creator_analytics import DeliveryCounts
 
 _SEVERITY = {"healthy": 0, "limited": 1, "warning": 2, "critical": 3}
+
+_CURSOR_STALE_AFTER = timedelta(hours=26)
+
+# A capability is only ever reported operational at READY; every other declared state
+# maps to a factual, non-editorializing severity for `/fetch creator`/`/fetch
+# integrations` findings.
+_CAPABILITY_SEVERITY: dict[CapabilityState, str] = {
+    CapabilityState.READY: "healthy",
+    CapabilityState.UNCONFIGURED: "limited",
+    CapabilityState.AUTHORIZATION_REQUIRED: "limited",
+    CapabilityState.APPROVAL_REQUIRED: "limited",
+    CapabilityState.UNSUPPORTED: "limited",
+    CapabilityState.DEGRADED: "warning",
+    CapabilityState.QUOTA_LIMITED: "warning",
+}
 
 
 def _dict(value: JSONValue | None) -> dict[str, JSONValue]:
@@ -191,3 +210,117 @@ class HealthService:
 
     def integration_health(self, snapshot: SnapshotRecord) -> HealthReport:
         return _report(_integration_findings(snapshot), snapshot.captured_at)
+
+    def creator_health(
+        self,
+        *,
+        connector_health: Iterable[ConnectorHealth],
+        cursor: ContentCursor | None,
+        delivery_counts: DeliveryCounts,
+        quota_exhausted: bool,
+        now: datetime,
+    ) -> HealthReport:
+        """Factual operational health for one registered creator account.
+
+        `connector_health` states never render anywhere beyond their `CapabilityState`
+        name here — `ConnectorHealth.detail` is caller-supplied and, unlike
+        `ConnectorFailure.safe_detail`, carries no built-in redaction guarantee, so this
+        method never reads it.
+        """
+        findings: list[HealthFinding] = []
+        for health in connector_health:
+            severity = _CAPABILITY_SEVERITY[health.state]
+            if severity == "healthy":
+                continue
+            findings.append(
+                HealthFinding(
+                    f"connector_{health.capability.value}_{health.state.value}",
+                    severity,
+                    f"{health.capability.value} capability is {health.state.value}.",
+                )
+            )
+        if cursor is None:
+            findings.append(
+                HealthFinding(
+                    "cursor_missing", "limited", "No content cursor recorded yet for this account."
+                )
+            )
+        elif now - cursor.updated_at > _CURSOR_STALE_AFTER:
+            findings.append(
+                HealthFinding(
+                    "cursor_stale",
+                    "warning",
+                    f"Content cursor last updated at {cursor.updated_at.isoformat()}.",
+                )
+            )
+        if delivery_counts.failed:
+            findings.append(
+                HealthFinding(
+                    "delivery_failed",
+                    "warning",
+                    f"{delivery_counts.failed} delivery attempt(s) currently failed.",
+                )
+            )
+        if delivery_counts.pending:
+            findings.append(
+                HealthFinding(
+                    "delivery_pending",
+                    "limited",
+                    f"{delivery_counts.pending} delivery attempt(s) still pending.",
+                )
+            )
+        if quota_exhausted:
+            findings.append(
+                HealthFinding(
+                    "quota_exhausted",
+                    "warning",
+                    "This guild's mention budget is exhausted for the current period.",
+                )
+            )
+        return _report(findings, now)
+
+    def bootstrap_health(
+        self,
+        *,
+        role_present: bool,
+        role_ambiguous: bool,
+        channel_present: bool,
+        channel_ambiguous: bool,
+        now: datetime,
+    ) -> HealthReport:
+        """Factual health for the guild's once-resolved Creator role/notification
+        channel. Ambiguous (more than one exact-name match) and missing are both
+        reported as findings — creator command surfaces never implicitly create
+        either resource."""
+        findings: list[HealthFinding] = []
+        if role_ambiguous:
+            findings.append(
+                HealthFinding(
+                    "creator_role_ambiguous",
+                    "warning",
+                    "More than one role matches the configured Creator role name.",
+                )
+            )
+        elif not role_present:
+            findings.append(
+                HealthFinding(
+                    "creator_role_missing", "warning", "The configured Creator role was not found."
+                )
+            )
+        if channel_ambiguous:
+            findings.append(
+                HealthFinding(
+                    "creator_channel_ambiguous",
+                    "warning",
+                    "More than one channel matches the configured notification channel name.",
+                )
+            )
+        elif not channel_present:
+            findings.append(
+                HealthFinding(
+                    "creator_channel_missing",
+                    "warning",
+                    "The configured creator notification channel was not found.",
+                )
+            )
+        return _report(findings, now)

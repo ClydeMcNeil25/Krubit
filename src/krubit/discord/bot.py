@@ -12,6 +12,12 @@ from discord.ext import tasks
 
 from krubit.config import Settings
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
+from krubit.discord.content_commands import (
+    ActorContext,
+    ContentCommandService,
+    CreatorCommands,
+    NotificationCommands,
+)
 from krubit.discord.events import guild_event
 from krubit.discord.install import phase_two_intents, phase_two_permissions
 from krubit.discord.inventory import InventoryCapture, capture_inventory
@@ -50,8 +56,11 @@ class FetchCommands(app_commands.Group):
         self._presence_intent = presence_intent
         self._twitch_credentials = twitch_credentials
         self._twitch_available = twitch_available
+        self._content_commands = ContentCommandService(service.store)
         self.add_command(BackupCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
+        self.add_command(CreatorCommands(self, self._content_commands))
+        self.add_command(NotificationCommands(self, self._content_commands))
 
     @property
     def snapshots(self) -> SnapshotService:
@@ -237,6 +246,48 @@ class FetchCommands(app_commands.Group):
             actor_id=actor_id,
             embed=render_health_card(report, title="Fetched: Integrations"),
             detail={"finding_count": len(report.findings)},
+        )
+
+    @app_commands.command(name="latest", description="Fetch the latest observed creator content")
+    @app_commands.guild_only()
+    async def latest(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_latest")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActorContext(
+            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+        )
+        result = await self._content_commands.latest(actor=actor)
+        assert result.card is not None
+        item_count = result.detail.get("item_count", 0)
+        await self.finish(
+            interaction,
+            action="fetch_latest",
+            actor_id=actor_id,
+            embed=render_card(result.card),
+            detail={"item_count": int(item_count) if isinstance(item_count, (int, float)) else 0},
+        )
+
+    @app_commands.command(name="schedule", description="Fetch Scheduled Event status")
+    @app_commands.guild_only()
+    async def schedule(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_schedule")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActorContext(
+            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+        )
+        result = await self._content_commands.schedule_status(actor=actor)
+        assert result.card is not None
+        count = result.detail.get("count", 0)
+        await self.finish(
+            interaction,
+            action="fetch_schedule",
+            actor_id=actor_id,
+            embed=render_card(result.card),
+            detail={"count": int(count) if isinstance(count, (int, float)) else 0},
         )
 
 
