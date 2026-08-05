@@ -18,6 +18,8 @@ _MAX_URL_LENGTH = 2_048
 _MAX_DETAIL_LENGTH = 200
 _MAX_EXTERNAL_ID_LENGTH = 200
 _MAX_ACCOUNT_ID_LENGTH = 64
+_MAX_TITLE_LENGTH = 300
+_MAX_CURSOR_LENGTH = 500
 
 
 class Platform(StrEnum):
@@ -229,3 +231,202 @@ class CreatorRoute:
         if self.mention_role_id is not None:
             _require_positive_id("mention_role_id", self.mention_role_id)
         _require_aware("updated_at", self.updated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ContentObservation:
+    """One connector-reported content item, normalized to shared vocabulary.
+
+    Produced by parsing a single raw `ConnectorPage` item. Carries no guild, account, or
+    storage identity of its own — `ContentSignalService` combines it with the ingesting
+    `CreatorAccount` to build a durable `ContentEvent`.
+    """
+
+    external_id: str
+    content_kind: ContentKind
+    state: ContentState
+    canonical_url: str
+    title: str | None = None
+    published_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _require_text("external_id", self.external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+        if type(self.content_kind) is not ContentKind:
+            raise ValueError("content_kind must be a ContentKind")
+        if type(self.state) is not ContentState:
+            raise ValueError("state must be a ContentState")
+        _require_text("canonical_url", self.canonical_url, limit=_MAX_URL_LENGTH)
+        if not self.canonical_url.startswith("https://"):
+            raise ValueError("canonical_url must use https")
+        if self.title is not None:
+            _require_text("title", self.title, limit=_MAX_TITLE_LENGTH)
+        if self.published_at is not None:
+            _require_aware("published_at", self.published_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ContentEvent:
+    """The durable ledger record for one piece of content observed for one account.
+
+    Identity is `(guild_id, platform, external_id)`, matching the storage layer's
+    `UNIQUE(guild_id, platform, external_id)` constraint. `first_observed_at` never
+    changes after creation; `last_observed_at` and `state` advance as later connector
+    pages report lifecycle changes.
+    """
+
+    guild_id: int
+    account_id: str
+    platform: Platform
+    external_id: str
+    content_kind: ContentKind
+    state: ContentState
+    canonical_url: str
+    title: str | None
+    published_at: datetime | None
+    first_observed_at: datetime
+    last_observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        if type(self.platform) is not Platform:
+            raise ValueError("platform must be a Platform")
+        _require_text("external_id", self.external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+        if type(self.content_kind) is not ContentKind:
+            raise ValueError("content_kind must be a ContentKind")
+        if type(self.state) is not ContentState:
+            raise ValueError("state must be a ContentState")
+        _require_text("canonical_url", self.canonical_url, limit=_MAX_URL_LENGTH)
+        if not self.canonical_url.startswith("https://"):
+            raise ValueError("canonical_url must use https")
+        if self.title is not None:
+            _require_text("title", self.title, limit=_MAX_TITLE_LENGTH)
+        if self.published_at is not None:
+            _require_aware("published_at", self.published_at)
+        _require_aware("first_observed_at", self.first_observed_at)
+        _require_aware("last_observed_at", self.last_observed_at)
+
+
+_LIVE_OR_PUBLISHED_STATES = frozenset({ContentState.PUBLISHED, ContentState.LIVE})
+
+
+def reaches_publish_or_live(state: ContentState) -> bool:
+    """Whether `state` counts as a claimable publish/live transition target.
+
+    Baseline ingestion never claims regardless of this check. On later pages, an event
+    claims exactly one pending delivery the first time it reaches `PUBLISHED` or `LIVE`
+    — not on every re-observation while it stays in one of those states, and not for
+    `SCHEDULED`, `DELAYED`, `ENDED`, `CANCELLED`, `CORRECTED`, `RETRACTED`, or `FAILED`.
+    """
+    return state in _LIVE_OR_PUBLISHED_STATES
+
+
+@dataclass(frozen=True, slots=True)
+class ContentCursor:
+    """A durable per-account connector cursor and its one-time baseline marker.
+
+    `baselined_at` is set once, the first time an account is ever successfully
+    ingested, and never changes afterward — it is what lets `ContentSignalService`
+    distinguish the baseline page (identities stored, nothing claimed) from every later
+    page (lifecycle changes upserted, new publish/live transitions claimed).
+    """
+
+    guild_id: int
+    account_id: str
+    platform: Platform
+    value: str | None
+    baselined_at: datetime | None
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        if type(self.platform) is not Platform:
+            raise ValueError("platform must be a Platform")
+        if self.value is not None:
+            _require_text("value", self.value, limit=_MAX_CURSOR_LENGTH)
+        if self.baselined_at is not None:
+            _require_aware("baselined_at", self.baselined_at)
+        _require_aware("updated_at", self.updated_at)
+
+
+_DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
+
+
+@dataclass(frozen=True, slots=True)
+class ContentDelivery:
+    """A durable, at-most-once claim to announce one content event.
+
+    Identity matches its `ContentEvent`'s `(guild_id, platform, external_id)`, so a
+    given piece of content can never accumulate more than one claim, however many times
+    it is observed or how many times it re-enters a publish/live state.
+    """
+
+    guild_id: int
+    platform: Platform
+    external_id: str
+    account_id: str
+    status: str
+    attempt: int
+    discord_channel_id: int | None
+    discord_message_id: int | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        if type(self.platform) is not Platform:
+            raise ValueError("platform must be a Platform")
+        _require_text("external_id", self.external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        if self.status not in _DELIVERY_STATUSES:
+            raise ValueError(f"status must be one of {sorted(_DELIVERY_STATUSES)}")
+        if self.attempt <= 0:
+            raise ValueError("attempt must be positive")
+        if self.discord_channel_id is not None:
+            _require_positive_id("discord_channel_id", self.discord_channel_id)
+        if self.discord_message_id is not None:
+            _require_positive_id("discord_message_id", self.discord_message_id)
+        _require_aware("created_at", self.created_at)
+        _require_aware("updated_at", self.updated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ContentPlan:
+    """One claimed delivery paired with the ledger event that triggered it."""
+
+    event: ContentEvent
+    delivery: ContentDelivery
+
+    def __post_init__(self) -> None:
+        if type(self.event) is not ContentEvent:
+            raise ValueError("event must be a ContentEvent")
+        if type(self.delivery) is not ContentDelivery:
+            raise ValueError("delivery must be a ContentDelivery")
+        if (
+            self.event.guild_id != self.delivery.guild_id
+            or self.event.platform != self.delivery.platform
+            or self.event.external_id != self.delivery.external_id
+        ):
+            raise ValueError("delivery must share its event's guild, platform, and external_id")
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionResult:
+    """The outcome of ingesting one connector page for one account.
+
+    `plans` holds one `ContentPlan` per item that newly claimed a pending delivery this
+    page, in the order those items appeared in the page. It is empty for a baseline page
+    and empty for a later page whose items are all no-op re-observations.
+    """
+
+    account_id: str
+    cursor: ContentCursor
+    plans: tuple[ContentPlan, ...]
+
+    def __post_init__(self) -> None:
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        if type(self.cursor) is not ContentCursor:
+            raise ValueError("cursor must be a ContentCursor")
+        if type(self.plans) is not tuple:
+            raise ValueError("plans must be a tuple")

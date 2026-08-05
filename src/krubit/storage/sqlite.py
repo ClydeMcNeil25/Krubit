@@ -16,7 +16,19 @@ from uuid import uuid4
 import aiosqlite
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
-from krubit.domain.creator_signals import CreatorAccount, CreatorProfile, CreatorRoute
+from krubit.domain.creator_signals import (
+    ContentCursor,
+    ContentDelivery,
+    ContentEvent,
+    ContentObservation,
+    ContentPlan,
+    ContentState,
+    CreatorAccount,
+    CreatorProfile,
+    CreatorRoute,
+    Platform,
+    reaches_publish_or_live,
+)
 from krubit.domain.live_signals import (
     LiveSignalConfig,
     LiveSignalSession,
@@ -26,6 +38,9 @@ from krubit.domain.live_signals import (
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
 from krubit.security.redaction import redact
 from krubit.storage.creator_rows import (
+    content_cursor_from_row,
+    content_delivery_from_row,
+    content_event_from_row,
     creator_account_from_row,
     creator_profile_from_row,
     creator_route_from_row,
@@ -85,6 +100,25 @@ class CreatorRegistryReceipt:
     account_id: str | None
     action: str
     actor_member_id: int
+    detail: dict[str, JSONValue]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ContentReceipt:
+    """A guild-scoped, redacted diagnostic record for the content ledger.
+
+    Storage-only view type, matching the `CreatorRegistryReceipt` convention: every row
+    documents an ingestion-time decision (most commonly a malformed connector item that
+    was skipped rather than delivered), not a mutable domain entity.
+    """
+
+    guild_id: int
+    receipt_id: str
+    account_id: str | None
+    platform: Platform | None
+    external_id: str | None
+    action: str
     detail: dict[str, JSONValue]
     created_at: datetime
 
@@ -311,6 +345,97 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_creator_registry_receipts_guild_account
                 ON creator_registry_receipts (guild_id, account_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS content_events (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                title TEXT,
+                published_at TEXT,
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, platform, external_id),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_content_events_guild_account
+                ON content_events (guild_id, account_id, last_observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS content_cursors (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                cursor_value TEXT,
+                baselined_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS content_deliveries (
+                guild_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
+                discord_channel_id INTEGER,
+                discord_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, platform, external_id),
+                FOREIGN KEY (guild_id, platform, external_id)
+                    REFERENCES content_events (guild_id, platform, external_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_content_deliveries_guild_status
+                ON content_deliveries (guild_id, status, created_at ASC);
+
+            CREATE TABLE IF NOT EXISTS content_delivery_attempts (
+                guild_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL CHECK (attempt > 0),
+                status TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, platform, external_id, attempt),
+                FOREIGN KEY (guild_id, platform, external_id)
+                    REFERENCES content_deliveries (guild_id, platform, external_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS content_correlations (
+                guild_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                correlation_group TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, platform, external_id),
+                FOREIGN KEY (guild_id, platform, external_id)
+                    REFERENCES content_events (guild_id, platform, external_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS content_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                account_id TEXT,
+                platform TEXT,
+                external_id TEXT,
+                action TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_content_receipts_guild_created
+                ON content_receipts (guild_id, created_at DESC);
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -1576,6 +1701,284 @@ class SQLiteStore:
             account_id=str(stored_account_id) if stored_account_id is not None else None,
             action=str(row["action"]),
             actor_member_id=int(row["actor_member_id"]),
+            detail=_json_object(json.loads(str(row["detail_json"]))),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    async def get_content_cursor(self, guild_id: int, account_id: str) -> ContentCursor | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM content_cursors WHERE guild_id = ? AND account_id = ?",
+            (guild_id, account_id),
+        )
+        return content_cursor_from_row(await cursor.fetchone())
+
+    async def get_content_event(
+        self, guild_id: int, platform: Platform, external_id: str
+    ) -> ContentEvent | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_events
+            WHERE guild_id = ? AND platform = ? AND external_id = ?
+            """,
+            (guild_id, platform.value, external_id),
+        )
+        return content_event_from_row(await cursor.fetchone())
+
+    async def get_content_delivery(
+        self, guild_id: int, platform: Platform, external_id: str
+    ) -> ContentDelivery | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_deliveries
+            WHERE guild_id = ? AND platform = ? AND external_id = ?
+            """,
+            (guild_id, platform.value, external_id),
+        )
+        return content_delivery_from_row(await cursor.fetchone())
+
+    async def list_pending_content_deliveries(self, guild_id: int) -> list[ContentDelivery]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM content_deliveries
+            WHERE guild_id = ? AND status = 'pending'
+            ORDER BY created_at ASC, platform ASC, external_id ASC
+            """,
+            (guild_id,),
+        )
+        deliveries = [content_delivery_from_row(row) for row in await cursor.fetchall()]
+        return [delivery for delivery in deliveries if delivery is not None]
+
+    async def record_content_observations(
+        self,
+        *,
+        guild_id: int,
+        account_id: str,
+        platform: Platform,
+        observations: tuple[ContentObservation, ...],
+        cursor_value: str | None,
+        now: datetime,
+    ) -> tuple[ContentCursor, tuple[ContentPlan, ...]]:
+        """Atomically upsert one connector page's items and claim new deliveries.
+
+        The first successful call for `(guild_id, account_id)` is the baseline page:
+        every observation is stored as an identity but nothing is ever claimed. Every
+        later call upserts each observation's lifecycle state and claims exactly one
+        pending delivery for an item that newly reaches `PUBLISHED` or `LIVE` (that is,
+        its previously stored state — if any — had not already reached one of those
+        states). The whole page is one write transaction, so concurrent or duplicate
+        calls observing the same transition can never double-claim: the delivery claim
+        is an `INSERT OR IGNORE` against `content_deliveries`'s
+        `(guild_id, platform, external_id)` primary key.
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction(immediate=True):
+            cursor_row_cursor = await self._connection.execute(
+                "SELECT baselined_at FROM content_cursors WHERE guild_id = ? AND account_id = ?",
+                (guild_id, account_id),
+            )
+            cursor_row = await cursor_row_cursor.fetchone()
+            is_baseline_page = cursor_row is None
+            existing_baselined_at = (
+                str(cursor_row["baselined_at"])
+                if cursor_row is not None and cursor_row["baselined_at"] is not None
+                else None
+            )
+            plans: list[ContentPlan] = []
+            for observation in observations:
+                event_row_cursor = await self._connection.execute(
+                    """
+                    SELECT state, first_observed_at FROM content_events
+                    WHERE guild_id = ? AND platform = ? AND external_id = ?
+                    """,
+                    (guild_id, platform.value, observation.external_id),
+                )
+                event_row = await event_row_cursor.fetchone()
+                previously_reached = event_row is not None and reaches_publish_or_live(
+                    ContentState(str(event_row["state"]))
+                )
+                first_observed_at = (
+                    str(event_row["first_observed_at"])
+                    if event_row is not None
+                    else now.isoformat()
+                )
+                await self._connection.execute(
+                    """
+                    INSERT INTO content_events (
+                        guild_id, account_id, platform, external_id, content_kind, state,
+                        canonical_url, title, published_at, first_observed_at, last_observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, platform, external_id) DO UPDATE SET
+                        account_id = excluded.account_id,
+                        content_kind = excluded.content_kind,
+                        state = excluded.state,
+                        canonical_url = excluded.canonical_url,
+                        title = excluded.title,
+                        published_at = excluded.published_at,
+                        last_observed_at = excluded.last_observed_at
+                    """,
+                    (
+                        guild_id,
+                        account_id,
+                        platform.value,
+                        observation.external_id,
+                        observation.content_kind.value,
+                        observation.state.value,
+                        observation.canonical_url,
+                        observation.title,
+                        _stored_timestamp(observation.published_at),
+                        first_observed_at,
+                        now.isoformat(),
+                    ),
+                )
+                if (
+                    not is_baseline_page
+                    and reaches_publish_or_live(observation.state)
+                    and not previously_reached
+                ):
+                    claim_cursor = await self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO content_deliveries (
+                            guild_id, platform, external_id, account_id, status, attempt,
+                            discord_channel_id, discord_message_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'pending', 1, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            guild_id,
+                            platform.value,
+                            observation.external_id,
+                            account_id,
+                            now.isoformat(),
+                            now.isoformat(),
+                        ),
+                    )
+                    if claim_cursor.rowcount == 1:
+                        await self._connection.execute(
+                            """
+                            INSERT INTO content_delivery_attempts (
+                                guild_id, platform, external_id, attempt, status, detail_json,
+                                created_at
+                            ) VALUES (?, ?, ?, 1, 'pending', '{}', ?)
+                            """,
+                            (guild_id, platform.value, observation.external_id, now.isoformat()),
+                        )
+                        claimed_event = await self.get_content_event(
+                            guild_id, platform, observation.external_id
+                        )
+                        claimed_delivery = await self.get_content_delivery(
+                            guild_id, platform, observation.external_id
+                        )
+                        if claimed_event is None or claimed_delivery is None:
+                            raise RuntimeError("claimed content delivery could not be read back")
+                        plans.append(ContentPlan(event=claimed_event, delivery=claimed_delivery))
+            resolved_baselined_at = existing_baselined_at or now.isoformat()
+            await self._connection.execute(
+                """
+                INSERT INTO content_cursors (
+                    guild_id, account_id, platform, cursor_value, baselined_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id) DO UPDATE SET
+                    platform = excluded.platform,
+                    cursor_value = excluded.cursor_value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    account_id,
+                    platform.value,
+                    cursor_value,
+                    resolved_baselined_at,
+                    now.isoformat(),
+                ),
+            )
+        saved_cursor = await self.get_content_cursor(guild_id, account_id)
+        if saved_cursor is None:
+            raise RuntimeError("content cursor could not be read back")
+        return saved_cursor, tuple(plans)
+
+    async def record_content_receipt(
+        self,
+        *,
+        guild_id: int,
+        receipt_id: str,
+        account_id: str | None,
+        platform: Platform | None,
+        external_id: str | None,
+        action: str,
+        detail: dict[str, JSONValue],
+        created_at: datetime,
+    ) -> None:
+        """Record a redacted diagnostic receipt for a skipped or malformed content item."""
+        _require_guild_id(guild_id)
+        safe_detail = _json_object(redact(detail))
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO content_receipts (
+                    guild_id, receipt_id, account_id, platform, external_id, action,
+                    detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt_id,
+                    account_id,
+                    platform.value if platform is not None else None,
+                    external_id,
+                    action,
+                    json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def list_content_receipts(
+        self, guild_id: int, account_id: str | None = None, limit: int = 50
+    ) -> list[ContentReceipt]:
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if account_id is None:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, account_id, platform, external_id, action,
+                       detail_json, created_at
+                FROM content_receipts
+                WHERE guild_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, account_id, platform, external_id, action,
+                       detail_json, created_at
+                FROM content_receipts
+                WHERE guild_id = ? AND account_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, account_id, limit),
+            )
+        rows = await cursor.fetchall()
+        return [self._content_receipt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _content_receipt_from_row(row: aiosqlite.Row) -> ContentReceipt:
+        stored_account_id = row["account_id"]
+        stored_platform = row["platform"]
+        stored_external_id = row["external_id"]
+        return ContentReceipt(
+            guild_id=int(row["guild_id"]),
+            receipt_id=str(row["receipt_id"]),
+            account_id=str(stored_account_id) if stored_account_id is not None else None,
+            platform=Platform(str(stored_platform)) if stored_platform is not None else None,
+            external_id=str(stored_external_id) if stored_external_id is not None else None,
+            action=str(row["action"]),
             detail=_json_object(json.loads(str(row["detail_json"]))),
             created_at=datetime.fromisoformat(str(row["created_at"])),
         )

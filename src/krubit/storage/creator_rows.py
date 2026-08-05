@@ -14,7 +14,11 @@ from datetime import datetime
 import aiosqlite
 
 from krubit.domain.creator_signals import (
+    ContentCursor,
+    ContentDelivery,
+    ContentEvent,
     ContentKind,
+    ContentState,
     CreatorAccount,
     CreatorProfile,
     CreatorRoute,
@@ -60,5 +64,63 @@ def creator_route_from_row(row: aiosqlite.Row | None) -> CreatorRoute | None:
         content_kind=ContentKind(str(row["content_kind"])),
         channel_id=int(row["channel_id"]),
         mention_role_id=int(mention_role_id) if mention_role_id is not None else None,
+        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+    )
+
+
+def content_cursor_from_row(row: aiosqlite.Row | None) -> ContentCursor | None:
+    if row is None:
+        return None
+    baselined_at = row["baselined_at"]
+    cursor_value = row["cursor_value"]
+    return ContentCursor(
+        guild_id=int(row["guild_id"]),
+        account_id=str(row["account_id"]),
+        platform=Platform(str(row["platform"])),
+        value=str(cursor_value) if cursor_value is not None else None,
+        baselined_at=(
+            datetime.fromisoformat(str(baselined_at)) if baselined_at is not None else None
+        ),
+        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+    )
+
+
+def content_event_from_row(row: aiosqlite.Row | None) -> ContentEvent | None:
+    if row is None:
+        return None
+    title = row["title"]
+    published_at = row["published_at"]
+    return ContentEvent(
+        guild_id=int(row["guild_id"]),
+        account_id=str(row["account_id"]),
+        platform=Platform(str(row["platform"])),
+        external_id=str(row["external_id"]),
+        content_kind=ContentKind(str(row["content_kind"])),
+        state=ContentState(str(row["state"])),
+        canonical_url=str(row["canonical_url"]),
+        title=str(title) if title is not None else None,
+        published_at=(
+            datetime.fromisoformat(str(published_at)) if published_at is not None else None
+        ),
+        first_observed_at=datetime.fromisoformat(str(row["first_observed_at"])),
+        last_observed_at=datetime.fromisoformat(str(row["last_observed_at"])),
+    )
+
+
+def content_delivery_from_row(row: aiosqlite.Row | None) -> ContentDelivery | None:
+    if row is None:
+        return None
+    channel_id = row["discord_channel_id"]
+    message_id = row["discord_message_id"]
+    return ContentDelivery(
+        guild_id=int(row["guild_id"]),
+        platform=Platform(str(row["platform"])),
+        external_id=str(row["external_id"]),
+        account_id=str(row["account_id"]),
+        status=str(row["status"]),
+        attempt=int(row["attempt"]),
+        discord_channel_id=int(channel_id) if channel_id is not None else None,
+        discord_message_id=int(message_id) if message_id is not None else None,
+        created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )
