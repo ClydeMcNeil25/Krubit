@@ -12,6 +12,7 @@ import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
 from krubit.discord.bot import KrubitBot
+from krubit.discord.content_commands import NotificationCommands
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
 from krubit.integrations.catalog import CATALOG
@@ -105,6 +106,24 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "status",
             "create",
             "preview",
+        }
+        creator = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "creator"),
+        )
+        # Final-review Important #8: `/fetch creator transfer` must actually be
+        # registered — the operator runbook documents it as available.
+        assert {command.name for command in creator.commands} == {
+            "add",
+            "pause",
+            "resume",
+            "remove",
+            "list",
+            "show",
+            "verify",
+            "route",
+            "transfer",
+            "template",
         }
     finally:
         await bot.close()
@@ -331,7 +350,11 @@ async def test_content_scheduler_cycle_survives_an_unhandled_exception_and_runs_
     """
     store = await SQLiteStore.open(tmp_path / "krubit.db")
     bot = KrubitBot(
-        Settings(application_id=123, database_path=tmp_path / "krubit.db"),
+        Settings(
+            application_id=123,
+            database_path=tmp_path / "krubit.db",
+            creator_signals_enabled=True,
+        ),
         FoundationService(store),
         content_connectors={Platform.BLUESKY: _InertConnector()},
     )
@@ -367,6 +390,139 @@ async def test_content_scheduler_cycle_survives_an_unhandled_exception_and_runs_
         assert calls >= 2
         task = bot.content_scheduler_cycle.get_task()
         assert task is not None and not task.done()
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_content_scheduler_never_runs_when_creator_signals_disabled(
+    tmp_path: Path,
+) -> None:
+    """Final-review Critical #1: `KRUBIT_CREATOR_SIGNALS_ENABLED=false` (the default)
+    must mean the connector polling scheduler never starts, even if a caller supplies
+    ready-to-poll connectors — the flag, not just the presence of connectors, is the
+    gate."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(
+            application_id=123,
+            database_path=tmp_path / "krubit.db",
+            creator_signals_enabled=False,
+        ),
+        FoundationService(store),
+        content_connectors={Platform.BLUESKY: _InertConnector()},
+    )
+
+    try:
+        assert bot._content_connectors == {}  # pyright: ignore[reportPrivateUsage]
+        assert bot._content_scheduler_enabled is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_never_builds_content_connectors_when_creator_signals_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same gate applies at `_run_bot`'s call site, not just inside `KrubitBot`."""
+    build_called = False
+    received_connectors: dict[object, object] | None = None
+
+    class FakeStore:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_live_signal_guild_ids(self) -> list[int]:
+            return []
+
+        async def close(self) -> None:
+            return None
+
+    class FakeConnector:
+        async def close(self) -> None:
+            return None
+
+    class FakeSession:
+        def __init__(self, *, connector: FakeConnector) -> None:
+            self.connector = connector
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBot:
+        def __init__(self, *args: object, content_connectors: object, **kwargs: object) -> None:
+            nonlocal received_connectors
+            received_connectors = cast(dict[object, object], content_connectors)
+
+        async def start(self, token: str) -> None:
+            raise RuntimeError("stop before real Discord connect")
+
+        async def close(self) -> None:
+            return None
+
+    def spy_build(*args: object, **kwargs: object) -> dict[object, object]:
+        nonlocal build_called
+        build_called = True
+        return {}
+
+    async def open_store(path: Path) -> FakeStore:
+        return FakeStore()
+
+    def connector_factory(**kwargs: object) -> FakeConnector:
+        return FakeConnector()
+
+    monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
+    monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(cli, "KrubitBot", FakeBot)
+    monkeypatch.setattr(cli, "_build_content_connectors", spy_build)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        creator_signals_enabled=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stop before real Discord connect"):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    assert build_called is False
+    assert received_connectors == {}
+
+
+@pytest.mark.asyncio
+async def test_notification_commands_share_the_bots_content_runtime(tmp_path: Path) -> None:
+    """Final-review Critical #1 composed consequence: `ContentCommandService`'s own
+    `ContentRuntime` (used by `/fetch notifications retry|retract`) must be the exact
+    same instance `KrubitBot` polls into, so it honors `social_delivery_enabled` too —
+    not a second, independently-defaulted `ContentRuntime` that could bypass shadow
+    mode."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(
+            application_id=123,
+            database_path=tmp_path / "krubit.db",
+            social_delivery_enabled=False,
+        ),
+        FoundationService(store),
+    )
+    try:
+        fetch = cast(
+            app_commands.Group,
+            next(command for command in bot.tree.get_commands() if command.name == "fetch"),
+        )
+        notifications = cast(
+            NotificationCommands,
+            next(command for command in fetch.commands if command.name == "notifications"),
+        )
+        service = notifications._service  # pyright: ignore[reportPrivateUsage]
+        assert service._runtime is bot._content_runtime  # pyright: ignore[reportPrivateUsage]
+        assert (
+            service._runtime._social_delivery_enabled  # pyright: ignore[reportPrivateUsage]
+            is False
+        )
     finally:
         await bot.close()
         await store.close()

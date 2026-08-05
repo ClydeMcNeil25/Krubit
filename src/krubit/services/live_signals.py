@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -27,6 +28,8 @@ from krubit.domain.models import JSONValue
 from krubit.integrations.twitch import TwitchClient
 from krubit.storage.sqlite import SQLiteStore
 
+_logger = logging.getLogger(__name__)
+
 _TWITCH_LOOKUP_TIMEOUT_SECONDS = 5
 _MISSING_EVIDENCE_GRACE = timedelta(minutes=5)
 _RESULT_STATUSES = frozenset({"succeeded", "failed"})
@@ -50,7 +53,7 @@ def _delivery_key(session: LiveSignalSession) -> str:
 
 async def _link_twitch_content(
     store: SQLiteStore, session: LiveSignalSession, *, channel_id: int, message_id: int
-) -> None:
+) -> bool:
     """Mirror one delivered Twitch announcement into the shared content ledger.
 
     Shared by the one-time Phase 2A `migrate_twitch_content` backfill and every future
@@ -61,12 +64,20 @@ async def _link_twitch_content(
     sends or edits a Discord message itself, and Twitch's own role/announcement
     pipeline in `krubit.discord.live_runtime` is completely unaffected: this call is
     additive bookkeeping on top of an already-decided outcome.
+
+    Uses `save_migrated_creator_account`, never `save_creator_account`: the deterministic
+    `creator_account_id(Platform.TWITCH, login)` identity can collide with an account
+    already registered (and possibly transferred or resumed) through the unified
+    creator registry, and this path must never crash on that conflict nor silently
+    re-pause an operator's already-resumed account. Returns `False` (without touching
+    the content ledger) when the account row belongs to a different owner — the caller
+    is responsible for logging that skip.
     """
     stream = session.stream
     if stream is None:
-        return
+        return False
     observed_at = session.last_twitch_at or session.detected_at
-    account = await store.save_creator_account(
+    account = await store.save_migrated_creator_account(
         CreatorAccount(
             guild_id=session.guild_id,
             account_id=creator_account_id(Platform.TWITCH, session.twitch_login),
@@ -80,6 +91,8 @@ async def _link_twitch_content(
             updated_at=observed_at,
         )
     )
+    if account is None:
+        return False
     await store.migrate_content_identity(
         guild_id=session.guild_id,
         account_id=account.account_id,
@@ -95,6 +108,7 @@ async def _link_twitch_content(
         channel_id=channel_id,
         message_id=message_id,
     )
+    return True
 
 
 async def migrate_twitch_content(store: SQLiteStore, guild_id: int) -> int:
@@ -110,7 +124,12 @@ async def migrate_twitch_content(store: SQLiteStore, guild_id: int) -> int:
     path a live delivery uses, so running this twice (or racing it against a live
     delivery for the same stream) links the same identity again without creating a
     second delivery, claiming a mention budget, or sending anything to Discord.
-    Returns the number of sessions linked (or re-confirmed) this call.
+
+    Never lets one bad session crash the whole boot sequence: an owner conflict (see
+    `SQLiteStore.save_migrated_creator_account`) or any other unexpected error linking
+    one session is caught, logged, and skipped so every other session in this guild —
+    and every other guild `migrate_all_twitch_content` still has to process — is
+    unaffected. Returns the number of sessions linked (or re-confirmed) this call.
     """
     linked = 0
     for session in await store.list_live_sessions_with_stream(guild_id):
@@ -124,9 +143,26 @@ async def migrate_twitch_content(store: SQLiteStore, guild_id: int) -> int:
             or delivery.message_id is None
         ):
             continue
-        await _link_twitch_content(
-            store, session, channel_id=delivery.channel_id, message_id=delivery.message_id
-        )
+        try:
+            did_link = await _link_twitch_content(
+                store, session, channel_id=delivery.channel_id, message_id=delivery.message_id
+            )
+        except Exception:
+            _logger.exception(
+                "migrate_twitch_content: failed to link session %s for guild %s; skipping "
+                "this session and continuing the migration",
+                session.session_key,
+                guild_id,
+            )
+            continue
+        if not did_link:
+            _logger.warning(
+                "migrate_twitch_content: session %s for guild %s already registered to a "
+                "different owner; skipping this session",
+                session.session_key,
+                guild_id,
+            )
+            continue
         linked += 1
     return linked
 
@@ -135,11 +171,21 @@ async def migrate_all_twitch_content(store: SQLiteStore) -> int:
     """Run `migrate_twitch_content` for every guild with Phase 2A configuration.
 
     Called once at startup (see `krubit.__main__._run_bot`); safe to call on every
-    boot since `migrate_twitch_content` is itself idempotent per guild.
+    boot since `migrate_twitch_content` is itself idempotent per guild. A whole guild's
+    migration failing unexpectedly (a DB error enumerating its sessions, for example)
+    is caught and logged here too, so it can never take down `krubit run`'s boot
+    sequence — the same guarantee `migrate_twitch_content` gives per-session.
     """
     linked = 0
     for guild_id in await store.list_live_signal_guild_ids():
-        linked += await migrate_twitch_content(store, guild_id)
+        try:
+            linked += await migrate_twitch_content(store, guild_id)
+        except Exception:
+            _logger.exception(
+                "migrate_all_twitch_content: failed to migrate guild %s; skipping this "
+                "guild and continuing with the rest",
+                guild_id,
+            )
     return linked
 
 

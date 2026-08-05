@@ -268,7 +268,7 @@ explicitly **not** claimed as complete by this audit:
    run today. The closest existing credential-independent checks are the automated test
    suite, `krubit status <guild_id>` (requires a running database and guild), and
    `krubit install-url`.
-2. Live `/fetch integrations`, `/fetch creator add <url>`, `/fetch notification
+2. Live `/fetch integrations`, `/fetch creator add <url>`, `/fetch notifications
    preview`, `/fetch live`, `/fetch latest`, `/fetch schedule` run against a real
    Discord guild with delivery flags false, confirming ephemeral responses and zero
    public side effects.
@@ -295,15 +295,60 @@ explicitly **not** claimed as complete by this audit:
   --check` is clean.
 - Every completion-gate line has direct evidence for the parts of the system that are
   implemented and wired into the running process (Twitch, YouTube/X/Bluesky polling,
-  registry, ledger, correlation, policy, delivery, Scheduled Event sync, analytics,
-  commands, authorization boundaries).
+  registry, ledger, correlation, policy, delivery, analytics, commands, authorization
+  boundaries). Discord Scheduled Event synchronization is implemented and tested but,
+  as of this audit, was **not yet wired into the running process** — see the
+  [final-review addendum](#addendum-final-whole-branch-review-fix-wave) below, which
+  corrects this line.
 - Two build gaps materially limit what "complete" means in production today and are
   documented prominently in the [operator runbook](phase-2-creator-signal-hub.md):
   Meta/TikTok connectors are not scheduled, and the OAuth/push callback server is never
   started. Both are deliberate, reviewed safety choices (not wiring a shared credential
   across accounts) rather than oversights, but they mean Instagram, Facebook, Threads,
   and TikTok are not operational in this build regardless of credentials configured.
+  **A third gap — Scheduled Event sync having no production call site — was found by
+  the whole-branch final review after this audit was written; see the addendum.**
 - No production canary — live or social — has been run in this session. Every claim
   requiring a live Discord guild or real platform credentials is explicitly deferred to
   an operator, per this audit's mandate not to fabricate results for steps this
   environment cannot perform.
+
+## Addendum: final whole-branch review fix wave
+
+This audit (dated 2026-08-05, above) was written from a task-scoped review of Tasks
+1-14 in isolation. A subsequent **whole-branch** review — looking at every task's
+change composed together, which no single task-scoped review could see — found four
+additional issues, now fixed on top of the state this audit describes:
+
+1. **`KRUBIT_CREATOR_SIGNALS_ENABLED`/`KRUBIT_SOCIAL_DELIVERY_ENABLED` were parsed and
+   validated but never actually read anywhere in `src/`.** With both at their `false`
+   default, the connector scheduler still started (`BlueskyConnector` needs no
+   credential) and `ContentRuntime` still delivered publicly. Both flags are now
+   enforced: `KrubitBot` never builds connectors or starts the scheduler unless
+   `creator_signals_enabled` is `true`, and `ContentRuntime.apply_plan` — the one
+   choke point every send/edit path runs through, including `/fetch notifications
+   retry`, which now shares the exact same `ContentRuntime` instance — is a no-op
+   unless `social_delivery_enabled` is `true`.
+2. **The idempotent Twitch-to-content-ledger migration
+   (`migrate_all_twitch_content`, called on every `krubit run` boot) could raise and
+   crash the entire boot sequence** if the deterministic Twitch account identity had
+   been re-registered to a different owner (e.g. via a legitimate
+   `/fetch creator transfer`). It also **silently re-paused an already-resumed Twitch
+   account on every boot**, because its upsert overwrote `paused`. Both are fixed:
+   `SQLiteStore.save_migrated_creator_account` never raises on an owner conflict (it
+   returns `None` and the caller logs and skips that one session) and never overwrites
+   an existing row's `paused` state.
+3. **Discord Scheduled Event synchronization has no production call site** — a third
+   build gap this audit's Summary line above did not count. Corrected in the [operator
+   runbook](phase-2-creator-signal-hub.md#scheduled-event-synchronization-has-no-production-call-site),
+   [README.md](../../README.md), and the
+   [roadmap](../roadmaps/2026-08-03-krubit-phase-rollout.md).
+4. **`notification_preview` had no authority check**, and `/fetch creator transfer`
+   was documented as available but never registered as a Discord command. Both are
+   fixed: `notification_preview` now applies the same `_require_authority` gate every
+   other per-account command uses, and `/fetch creator transfer` is now a registered
+   command following the same confirm/authority pattern as `/fetch creator route`.
+
+Every `/fetch notification ...` reference in this audit, the operator runbook, and
+README.md was also corrected to the actual registered command group name,
+`/fetch notifications ...`.

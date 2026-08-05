@@ -6,16 +6,23 @@ Discord-presence baseline documented separately in the
 [Phase 2A live-stream signal guide](phase-2a-live-stream-signals.md). Read that guide
 first if Twitch live signals are not already running.
 
-> **Read this before enabling anything in this guide.** Two production gaps are called
-> out prominently below because they change what "enabled" actually means for an
-> operator: the Meta and TikTok connectors do not run in the scheduler yet (see
+> **Read this before enabling anything in this guide.** Three production gaps are
+> called out prominently below because they change what "enabled" actually means for
+> an operator: the Meta and TikTok connectors do not run in the scheduler yet (see
 > [Meta and TikTok are not scheduled](#meta-and-tiktok-are-not-scheduled-in-this-build)),
-> and the OAuth/push callback server is not started by `krubit run` yet (see
-> [The callback ingress server is not wired into the running process](#the-callback-ingress-server-is-not-wired-into-the-running-process)).
+> the OAuth/push callback server is not started by `krubit run` yet (see
+> [The callback ingress server is not wired into the running process](#the-callback-ingress-server-is-not-wired-into-the-running-process)),
+> and Discord Scheduled Event synchronization has no production call site at all (see
+> [Scheduled Event synchronization has no production call site](#scheduled-event-synchronization-has-no-production-call-site)).
+> `KRUBIT_CREATOR_SIGNALS_ENABLED` and `KRUBIT_SOCIAL_DELIVERY_ENABLED` themselves are
+> fully enforced — leaving both at their `false` default guarantees the connector
+> polling scheduler never starts and no Discord message is ever sent — but the three
+> gaps above apply even once both are `true`.
 
 ## What this build adds over Phase 2A
 
-- A creator registry: `/fetch creator add|remove|list|show|verify|pause|resume|route|template`,
+- A creator registry:
+  `/fetch creator add|remove|list|show|verify|pause|resume|route|transfer|template`,
   guild-scoped, owner- and admin-authorized.
 - A connector catalog covering Twitch, YouTube, X, Instagram, Facebook Pages, Facebook
   profiles, Threads, Bluesky, TikTok, and Fanbase, each declaring an honest
@@ -27,11 +34,14 @@ first if Twitch live signals are not already running.
   migrated Twitch/Discord-presence path.
 - `#social-notifications` delivery for posts/uploads/Shorts/Reels/videos, alongside the
   existing `#live-notifications` live-card path.
-- Discord Scheduled Event synchronization for supported scheduled streams.
-- `/fetch notifications`, `/fetch notification preview|retry|retract`, `/fetch latest`,
+- Discord Scheduled Event synchronization for supported scheduled streams — implemented
+  and tested, but **not called from any production code path yet**; see
+  [Scheduled Event synchronization has no production call site](#scheduled-event-synchronization-has-no-production-call-site).
+- `/fetch notifications`, `/fetch notifications preview|retry|retract`, `/fetch latest`,
   `/fetch schedule`, and an expanded `/fetch integrations`.
 
-None of this is reachable until an operator opts in. Two independent flags gate it:
+None of this is reachable until an operator opts in. Two independent flags gate it, and
+both are now fully enforced end to end — not just parsed and validated:
 
 ```dotenv
 KRUBIT_CREATOR_SIGNALS_ENABLED=false
@@ -41,8 +51,18 @@ KRUBIT_SOCIAL_DELIVERY_ENABLED=false
 `Settings.from_env` (`src/krubit/config.py`) defaults both to `false`
 (`tests/test_phase_2_rollout.py::test_new_connectors_default_disabled_and_can_be_enabled_independently`
 and `tests/test_config.py::test_missing_social_settings_all_default_to_none_or_disabled`
-enforce this). Enabling one does not enable the other, and neither retroactively enables
-Phase 2A's separate `KRUBIT_LIVE_SIGNALS_ENABLED` flag or any individual connector's
+enforce this). `KRUBIT_CREATOR_SIGNALS_ENABLED=false` means `krubit run` never builds a
+connector, never starts the polling scheduler, and `_content_scheduler_enabled` on
+`KrubitBot` stays `False`
+(`tests/test_cli.py::test_content_scheduler_never_runs_when_creator_signals_disabled`).
+`KRUBIT_SOCIAL_DELIVERY_ENABLED=false` means `ContentRuntime.apply_plan` — the single
+choke point every send/edit path (`apply_plans`, `recover_pending`, `retry_delivery`,
+and `/fetch notifications retry`, which shares the exact same `ContentRuntime` instance
+`KrubitBot` polls into) runs through — returns immediately without resolving a route,
+deciding a mention, or touching Discord at all
+(`tests/test_content_runtime.py::test_apply_plan_sends_nothing_when_social_delivery_is_disabled`).
+Enabling one flag does not enable the other, and neither retroactively enables Phase
+2A's separate `KRUBIT_LIVE_SIGNALS_ENABLED` flag or any individual connector's
 credentials — a missing per-platform credential leaves that platform's capabilities at
 `unconfigured` regardless of these two flags.
 
@@ -198,6 +218,23 @@ A future task must instantiate and start `CallbackServer` from `_run_bot` (or
 equivalent) with the platform-specific routes registered, before any push/OAuth/webhook
 path can be exercised outside of tests.
 
+### Scheduled Event synchronization has no production call site
+
+`src/krubit/discord/scheduled_events.py`'s `ScheduledEventSynchronizer` — creating,
+updating, and exact-ID-recovering a Krubit-owned Discord Scheduled Event for a
+supported scheduled stream — is fully implemented and tested
+(`tests/test_scheduled_event_sync.py`), including restart-safe recovery that never
+falls back to searching by mutable event name. However, nothing in
+`src/krubit/discord/bot.py`, `src/krubit/__main__.py`, or
+`src/krubit/discord/content_runtime.py` ever constructs a `ScheduledEventSynchronizer`
+or calls `.apply(...)` on one. **Practical consequence:** `scheduled_event_mappings`
+is never written by the running process, so `/fetch schedule` will always report "No
+Krubit-owned Scheduled Events," regardless of what content is enrolled, routed, or
+scheduled on any platform. A future task must call `ScheduledEventSynchronizer.apply`
+from the same place `ContentRuntime.apply_plan` is called (or an equivalent hook) for
+every content event carrying schedulable state, before this capability does anything
+in production.
+
 ### `X_KRUBIT_BEARER_TOKEN` is the only currently reachable OAuth-free social connector
 
 Of the platforms wired into the scheduler (YouTube, X, Bluesky), only X requires a
@@ -207,6 +244,14 @@ the callback server. Both are the connectors an operator can realistically exerc
 end-to-end today, alongside the Twitch/Discord-presence path from Phase 2A.
 
 ## Notification policy: guild configuration is not wired yet
+
+**This is a known, currently-open limitation, separate from the three production gaps
+called out at the top of this guide** — it does not block `KRUBIT_SOCIAL_DELIVERY_ENABLED`
+from being genuinely enforced (see above); it means that once delivery is enabled, every
+guild gets the same maximally-permissive policy rather than one it can configure. It has
+carried forward through the final review of this build without a fix, deliberately: a
+minimal guild-config mechanism was judged out of scope for a review-fix pass, and this
+section exists so it is never mistaken for resolved.
 
 `ContentRuntime` uses a `policy_factory` that currently defaults every guild to
 **unlimited mention budgets and no quiet hours** — there is no guild-level
@@ -247,7 +292,7 @@ no connector instance is wired into the command layer for a live check yet).
    `KRUBIT_LIVE_SIGNALS_ENABLED=false`) while `KRUBIT_CREATOR_SIGNALS_ENABLED=true`.
    Enrollment, connector polling where wired (YouTube/X/Bluesky/Twitch), and cursor
    advancement can proceed, but no public Discord delivery occurs.
-2. **Staff preview**: `/fetch notification preview` renders an ephemeral card for a
+2. **Staff preview**: `/fetch notifications preview` renders an ephemeral card for a
    registered account's next-would-be delivery without sending anything publicly or
    consuming a mention budget.
 3. **Controlled canary**: enable only the one connector's shadow flag, baseline an
@@ -263,9 +308,9 @@ no connector instance is wired into the command layer for a live check yet).
 Retry, retraction, and status:
 
 ```text
-/fetch notification status
-/fetch notification retry <delivery_id>
-/fetch notification retract <delivery_id>
+/fetch notifications status
+/fetch notifications retry <delivery_id>
+/fetch notifications retract <delivery_id>
 /fetch latest
 /fetch schedule
 /fetch integrations
@@ -300,7 +345,7 @@ Retry, retraction, and status:
 1. Set `KRUBIT_SOCIAL_DELIVERY_ENABLED=false` (and `KRUBIT_CREATOR_SIGNALS_ENABLED=false`
    if connector polling itself must stop) in the master `.env`.
 2. Restart with `& scripts/invoke-krubit.ps1 run`.
-3. Confirm `/fetch integrations`, `/fetch notification status` report the expected
+3. Confirm `/fetch integrations`, `/fetch notifications status` report the expected
    disabled state and no new public delivery occurs.
 4. Keep the database, WAL, and SHM files — the content ledger, correlation, delivery,
    and mention-budget tables are additive and safe to retain during rollback, exactly
@@ -348,11 +393,12 @@ Retry, retraction, and status:
 Cross-guild reads/mutations and unauthorized creator management are denied at the
 service layer (`src/krubit/services/creator_registry.py::_require_authority` and
 guild-scoping in every store method) and covered by
-`tests/test_creator_registry_service.py`. `notification_preview` currently has **no**
-authority check — any guild member can preview any account's card
-(`src/krubit/discord/content_commands.py`); this is a known limitation carried from
-Task 12, not new in this document, and should be tightened before general
-availability.
+`tests/test_creator_registry_service.py`. `notification_preview`
+(`src/krubit/discord/content_commands.py`) now applies the same `_require_authority`
+gate as every other per-account command — only the account's owner or an admin may
+preview its card — closing the previously-open gap where any guild member could
+preview any account's canonical URL and mention role
+(`tests/test_content_commands.py::test_notification_preview_denies_a_non_owning_non_admin_actor`).
 
 ## Related documents
 

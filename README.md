@@ -42,7 +42,8 @@ activity publicly in Discord; Krubit does not read private connected accounts.
 
 ## Phase 2 capabilities
 
-- A guild-scoped creator registry (`/fetch creator add|remove|list|show|verify|pause|resume|route|template`)
+- A guild-scoped creator registry
+  (`/fetch creator add|remove|list|show|verify|pause|resume|route|transfer|template`)
   with owner/admin authority boundaries and redacted audit receipts
 - A per-platform connector catalog covering Twitch, YouTube, X, Instagram, Facebook
   Pages, Facebook profiles, Threads, Bluesky, TikTok, and Fanbase, each reporting an
@@ -54,22 +55,29 @@ activity publicly in Discord; Krubit does not read private connected accounts.
   Discord delivery engine, covering both `#live-notifications` and the new
   `#social-notifications` destination
 - Discord Scheduled Event synchronization for supported scheduled streams, recovering
-  only by exact stored event ID
+  only by exact stored event ID — implemented and tested, but **not yet called from
+  the running process** (see the production gaps below)
 - `/fetch latest`, `/fetch schedule`, `/fetch notifications`, and
-  `/fetch notification preview|retry|retract`
+  `/fetch notifications preview|retry|retract`
 - The Phase 2A Twitch/Discord-presence path migrated behind these same shared contracts
   without changing its accepted presentation or safety guarantees
 
 Every Phase 2 surface defaults off: `KRUBIT_CREATOR_SIGNALS_ENABLED` and
-`KRUBIT_SOCIAL_DELIVERY_ENABLED` both default to `false`, and every missing per-platform
-credential simply leaves that capability at `unconfigured` rather than blocking
-startup. Instagram, Facebook, Threads, and TikTok connectors are fully implemented and
-tested but are **not wired into the polling scheduler in this build** — they need
-per-account OAuth credential resolution that is not yet built, so scheduling them with
-one shared bot-wide token would fetch every creator's content under one account's
-credentials. See the
+`KRUBIT_SOCIAL_DELIVERY_ENABLED` both default to `false`, and neither flag is
+decorative — leaving both at their default means the connector polling scheduler never
+starts and no Discord message is ever sent, even if accounts are enrolled, resumed, and
+routed. Every missing per-platform credential simply leaves that capability at
+`unconfigured` rather than blocking startup. Three production gaps remain even with
+both flags enabled: Instagram, Facebook, Threads, and TikTok connectors are fully
+implemented and tested but are **not wired into the polling scheduler in this
+build** (they need per-account OAuth credential resolution that is not yet built, so
+scheduling them with one shared bot-wide token would fetch every creator's content
+under one account's credentials); the OAuth/push **callback server is never started**
+by `krubit run`; and Discord **Scheduled Event synchronization has no production call
+site** — nothing in the running process ever calls it, so `/fetch schedule` will always
+report no Krubit-owned events. See the
 [Phase 2 operations guide](docs/operations/phase-2-creator-signal-hub.md) for the full
-operator runbook, including this and the OAuth-callback-server gap, and the
+operator runbook, including all three gaps, and the
 [Phase 2 completion audit](docs/operations/phase-2-completion-audit.md) for exactly
 what is evidenced versus deferred to a credentialed operator.
 

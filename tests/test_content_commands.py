@@ -402,6 +402,66 @@ async def test_notification_preview_fails_without_a_configured_route(
     assert result.status is CommandStatus.FAILED
 
 
+@pytest.mark.asyncio
+async def test_notification_preview_denies_a_non_owning_non_admin_actor(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    """Final-review Important #7: a preview card can reveal the account's canonical
+    URL and configured mention role, so only the account's owner or an admin may see
+    it — a same-guild `Creator`-role member who does not own this account must be
+    denied before any card is ever rendered."""
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=YOUTUBE_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+    await store.save_creator_route(
+        CreatorRoute(
+            guild_id=GUILD_ID,
+            account_id=account_id,
+            content_kind=ContentKind.VIDEO,
+            channel_id=444,
+            mention_role_id=555,
+            updated_at=NOW,
+        )
+    )
+
+    result = await commands.notification_preview(
+        actor=other_member(), account_id=account_id, content_kind=ContentKind.VIDEO
+    )
+
+    assert result.status is CommandStatus.DENIED
+    assert result.rendered is None
+
+
+@pytest.mark.asyncio
+async def test_notification_preview_allows_an_admin_to_preview_any_account(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=YOUTUBE_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+    await store.save_creator_route(
+        CreatorRoute(
+            guild_id=GUILD_ID,
+            account_id=account_id,
+            content_kind=ContentKind.VIDEO,
+            channel_id=444,
+            mention_role_id=555,
+            updated_at=NOW,
+        )
+    )
+
+    result = await commands.notification_preview(
+        actor=admin_member(), account_id=account_id, content_kind=ContentKind.VIDEO
+    )
+
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.rendered is not None
+
+
 # -- retry: validates route/policy and attempt ownership -------------------------------
 
 

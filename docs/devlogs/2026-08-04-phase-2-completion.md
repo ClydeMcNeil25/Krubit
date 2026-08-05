@@ -36,7 +36,7 @@ receipt.
 | 9 | Meta connectors: Instagram, Facebook Pages, Facebook profiles, Threads, OAuth authorization flow |
 | 10 | TikTok and Fanbase: OAuth/Display API connector and dormant pending-capability handling |
 | 11 | Discord Scheduled Event synchronization with exact-ID recovery |
-| 12 | Unified `/fetch creator`/`/fetch notification` command surface |
+| 12 | Unified `/fetch creator`/`/fetch notifications` command surface |
 | 13 | Unified polling scheduler and idempotent Twitch-to-content-ledger migration |
 | 14 | Operator runbook, rollout env vars, completion audit (this task) |
 
@@ -77,18 +77,19 @@ a576cc4  fix: isolate scheduler cycle failures and honor real rate-limit headers
   `KRUBIT_CALLBACK_PUBLIC_BASE_URL`, `KRUBIT_CALLBACK_PORT`) — all optional, all
   default to leaving the corresponding capability `unconfigured` rather than blocking
   startup.
-- Commands: `/fetch creator add|remove|list|show|verify|pause|resume|route|template`,
-  `/fetch notifications`, `/fetch notification preview|retry|retract`, `/fetch latest`,
+- Commands: `/fetch creator add|remove|list|show|verify|pause|resume|route|transfer|template`,
+  `/fetch notifications`, `/fetch notifications preview|retry|retract`, `/fetch latest`,
   `/fetch schedule`.
 - Discord resources: `#social-notifications` channel and `Creator` role, resolved once
   by exact name alongside the existing `#live-notifications`/`Streaming Now` pair.
 - Full operator setup, remediation, rollback, and data-deletion guidance in the new
   [Phase 2 operations guide](../operations/phase-2-creator-signal-hub.md).
 
-## Two build gaps documented prominently for operators
+## Three build gaps documented prominently for operators
 
-Both are deliberate, reviewed safety choices, not oversights, and are called out at the
-top of the operator runbook rather than buried:
+All three are deliberate, reviewed safety choices or straightforwardly missing wiring,
+not oversights, and are called out at the top of the operator runbook rather than
+buried:
 
 1. **Meta and TikTok connectors are not scheduled.** Each needs a per-account OAuth
    token resolved at poll time, not the single bot-wide token `Settings` provides for
@@ -101,6 +102,25 @@ top of the operator runbook rather than buried:
    `Settings` already validates `KRUBIT_CALLBACK_PUBLIC_BASE_URL`/`KRUBIT_CALLBACK_PORT`,
    but `krubit run` never constructs or starts a `CallbackServer`. YouTube push,
    Meta/TikTok OAuth redirects, and Meta signed webhooks have nowhere to land.
+3. **Discord Scheduled Event synchronization has no production call site.**
+   `ScheduledEventSynchronizer` is implemented and tested (including restart-safe,
+   exact-ID-only recovery), but nothing in `bot.py`, `__main__.py`, or
+   `content_runtime.py` ever constructs or calls it. `/fetch schedule` will always
+   report no Krubit-owned events in this build, regardless of what is scheduled on any
+   platform. Found by the whole-branch final review (see below), not caught by this
+   task's own review.
+
+A whole-branch final review performed after this devlog was first written also found
+and fixed a fourth, more serious composition-level defect: `KRUBIT_CREATOR_SIGNALS_ENABLED`
+and `KRUBIT_SOCIAL_DELIVERY_ENABLED` were parsed and validated
+(`src/krubit/config.py`) but never actually read anywhere else in `src/` — so leaving
+both at their documented `false` default did not, in fact, prevent connector polling or
+public Discord delivery. Both flags are now genuinely enforced; see the [completion
+audit's
+addendum](../operations/phase-2-completion-audit.md#addendum-final-whole-branch-review-fix-wave)
+for the complete list of fixes from that review, including two migration-safety fixes
+(a boot-crashing owner conflict and a silent re-pause on every restart) and an
+authority-check gap in `notification_preview`.
 
 ## Verification performed in this session (Task 14)
 
@@ -127,9 +147,8 @@ and the [operator runbook](../operations/phase-2-creator-signal-hub.md); the hig
 impact items are:
 
 - No guild-level `NotificationPolicy` configuration storage — every guild currently
-  gets unlimited mention budgets and no quiet hours by default.
-- `/fetch notification preview` has no authority check; any guild member can preview
-  any account's card.
+  gets unlimited mention budgets and no quiet hours by default. (Still open after the
+  final-review fix wave — judged out of scope for a review-fix pass; see the runbook.)
 - `extract_streaming_observation` (the shared Twitch/YouTube presence extractor) has no
   production call site; `handle_presence` still calls the Twitch-only extractor
   directly.

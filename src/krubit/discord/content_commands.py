@@ -590,10 +590,25 @@ class ContentCommandService:
         decide_mention` is pure and never touches storage, unlike `evaluate_and_claim`),
         no role mutation, and no Scheduled Event action: this method never calls
         `ContentRuntime` or `ScheduledEventSynchronizer` at all.
+
+        Gated by the same `_require_authority` rule as every other per-account command
+        (`creator_show`, `creator_verify`, `notification_retry`, ...): an admin may
+        preview any account, a `Creator`-role member only their own. A preview card can
+        include the account's canonical URL and configured mention role, so a denied
+        actor must never see it.
         """
         account = await self._store.get_creator_account(actor.guild_id, account_id)
         if account is None:
             return CommandResult(CommandStatus.FAILED, detail={"reason": "account_not_found"})
+        try:
+            _require_authority(
+                actor_member_id=actor.member_id,
+                owner_member_id=account.owner_member_id,
+                actor_is_admin=actor.is_admin,
+                actor_has_creator_role=actor.has_creator_role,
+            )
+        except CreatorAuthorityError as exc:
+            return _denied(exc)
         routes = await self._store.list_creator_routes(actor.guild_id, account_id)
         route = next((r for r in routes if r.content_kind is content_kind), None)
         if route is None:
@@ -1001,6 +1016,32 @@ class CreatorCommands(app_commands.Group):
                 content_kind=kind,
                 channel_id=channel.id,
                 mention_role_id=role_id,
+                confirm=True,
+            ),
+        )
+
+    @app_commands.command(
+        name="transfer", description="Transfer a creator account to a new owner"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def transfer(
+        self, interaction: discord.Interaction, account_id: str, new_owner: discord.Member
+    ) -> None:
+        actor = await _actor_context(self._service, interaction)
+        if actor is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self._service.creator_transfer(
+            actor=actor, account_id=account_id, new_owner_member_id=new_owner.id
+        )
+        await self._present(
+            interaction,
+            result,
+            confirm=lambda: self._service.creator_transfer(
+                actor=actor,
+                account_id=account_id,
+                new_owner_member_id=new_owner.id,
                 confirm=True,
             ),
         )

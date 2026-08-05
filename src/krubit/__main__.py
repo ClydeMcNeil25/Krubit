@@ -38,6 +38,10 @@ def _build_content_connectors(
     bot-wide token — that per-account credential resolution is a distinct feature this
     task does not build, so those platforms are intentionally left unscheduled for now
     rather than wired with a token that cannot be correct for more than one account.
+
+    Callers must gate this on `settings.creator_signals_enabled` themselves (see
+    `_run_bot`) — this function does not check the flag, since `KrubitBot` also enforces
+    it independently for any caller that constructs it directly (for example, a test).
     """
     connectors: dict[Platform, Connector] = {}
     if settings.youtube_api_key is not None:
@@ -129,7 +133,11 @@ async def _run_bot(settings: Settings) -> int:
         await migrate_all_twitch_content(store)
         content_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         content_session = aiohttp.ClientSession(connector=content_tcp_connector)
-        content_connectors = _build_content_connectors(settings, content_session)
+        content_connectors = (
+            _build_content_connectors(settings, content_session)
+            if settings.creator_signals_enabled
+            else {}
+        )
         connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         bot = KrubitBot(
             settings,

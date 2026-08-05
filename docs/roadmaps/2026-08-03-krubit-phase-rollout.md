@@ -148,20 +148,32 @@ creator registry, a connector catalog covering all ten listed platforms with hon
 per-capability state, a normalized content ledger with cross-platform correlation,
 shared quiet-hours/mention-budget policy, a shared durable Discord delivery engine
 covering both `#live-notifications` and the new `#social-notifications`, Discord
-Scheduled Event synchronization, and the full `/fetch creator`/`/fetch notification`
+Scheduled Event synchronization, and the full `/fetch creator`/`/fetch notifications`
 command surface. The Phase 2A Twitch/Discord-presence slice is migrated behind these
 same shared contracts without changing its accepted presentation or safety guarantees.
 
-Two things keep this short of production-ready for every listed platform, both
+Three things keep this short of production-ready for every listed platform, all
 documented prominently in the
 [Phase 2 operations guide](../operations/phase-2-creator-signal-hub.md): Instagram,
 Facebook, Threads, and TikTok connectors are fully built and tested but not wired into
 the polling scheduler yet (each needs per-account OAuth credential resolution this
 build does not implement, so a shared bot-wide token would be actively wrong rather
-than merely incomplete); and the OAuth/push callback server is implemented and tested
-but never started by the running process, so no live OAuth consent, YouTube push, or
-Meta webhook can be completed yet. YouTube, X, Bluesky, and Twitch are the connectors
+than merely incomplete); the OAuth/push callback server is implemented and tested but
+never started by the running process, so no live OAuth consent, YouTube push, or Meta
+webhook can be completed yet; and Discord Scheduled Event synchronization
+(`ScheduledEventSynchronizer`) is implemented and tested but has no production call
+site, so `/fetch schedule` will always report no Krubit-owned events regardless of what
+is scheduled on any platform. YouTube, X, Bluesky, and Twitch are the connectors
 reachable in this build.
+
+A final whole-branch review (2026-08-05, after the task-scoped implementation and audit
+above) also found and fixed a build-composition defect: `KRUBIT_CREATOR_SIGNALS_ENABLED`
+and `KRUBIT_SOCIAL_DELIVERY_ENABLED` were parsed and validated but never actually
+enforced anywhere, so leaving both at their documented `false` default did not in fact
+prevent connector polling or public Discord delivery. Both flags are now genuinely
+enforced end to end; see the
+[completion audit's addendum](../operations/phase-2-completion-audit.md#addendum-final-whole-branch-review-fix-wave)
+for the full list of fixes from that review.
 
 No controlled `#live-notifications` or `#social-notifications` production canary has
 run against a live Discord guild or real platform credentials; the

@@ -512,3 +512,103 @@ async def test_apply_plans_counts_only_the_plans_that_actually_applied(
 
     assert applied == 0
     assert guild.channel.sent == []
+
+
+# --- KRUBIT_SOCIAL_DELIVERY_ENABLED shadow-mode gate ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_plan_sends_nothing_when_social_delivery_is_disabled(
+    tmp_path: Path,
+) -> None:
+    """Final-review Critical #1: `social_delivery_enabled=False` must produce zero
+    Discord sends, regardless of what the scheduler or a command surface claims."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    await store.save_creator_account(account())
+    await store.save_creator_route(route())
+    channel = FakeTextChannel(444)
+    guild = FakeGuild(channel)
+    runtime = ContentRuntime(store, now=lambda: NOW, social_delivery_enabled=False)
+    try:
+        plan = await claim_live_plan(store)
+
+        applied = await runtime.apply_plan(as_guild(guild), plan)
+
+        assert applied is False
+        assert guild.channel.sent == []
+        delivery = await store.get_content_delivery_by_seq(
+            111, plan.delivery.platform, plan.delivery.external_id, plan.delivery.transition_seq
+        )
+        assert delivery is not None
+        assert delivery.status == "pending"
+        # Shadow mode must never consume a mention-budget slot for content it never
+        # actually announced.
+        consumed = await store.mention_budget_consumed(
+            111, "live_everyone", NOW.date().isoformat()
+        )
+        assert consumed == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_plans_and_recover_pending_send_nothing_when_delivery_is_disabled(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    await store.save_creator_account(account())
+    await store.save_creator_route(route())
+    channel = FakeTextChannel(444)
+    guild = FakeGuild(channel)
+    runtime = ContentRuntime(store, now=lambda: NOW, social_delivery_enabled=False)
+    try:
+        plan = await claim_live_plan(store)
+
+        applied = await runtime.apply_plans(as_guild(guild), (plan,))
+        recovered = await runtime.recover_pending(as_guild(guild))
+
+        assert applied == 0
+        assert recovered == 0
+        assert guild.channel.sent == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_delivery_sends_nothing_when_social_delivery_is_disabled(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    await store.save_creator_account(account())
+    await store.save_creator_route(route())
+    channel = FakeTextChannel(444)
+    guild = FakeGuild(channel)
+    # Fail one real send while delivery is enabled, to reach a `failed` delivery...
+    runtime_enabled = ContentRuntime(store, now=lambda: NOW, social_delivery_enabled=True)
+    plan = await claim_live_plan(store)
+    channel.send_failure = discord.HTTPException(
+        cast(Any, SimpleNamespace(status=500, reason="boom", headers={})), "boom"
+    )
+    await runtime_enabled.apply_plan(as_guild(guild), plan)
+    channel.send_failure = None
+
+    # ...then retry it with delivery disabled and confirm nothing is ever sent.
+    runtime_disabled = ContentRuntime(store, now=lambda: NOW, social_delivery_enabled=False)
+    try:
+        retried = await runtime_disabled.retry_delivery(
+            as_guild(guild),
+            delivery_id_for(
+                plan.delivery.platform, plan.delivery.external_id, plan.delivery.transition_seq
+            ),
+        )
+
+        assert retried is False
+        assert guild.channel.sent == []
+    finally:
+        await store.close()

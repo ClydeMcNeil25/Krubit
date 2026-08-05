@@ -103,10 +103,22 @@ class ContentRuntime:
         *,
         policy_factory: PolicyFactory | None = None,
         now: Callable[[], datetime] | None = None,
+        social_delivery_enabled: bool = True,
     ) -> None:
+        """`social_delivery_enabled=False` is the shadow-mode gate: every send/edit
+        path in `apply_plan` (and therefore every caller that routes through it —
+        `apply_plans`, `recover_pending`, `retry_delivery`) becomes a no-op that leaves
+        the delivery `pending` rather than posting to Discord. This is checked before
+        any route resolution, mention decision, or budget claim, so shadow mode has
+        zero Discord side effects and never consumes a mention-budget slot for content
+        it never actually announced. `retract_delivery` needs no separate check: with
+        every send gated, a delivery can only reach `retract_delivery` with a real
+        Discord message if it was sent while the flag was still `True`.
+        """
         self._store = store
         self._policy_factory = policy_factory or _default_policy_factory
         self._now = now or (lambda: datetime.now(UTC))
+        self._social_delivery_enabled = social_delivery_enabled
         self._guild_locks: dict[int, asyncio.Lock] = {}
 
     def _guild_lock(self, guild_id: int) -> asyncio.Lock:
@@ -127,6 +139,8 @@ class ContentRuntime:
         being announced, so nothing should be re-claimed.
         """
         if guild.id != plan.event.guild_id or guild.id != plan.delivery.guild_id:
+            return False
+        if not self._social_delivery_enabled:
             return False
         if not await self._store.guild_is_enabled(guild.id):
             return False

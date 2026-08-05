@@ -54,6 +54,7 @@ class FetchCommands(app_commands.Group):
         presence_intent: bool = False,
         twitch_credentials: bool = False,
         twitch_available: bool = False,
+        content_runtime: ContentRuntime | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -63,7 +64,14 @@ class FetchCommands(app_commands.Group):
         self._presence_intent = presence_intent
         self._twitch_credentials = twitch_credentials
         self._twitch_available = twitch_available
-        self._content_commands = ContentCommandService(service.store)
+        # Share the same `ContentRuntime` instance `KrubitBot` polls into, rather than
+        # letting `ContentCommandService` default-construct its own: that default
+        # always has `social_delivery_enabled=True`, which would let `/fetch
+        # notifications retry` bypass the `KRUBIT_SOCIAL_DELIVERY_ENABLED=false` shadow-
+        # mode gate that every scheduler-driven delivery already honors.
+        self._content_commands = ContentCommandService(
+            service.store, runtime=content_runtime or ContentRuntime(service.store)
+        )
         self.add_command(BackupCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
@@ -423,8 +431,12 @@ class KrubitBot(discord.Client):
             live_signals,
             receipts=service,
         )
-        self._content_runtime = ContentRuntime(service.store)
-        self._content_connectors = dict(content_connectors or {})
+        self._content_runtime = ContentRuntime(
+            service.store, social_delivery_enabled=settings.social_delivery_enabled
+        )
+        self._content_connectors = (
+            dict(content_connectors or {}) if settings.creator_signals_enabled else {}
+        )
         self._content_scheduler_enabled = bool(self._content_connectors)
         self._content_scheduler = ConnectorScheduler(
             service.store,
@@ -443,6 +455,7 @@ class KrubitBot(discord.Client):
                     and settings.twitch_client_secret is not None
                 ),
                 twitch_available=live_runtime_enabled,
+                content_runtime=self._content_runtime,
             )
         )
 

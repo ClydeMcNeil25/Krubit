@@ -1643,6 +1643,79 @@ class SQLiteStore:
             raise RuntimeError("saved creator account could not be read")
         return saved
 
+    async def save_migrated_creator_account(
+        self, account: CreatorAccount
+    ) -> CreatorAccount | None:
+        """Idempotently link one Phase 2A-derived creator account without ever
+        clobbering an operator's later decisions about it.
+
+        Used only by `krubit.services.live_signals.migrate_twitch_content` (and, via
+        `_link_twitch_content`, the live Twitch delivery-result path it shares). Unlike
+        `save_creator_account`:
+
+        - An owner conflict (the `(guild_id, account_id)` row already belongs to a
+          different member — for example after a legitimate `/fetch creator transfer`)
+          never raises. It returns `None` so the caller can skip and log this one
+          session rather than crash the whole migration (and, upstream, `krubit run`'s
+          entire boot sequence).
+        - `paused` is never overwritten on an existing row. The migration's own
+          `paused=True` only applies the first time this identity is created; a
+          subsequent `/fetch creator resume` an operator has already applied survives
+          every later boot's migration replay untouched.
+        """
+        _require_guild_id(account.guild_id)
+        async with self._write_transaction(immediate=True):
+            cursor = await self._connection.execute(
+                """
+                SELECT owner_member_id FROM creator_accounts
+                WHERE guild_id = ? AND account_id = ?
+                """,
+                (account.guild_id, account.account_id),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None and int(existing["owner_member_id"]) != account.owner_member_id:
+                return None
+            await self._connection.execute(
+                """
+                INSERT INTO creator_profiles (guild_id, owner_member_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, owner_member_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account.guild_id,
+                    account.owner_member_id,
+                    account.updated_at.isoformat(),
+                    account.updated_at.isoformat(),
+                ),
+            )
+            await self._connection.execute(
+                """
+                INSERT INTO creator_accounts (
+                    guild_id, account_id, owner_member_id, platform, handle, canonical_url,
+                    external_id, paused, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id) DO UPDATE SET
+                    handle = excluded.handle,
+                    canonical_url = excluded.canonical_url,
+                    external_id = excluded.external_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account.guild_id,
+                    account.account_id,
+                    account.owner_member_id,
+                    account.platform.value,
+                    account.handle,
+                    account.canonical_url,
+                    account.external_id,
+                    int(account.paused),
+                    account.created_at.isoformat(),
+                    account.updated_at.isoformat(),
+                ),
+            )
+        return await self.get_creator_account(account.guild_id, account.account_id)
+
     async def transfer_creator_account(
         self, guild_id: int, account_id: str, new_owner_member_id: int, now: datetime
     ) -> CreatorAccount:
