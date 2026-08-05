@@ -81,9 +81,12 @@ BLUESKY_AUTHOR_FEED = {
 
 
 class FakeResponse:
-    def __init__(self, status: int, payload: object) -> None:
+    def __init__(
+        self, status: int, payload: object, *, headers: dict[str, str] | None = None
+    ) -> None:
         self.status = status
         self.payload = payload
+        self.headers = headers or {}
 
     async def __aenter__(self) -> FakeResponse:
         return self
@@ -223,6 +226,15 @@ async def test_fetch_page_raises_rate_limited_on_429() -> None:
     with pytest.raises(BlueskyConnectorError) as excinfo:
         await bluesky_connector({}, status=429).fetch_page(bsky_account(), cursor=None)
     assert excinfo.value.failure.kind is ConnectorFailureKind.RATE_LIMITED
+    assert excinfo.value.retry_after_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_reports_retry_after_header_on_429() -> None:
+    session = FakeSession([FakeResponse(429, {}, headers={"Retry-After": "60"})])
+    with pytest.raises(BlueskyConnectorError) as excinfo:
+        await bluesky_connector_from_session(session).fetch_page(bsky_account(), cursor=None)
+    assert excinfo.value.retry_after_seconds == 60.0
 
 
 @pytest.mark.asyncio

@@ -36,11 +36,12 @@ import hmac
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha1
 from typing import Protocol, cast
 from urllib.parse import parse_qs, urlsplit
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -337,11 +338,18 @@ class YouTubeConnectorError(RuntimeError):
 
     Carries the classified `ConnectorFailure` a caller renders safely; this exception's
     own message is the fixed `kind` name, never provider response text.
+    `retry_after_seconds`, when known, is the real server-instructed (or, for a daily
+    quota, API-documented) resume delay — see `_quota_reset_delay_seconds` and
+    `_retry_after_seconds_from_headers` — so a scheduler never re-polls before the
+    platform actually allows it.
     """
 
-    def __init__(self, failure: ConnectorFailure) -> None:
+    def __init__(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(failure.kind.value)
         self.failure = failure
+        self.retry_after_seconds = retry_after_seconds
 
 
 class _Response(Protocol):
@@ -362,6 +370,41 @@ class _Session(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+_QUOTA_RESET_ZONE = ZoneInfo("America/Los_Angeles")
+
+
+def _quota_reset_delay_seconds(now: datetime) -> float:
+    """Seconds until the next YouTube Data API daily quota reset (midnight Pacific).
+
+    Google documents the YouTube Data API's daily quota as resetting at midnight
+    Pacific time: https://developers.google.com/youtube/v3/getting-started#quota.
+    Used so a `quotaExceeded`/`dailyLimitExceeded` failure schedules its next poll at
+    the real reset instant — commonly 12+ hours away — instead of retrying every few
+    hours against a quota that cannot possibly have recovered.
+    """
+    local = now.astimezone(_QUOTA_RESET_ZONE)
+    next_midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(0.0, (next_midnight - local).total_seconds())
+
+
+def _retry_after_seconds_from_headers(headers: object) -> float | None:
+    """Extract a numeric resume delay from a 429 response's `Retry-After` header."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    for key in ("Retry-After", "retry-after"):
+        value = getter(key)
+        if value is None:
+            continue
+        try:
+            delay = float(str(value))
+        except (TypeError, ValueError):
+            continue
+        if delay > 0:
+            return delay
+    return None
 
 
 class YouTubeConnector:
@@ -567,6 +610,7 @@ class YouTubeConnector:
                 ) as exc:
                     raise self._fail(ConnectorFailure.invalid_response()) from exc
                 status = response.status
+                response_headers = getattr(response, "headers", None)
         except TimeoutError as exc:
             raise self._fail(ConnectorFailure.timeout()) from exc
         except aiohttp.ClientError as exc:
@@ -578,15 +622,23 @@ class YouTubeConnector:
             return mapped_payload
         reason = _error_reason(mapped_payload)
         if status == 403 and reason in {"quotaExceeded", "dailyLimitExceeded"}:
-            raise self._fail(ConnectorFailure.quota_exceeded())
+            raise self._fail(
+                ConnectorFailure.quota_exceeded(),
+                retry_after_seconds=_quota_reset_delay_seconds(self._now()),
+            )
         if status in {401, 403}:
             raise self._fail(ConnectorFailure.authorization())
         if status == 404:
             raise self._fail(ConnectorFailure.not_found())
         if status == 429:
-            raise self._fail(ConnectorFailure.rate_limited())
+            raise self._fail(
+                ConnectorFailure.rate_limited(),
+                retry_after_seconds=_retry_after_seconds_from_headers(response_headers),
+            )
         raise self._fail(ConnectorFailure.invalid_response())
 
-    def _fail(self, failure: ConnectorFailure) -> YouTubeConnectorError:
+    def _fail(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> YouTubeConnectorError:
         self._last_failure = failure
-        return YouTubeConnectorError(failure)
+        return YouTubeConnectorError(failure, retry_after_seconds=retry_after_seconds)

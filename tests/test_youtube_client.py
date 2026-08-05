@@ -28,9 +28,12 @@ NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
 
 
 class FakeResponse:
-    def __init__(self, status: int, payload: object) -> None:
+    def __init__(
+        self, status: int, payload: object, *, headers: dict[str, str] | None = None
+    ) -> None:
         self.status = status
         self.payload = payload
+        self.headers = headers or {}
 
     async def __aenter__(self) -> FakeResponse:
         return self
@@ -319,6 +322,25 @@ async def test_fetch_page_raises_quota_exceeded_on_a_403_quota_error() -> None:
     with pytest.raises(YouTubeConnectorError) as excinfo:
         await connector(session).fetch_page(account(), cursor=None)
     assert excinfo.value.failure.kind is ConnectorFailureKind.QUOTA_EXCEEDED
+    # NOW is 2026-08-05T12:00:00Z == 05:00 Pacific; the daily quota resets at the next
+    # Pacific midnight, 19 hours later — far beyond any generic exponential backoff
+    # cap, which is exactly why this must be honored explicitly rather than guessed.
+    assert excinfo.value.retry_after_seconds == pytest.approx(68_400.0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_reports_retry_after_header_on_a_429() -> None:
+    session = FakeSession(
+        [
+            channel_payload(),
+            FakeResponse(429, {}, headers={"Retry-After": "30"}),
+        ]
+    )
+
+    with pytest.raises(YouTubeConnectorError) as excinfo:
+        await connector(session).fetch_page(account(), cursor=None)
+    assert excinfo.value.failure.kind is ConnectorFailureKind.RATE_LIMITED
+    assert excinfo.value.retry_after_seconds == 30.0
 
 
 @pytest.mark.asyncio
@@ -341,9 +363,7 @@ async def test_fetch_page_raises_invalid_response_for_malformed_json() -> None:
 
 @pytest.mark.asyncio
 async def test_health_reports_ready_until_a_failure_is_observed() -> None:
-    session = FakeSession(
-        [FakeResponse(403, {"error": {"errors": [{"reason": "quotaExceeded"}]}})]
-    )
+    session = FakeSession([FakeResponse(403, {"error": {"errors": [{"reason": "quotaExceeded"}]}})])
     client = connector(session)
 
     healthy = await client.health()

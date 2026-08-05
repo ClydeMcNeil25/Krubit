@@ -72,11 +72,18 @@ class XConnectorError(RuntimeError):
 
     Carries the classified `ConnectorFailure` a caller renders safely; this
     exception's own message is the fixed `kind` name, never provider response text.
+    `retry_after_seconds`, when known, is the real `x-rate-limit-reset` (or
+    `Retry-After`) resume delay a 429 response reported — see
+    `_retry_after_seconds_from_headers` — so a scheduler never re-polls before X's own
+    rate limit window has actually elapsed.
     """
 
-    def __init__(self, failure: ConnectorFailure) -> None:
+    def __init__(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(failure.kind.value)
         self.failure = failure
+        self.retry_after_seconds = retry_after_seconds
 
 
 class _Response(Protocol):
@@ -126,6 +133,37 @@ def _is_reply_repost_or_quote(tweet: Mapping[str, object]) -> bool:
         if mapped is not None and mapped.get("type") in _REPLY_OR_REPOST_TYPES:
             return True
     return False
+
+
+def _retry_after_seconds_from_headers(headers: object, *, now: datetime) -> float | None:
+    """Extract a numeric resume delay from X's 429 rate-limit response headers.
+
+    X sets `x-rate-limit-reset` to a Unix epoch second on a 429; a plain `Retry-After`
+    (seconds) is checked as a fallback for any gateway/proxy in front of the API that
+    might set it instead. Returns `None` if neither header is present or parseable
+    (or resolves to a non-positive delay), letting the scheduler's own exponential
+    backoff apply instead.
+    """
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    reset = getter("x-rate-limit-reset") or getter("X-Rate-Limit-Reset")
+    if reset is not None:
+        try:
+            delay = float(str(reset)) - now.timestamp()
+        except (TypeError, ValueError):
+            delay = None
+        if delay is not None and delay > 0:
+            return delay
+    retry_after = getter("Retry-After") or getter("retry-after")
+    if retry_after is not None:
+        try:
+            delay = float(str(retry_after))
+        except (TypeError, ValueError):
+            return None
+        if delay > 0:
+            return delay
+    return None
 
 
 def _canonical_status_url(handle: str, tweet_id: str) -> str:
@@ -244,6 +282,7 @@ class XConnector:
                 ) as exc:
                     raise self._fail(ConnectorFailure.invalid_response()) from exc
                 status = response.status
+                response_headers = getattr(response, "headers", None)
         except TimeoutError as exc:
             raise self._fail(ConnectorFailure.timeout()) from exc
         except aiohttp.ClientError as exc:
@@ -258,9 +297,16 @@ class XConnector:
         if status == 404:
             raise self._fail(ConnectorFailure.not_found())
         if status == 429:
-            raise self._fail(ConnectorFailure.rate_limited())
+            raise self._fail(
+                ConnectorFailure.rate_limited(),
+                retry_after_seconds=_retry_after_seconds_from_headers(
+                    response_headers, now=self._now()
+                ),
+            )
         raise self._fail(ConnectorFailure.invalid_response())
 
-    def _fail(self, failure: ConnectorFailure) -> XConnectorError:
+    def _fail(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> XConnectorError:
         self._last_failure = failure
-        return XConnectorError(failure)
+        return XConnectorError(failure, retry_after_seconds=retry_after_seconds)

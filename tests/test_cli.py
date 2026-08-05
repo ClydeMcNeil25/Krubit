@@ -12,6 +12,9 @@ import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
 from krubit.discord.bot import KrubitBot
+from krubit.domain.creator_signals import CreatorAccount, Platform
+from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
+from krubit.integrations.catalog import CATALOG
 from krubit.services.foundation import FoundationService
 from krubit.storage.sqlite import SQLiteStore
 
@@ -292,4 +295,78 @@ async def test_enabled_live_runtime_loop_is_cancelled_by_bot_close(
         assert bot.daily_health_summary.get_task() is not None
     finally:
         release.set()
+        await store.close()
+
+
+class _InertConnector:
+    """Enough of `Connector` to enable `content_scheduler_cycle`; never actually called."""
+
+    descriptor = CATALOG[Platform.BLUESKY]
+
+    async def resolve_account(self, recognized: object) -> ConnectorAccount:  # pragma: no cover
+        raise NotImplementedError
+
+    async def fetch_page(
+        self, account: CreatorAccount, *, cursor: str | None
+    ) -> ConnectorPage:  # pragma: no cover
+        raise NotImplementedError
+
+    async def health(
+        self, account: CreatorAccount | None = None
+    ) -> ConnectorHealth:  # pragma: no cover
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_content_scheduler_cycle_survives_an_unhandled_exception_and_runs_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception escaping `run_cycle` must never stop the loop permanently.
+
+    `discord.ext.tasks.Loop` only auto-retries a narrow set of reconnect-worthy
+    exceptions; anything else stops the loop until the process restarts unless the
+    loop body itself catches it. This proves `KrubitBot.content_scheduler_cycle`
+    survives an arbitrary unhandled exception from `ConnectorScheduler.run_cycle` and
+    still fires again on its next tick, rather than silently going dark.
+    """
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(application_id=123, database_path=tmp_path / "krubit.db"),
+        FoundationService(store),
+        content_connectors={Platform.BLUESKY: _InertConnector()},
+    )
+    calls = 0
+    ran_twice = asyncio.Event()
+
+    async def flaky_run_cycle() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated cycle failure")
+        ran_twice.set()
+
+    async def sync() -> None:
+        return None
+
+    async def ready() -> None:
+        return None
+
+    monkeypatch.setattr(bot.tree, "sync", sync)
+    monkeypatch.setattr(bot, "wait_until_ready", ready)
+    monkeypatch.setattr(
+        bot._content_scheduler,  # pyright: ignore[reportPrivateUsage]
+        "run_cycle",
+        flaky_run_cycle,
+    )
+    bot.content_scheduler_cycle.change_interval(seconds=0.01)
+
+    try:
+        await bot.setup_hook()
+        await asyncio.wait_for(ran_twice.wait(), timeout=5)
+
+        assert calls >= 2
+        task = bot.content_scheduler_cycle.get_task()
+        assert task is not None and not task.done()
+    finally:
+        await bot.close()
         await store.close()

@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -28,6 +29,7 @@ from krubit.integrations.base import (
     ConnectorPage,
 )
 from krubit.integrations.catalog import CATALOG
+from krubit.integrations.x import XConnector
 from krubit.storage.sqlite import SQLiteStore
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
@@ -128,6 +130,78 @@ async def test_one_connector_failure_does_not_cancel_other_guild_or_platform_job
     assert bluesky_result is not None and bluesky_result.state is CapabilityState.READY
 
 
+class _FailListingForGuildStore:
+    """Delegates to a real `SQLiteStore` except `list_creator_accounts` for one guild.
+
+    Proxies every other attribute straight through via `__getattr__` so `run_cycle`'s
+    other store calls (`get_content_schedule`, `save_content_schedule`, ...) still hit
+    the real, fully-functional store.
+    """
+
+    def __init__(self, inner: SQLiteStore, *, failing_guild_id: int) -> None:
+        self._inner = inner
+        self._failing_guild_id = failing_guild_id
+        self.attempted_guild_ids: list[int] = []
+
+    async def list_creator_accounts(self, guild_id: int) -> list[CreatorAccount]:
+        self.attempted_guild_ids.append(guild_id)
+        if guild_id == self._failing_guild_id:
+            raise RuntimeError("simulated corrupt row / DB error enumerating this guild")
+        return await self._inner.list_creator_accounts(guild_id)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+@pytest.mark.asyncio
+async def test_one_guilds_account_listing_failure_does_not_prevent_other_guilds_jobs(
+    store: SQLiteStore,
+) -> None:
+    """`list_creator_accounts` raising for one guild must not abort the whole cycle.
+
+    Regression test: `run_cycle` used to call `list_creator_accounts` for every guild
+    directly inside the job-building loop with no per-guild isolation, so a failure for
+    guild 111 (enumerated first) would propagate out of `run_cycle` before
+    `asyncio.gather` was ever reached — discarding jobs already queued for earlier
+    guilds and silently skipping every guild after the failing one, including 222 and
+    333 here.
+    """
+    await store.save_creator_account(account(111, Platform.X, "x-one"))
+    await store.set_guild_enabled(333, True)
+    await store.save_creator_account(account(333, Platform.TIKTOK, "tt-one"))
+    await store.save_creator_account(account(222, Platform.BLUESKY, "bsky-one"))
+    x_connector = FakeConnector(Platform.X, [ConnectorPage(items=())])
+    tiktok_connector = FakeConnector(Platform.TIKTOK, [ConnectorPage(items=())])
+    bluesky_connector = FakeConnector(Platform.BLUESKY, [ConnectorPage(items=())])
+    failing_store = cast(SQLiteStore, _FailListingForGuildStore(store, failing_guild_id=111))
+    supervisor = ConnectorScheduler(
+        failing_store,
+        {
+            Platform.X: x_connector,
+            Platform.TIKTOK: tiktok_connector,
+            Platform.BLUESKY: bluesky_connector,
+        },
+        guild_ids=lambda: (111, 333, 222),
+        now=lambda: NOW,
+        jitter=lambda: 0.0,
+    )
+
+    await supervisor.run_cycle()
+
+    # Guild 111's enumeration failure must not have been swallowed silently for no
+    # reason: it really was attempted, and it really did fail (no result recorded).
+    assert supervisor.result(111, Platform.X) is None
+    assert x_connector.calls == []
+    # Guild 333 (enumerated right after the failing guild) and guild 222 (enumerated
+    # last) must still have run their jobs in the same cycle.
+    assert supervisor.result(333, Platform.TIKTOK) is not None
+    assert supervisor.result(333, Platform.TIKTOK).state is CapabilityState.READY  # type: ignore[union-attr]
+    assert supervisor.result(222, Platform.BLUESKY) is not None
+    assert supervisor.result(222, Platform.BLUESKY).state is CapabilityState.READY  # type: ignore[union-attr]
+    assert tiktok_connector.calls == [account(333, Platform.TIKTOK, "tt-one").account_id]
+    assert bluesky_connector.calls == [account(222, Platform.BLUESKY, "bsky-one").account_id]
+
+
 @pytest.mark.asyncio
 async def test_multiple_guilds_and_platforms_each_get_their_own_result(
     store: SQLiteStore,
@@ -225,6 +299,52 @@ async def test_repeated_failures_back_off_and_never_exceed_the_connector_retry_h
     # interval rather than the faster default backoff.
     assert schedule.interval_seconds >= 5_000
     assert schedule.next_poll_at >= NOW + timedelta(seconds=5_000)
+
+
+@pytest.mark.asyncio
+async def test_real_x_connector_429_header_is_honored_end_to_end(store: SQLiteStore) -> None:
+    """Full pipeline: a real `XConnector` HTTP 429 response with a rate-limit-reset
+    header must drive the scheduler's durable next-poll time, not just a hand-built
+    fake exception. Proves `_classify_scheduler_failure`'s `retry_after_seconds`
+    duck-typing actually lines up with what `XConnector` raises in practice."""
+
+    class RateLimitedResponse:
+        status = 429
+        headers = {"x-rate-limit-reset": str(int(NOW.timestamp()) + 10_800)}
+
+        async def __aenter__(self) -> RateLimitedResponse:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def json(self) -> object:
+            return {}
+
+    class RealX429Session:
+        def get(self, url: str, **kwargs: object) -> RateLimitedResponse:
+            return RateLimitedResponse()
+
+    x_account = account(111, Platform.X, "x-real")
+    await store.save_creator_account(x_account)
+    real_connector = XConnector(RealX429Session(), "bearer-token", now=lambda: NOW)
+    supervisor = ConnectorScheduler(
+        store,
+        {Platform.X: real_connector},
+        guild_ids=lambda: (111,),
+        now=lambda: NOW,
+        jitter=lambda: 0.0,
+    )
+
+    await supervisor.run_cycle()
+
+    schedule = await store.get_content_schedule(111, x_account.account_id, Platform.X)
+    assert schedule is not None
+    # X's own 3-hour (10800s) rate-limit-reset header is far slower than X's 900s
+    # default backoff and must win.
+    assert schedule.interval_seconds >= 10_800
+    result = supervisor.result(111, Platform.X)
+    assert result is not None and result.state is CapabilityState.DEGRADED
 
 
 @pytest.mark.asyncio

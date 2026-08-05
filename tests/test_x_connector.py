@@ -59,9 +59,12 @@ X_TIMELINE_WITH_QUOTE_TWEET_FIXTURE = {
 
 
 class FakeResponse:
-    def __init__(self, status: int, payload: object) -> None:
+    def __init__(
+        self, status: int, payload: object, *, headers: dict[str, str] | None = None
+    ) -> None:
         self.status = status
         self.payload = payload
+        self.headers = headers or {}
 
     async def __aenter__(self) -> FakeResponse:
         return self
@@ -182,7 +185,9 @@ async def test_resolve_account_uses_users_by_username() -> None:
 
     result = await x_connector_from_session(session).resolve_account(
         RecognizedAccountUrl(
-            platform=Platform.X, handle="krucialstudios", canonical_url="https://x.com/krucialstudios"
+            platform=Platform.X,
+            handle="krucialstudios",
+            canonical_url="https://x.com/krucialstudios",
         )
     )
 
@@ -217,6 +222,26 @@ async def test_fetch_page_raises_rate_limited_on_429() -> None:
     with pytest.raises(XConnectorError) as excinfo:
         await x_connector({}, status=429).fetch_page(x_account(), cursor=None)
     assert excinfo.value.failure.kind is ConnectorFailureKind.RATE_LIMITED
+    assert excinfo.value.retry_after_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_reports_retry_after_from_rate_limit_reset_header() -> None:
+    reset_epoch = int(NOW.timestamp()) + 900
+    session = FakeSession([FakeResponse(429, {}, headers={"x-rate-limit-reset": str(reset_epoch)})])
+    with pytest.raises(XConnectorError) as excinfo:
+        await x_connector_from_session(session).fetch_page(x_account(), cursor=None)
+    assert excinfo.value.failure.kind is ConnectorFailureKind.RATE_LIMITED
+    assert excinfo.value.retry_after_seconds is not None
+    assert 890 <= excinfo.value.retry_after_seconds <= 900
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_falls_back_to_retry_after_header_when_reset_is_absent() -> None:
+    session = FakeSession([FakeResponse(429, {}, headers={"Retry-After": "120"})])
+    with pytest.raises(XConnectorError) as excinfo:
+        await x_connector_from_session(session).fetch_page(x_account(), cursor=None)
+    assert excinfo.value.retry_after_seconds == 120.0
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time
 from uuid import uuid4
@@ -39,6 +40,8 @@ from krubit.services.foundation import (
 from krubit.services.health import HealthService
 from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
+
+_logger = logging.getLogger(__name__)
 
 
 class FetchCommands(app_commands.Group):
@@ -471,11 +474,30 @@ class KrubitBot(discord.Client):
 
     @tasks.loop(seconds=60)
     async def content_scheduler_cycle(self) -> None:
-        await self._content_scheduler.run_cycle()
+        """Run one polling cycle without ever letting the loop itself stop.
+
+        `ConnectorScheduler.run_cycle` already isolates every per-guild and per-job
+        failure internally, but `discord.ext.tasks.Loop` only auto-retries a narrow set
+        of reconnect-worthy exceptions (`OSError`/gateway errors) — any other unhandled
+        exception escaping this coroutine stops the loop *permanently* until the
+        process restarts, silently killing polling for every guild and platform. This
+        `try`/`except` is the actual guarantee that one cycle's unexpected failure never
+        does that; `content_scheduler_cycle.error` below only logs it.
+        """
+        try:
+            await self._content_scheduler.run_cycle()
+        except Exception:
+            _logger.exception("content_scheduler_cycle: unhandled exception during run_cycle")
 
     @content_scheduler_cycle.before_loop
     async def before_content_scheduler_cycle(self) -> None:
         await self.wait_until_ready()
+
+    @content_scheduler_cycle.error
+    async def on_content_scheduler_cycle_error(self, exception: BaseException) -> None:
+        _logger.exception(
+            "content_scheduler_cycle: exception escaped the loop body", exc_info=exception
+        )
 
     async def run_daily_summary_for_guild(
         self, guild: discord.Guild, summary_date: date

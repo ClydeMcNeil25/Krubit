@@ -22,6 +22,7 @@ to no mention without ever blocking or duplicating the underlying delivery.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from collections.abc import (
     AsyncIterator,
@@ -67,6 +68,8 @@ from krubit.services.notification_policy import (
     NotificationPolicy,
 )
 from krubit.storage.sqlite import ContentScheduleState, SQLiteStore
+
+_logger = logging.getLogger(__name__)
 
 _HISTORY_RECOVERY_LIMIT = 25
 _RETRACTED_NOTICE = "⚠️ This announcement was retracted by a moderator."
@@ -623,10 +626,27 @@ class ConnectorScheduler:
         return self._results.get((guild_id, platform))
 
     async def run_cycle(self) -> None:
-        """Poll every due, non-paused, connector-backed account exactly once."""
+        """Poll every due, non-paused, connector-backed account exactly once.
+
+        Enumerating one guild's accounts is its own isolation boundary, separate from
+        the per-job boundary `_poll_account` already provides: a `list_creator_accounts`
+        failure for one guild (a DB error, a corrupt row) must only drop that guild's
+        jobs for this cycle, never abort building the job list for every other guild
+        already or still to be enumerated, and never prevent `asyncio.gather` from ever
+        being reached at all.
+        """
         jobs: list[Coroutine[object, object, None]] = []
         for guild_id in self._guild_ids():
-            for account in await self._store.list_creator_accounts(guild_id):
+            try:
+                accounts = await self._store.list_creator_accounts(guild_id)
+            except Exception:
+                _logger.exception(
+                    "ConnectorScheduler: failed to list creator accounts for guild %s; "
+                    "skipping this guild for the current cycle",
+                    guild_id,
+                )
+                continue
+            for account in accounts:
                 if account.paused or account.platform not in self._connectors:
                     continue
                 jobs.append(self._poll_account(guild_id, account))

@@ -72,11 +72,17 @@ class BlueskyConnectorError(RuntimeError):
 
     Carries the classified `ConnectorFailure` a caller renders safely; this
     exception's own message is the fixed `kind` name, never provider response text.
+    `retry_after_seconds`, when known, is the real `Retry-After` resume delay a 429
+    response reported — see `_retry_after_seconds_from_headers` — so a scheduler never
+    re-polls before Bluesky's own rate limit window has actually elapsed.
     """
 
-    def __init__(self, failure: ConnectorFailure) -> None:
+    def __init__(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(failure.kind.value)
         self.failure = failure
+        self.retry_after_seconds = retry_after_seconds
 
 
 class _Response(Protocol):
@@ -115,6 +121,24 @@ def _list(value: object) -> list[object] | None:
     if not isinstance(value, list):
         return None
     return list(cast(list[object], value))
+
+
+def _retry_after_seconds_from_headers(headers: object) -> float | None:
+    """Extract a numeric resume delay from a 429 response's `Retry-After` header."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    for key in ("Retry-After", "retry-after"):
+        value = getter(key)
+        if value is None:
+            continue
+        try:
+            delay = float(str(value))
+        except (TypeError, ValueError):
+            continue
+        if delay > 0:
+            return delay
+    return None
 
 
 def _is_repost(entry: Mapping[str, object]) -> bool:
@@ -208,9 +232,7 @@ class BlueskyConnector:
             capability=Capability.SOCIAL, state=state, detail=self._last_failure.safe_detail
         )
 
-    def _map_post(
-        self, post: Mapping[str, object], handle: str
-    ) -> Mapping[str, JSONValue] | None:
+    def _map_post(self, post: Mapping[str, object], handle: str) -> Mapping[str, JSONValue] | None:
         uri = post.get("uri")
         if not isinstance(uri, str) or not uri:
             return None
@@ -243,6 +265,7 @@ class BlueskyConnector:
                 ) as exc:
                     raise self._fail(ConnectorFailure.invalid_response()) from exc
                 status = response.status
+                response_headers = getattr(response, "headers", None)
         except TimeoutError as exc:
             raise self._fail(ConnectorFailure.timeout()) from exc
         except aiohttp.ClientError as exc:
@@ -260,9 +283,14 @@ class BlueskyConnector:
         if status == 404:
             raise self._fail(ConnectorFailure.not_found())
         if status == 429:
-            raise self._fail(ConnectorFailure.rate_limited())
+            raise self._fail(
+                ConnectorFailure.rate_limited(),
+                retry_after_seconds=_retry_after_seconds_from_headers(response_headers),
+            )
         raise self._fail(ConnectorFailure.invalid_response())
 
-    def _fail(self, failure: ConnectorFailure) -> BlueskyConnectorError:
+    def _fail(
+        self, failure: ConnectorFailure, *, retry_after_seconds: float | None = None
+    ) -> BlueskyConnectorError:
         self._last_failure = failure
-        return BlueskyConnectorError(failure)
+        return BlueskyConnectorError(failure, retry_after_seconds=retry_after_seconds)
