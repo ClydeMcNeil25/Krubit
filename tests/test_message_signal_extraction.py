@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from krubit.discord.watchdog_events import extract_message_signals
+from krubit.domain.watchdog import RiskBand, evaluate_risk_band
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
 
@@ -77,6 +78,37 @@ def test_mention_everyone_flags_mass_mentions() -> None:
         message(mention_everyone=True, content="@everyone hi"), now=NOW
     )
     assert any(s.name == "mass_mentions" for s in signals)
+
+
+def test_everyone_mention_alone_reaches_suspicious_band_by_design() -> None:
+    """The one deliberate exception to "no single message-signal escalates alone".
+
+    A bare `@everyone`/`@here` ping is already maximally disruptive to the guild on
+    its own, so `mass_mentions`'s HIGH tier (weight 6 @ confidence 0.7 = effective
+    4.2) is intentionally allowed to clear `_SUSPICIOUS_THRESHOLD` (3.0) by itself —
+    see the "Message-signal thresholds" section of `watchdog_events.py`'s module
+    docstring for the full rationale and its precedent in `extract_join_signals`'s
+    `account_age`/`join_velocity` HIGH tiers.
+    """
+    signals = extract_message_signals(message(mention_everyone=True), now=NOW)
+    band, _ = evaluate_risk_band(signals)
+    assert band in (RiskBand.SUSPICIOUS, RiskBand.INCIDENT)
+
+
+def test_high_tier_explicit_mention_count_alone_reaches_suspicious_band_by_design() -> None:
+    """Same exception, reached via >= 15 explicit mentions instead of @everyone."""
+    signals = extract_message_signals(message(mention_count=15), now=NOW)
+    band, _ = evaluate_risk_band(signals)
+    assert band in (RiskBand.SUSPICIOUS, RiskBand.INCIDENT)
+
+
+def test_elevated_mention_count_alone_stays_at_watch_band() -> None:
+    """The ELEVATED tier (below HIGH) is NOT part of the exception — it must never,
+    by itself, clear `_SUSPICIOUS_THRESHOLD` alone, matching the general rule.
+    """
+    signals = extract_message_signals(message(mention_count=8), now=NOW)
+    band, _ = evaluate_risk_band(signals)
+    assert band is RiskBand.WATCH
 
 
 def test_known_shortener_domain_flags_malicious_link_shape() -> None:

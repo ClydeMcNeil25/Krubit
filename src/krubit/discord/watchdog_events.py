@@ -101,17 +101,30 @@ _GARBAGE_USERNAME_PATTERN = re.compile(r"^\d+$")
 # prior: this member already looked worth a second look. That does NOT mean these
 # thresholds should be loose — a false accusation against an already-anxious watched
 # member is still a worse failure mode than a slow catch — so every weight/confidence
-# pair below is chosen the same way the join signals were: no single message-signal
-# should clear `_SUSPICIOUS_THRESHOLD` (3.0) alone.
+# pair below is chosen the same way the join signals were: with ONE deliberate,
+# explicitly-named exception (below), no single message-signal should clear
+# `_SUSPICIOUS_THRESHOLD` (3.0) alone.
 #
 # - `mass_mentions` (weight 3 @ 0.5 = 1.5 at >= 8 combined user/role mentions; weight 6
 #   @ 0.7 = 4.2 at >= 15, and unconditionally at the same weight/confidence for an
 #   `@everyone`/`@here` ping): an ordinary message rarely pings more than a handful of
 #   people; a burst of mentions is the classic "ping the whole server" spam/raid
-#   pattern. The `@everyone`/`@here` tier intentionally matches the high tier's
-#   weight/confidence regardless of the accompanying explicit-mention count, since a
-#   guild-wide ping is already maximally disruptive on its own — counting explicit
-#   mentions on top of it would not make it more or less alarming.
+#   pattern. **This is the one exception to the "no single signal alone" rule above,
+#   deliberately, not by oversight**: the HIGH tier's effective weight (6 * 0.7 = 4.2)
+#   exceeds `_SUSPICIOUS_THRESHOLD` (3.0) by itself, mirroring the precedent already
+#   set by `extract_join_signals`'s own `account_age` < 1h tier (4.5) and
+#   `join_velocity` HIGH tier (4.2) — see that function's module docstring. A message
+#   mentioning 15+ users/roles at once, or a bare `@everyone`/`@here` ping, is already
+#   maximally disruptive to the guild on its own; requiring a second corroborating
+#   signal before treating it as more than "quietly worth watching" would under-react
+#   to the single clearest, most self-evident message-level attack pattern this
+#   function can observe. The `@everyone`/`@here` case intentionally matches the high
+#   tier's weight/confidence regardless of the accompanying explicit-mention count,
+#   since a guild-wide ping is already maximally disruptive on its own — counting
+#   explicit mentions on top of it would not make it more or less alarming. The
+#   ELEVATED tier (1.5) stays well under threshold, so an ordinary handful-of-mentions
+#   message never escalates alone; only the HIGH tier and the `@everyone`/`@here` case
+#   carry this exception.
 # - `malicious_link_shape` (weight 4 @ 0.6 = 2.4): fires on structural URL red flags
 #   only — a bare IP-address host, `userinfo@host` credential/redirect tricks (the
 #   classic `https://real-site.com@evil.tld/` phishing shape), or a known link-
@@ -409,7 +422,10 @@ def extract_message_signals(message: MessageSubject, now: datetime) -> tuple[Ris
     caller responsible for ensuring this function only ever runs for a member with a
     currently open watch window). Two calls with equal inputs always return an equal
     result. See the module docstring's "Message-signal thresholds" section for the
-    weight/confidence rationale behind each signal below.
+    weight/confidence rationale behind each signal below. `now` is currently only used
+    for timezone-awareness validation (no signal here is time-based yet); it stays a
+    required parameter so a future time-sensitive message signal (e.g. posting-rate
+    within a rolling window) can be added without changing this function's signature.
     """
     _require_aware("now", now)
 
