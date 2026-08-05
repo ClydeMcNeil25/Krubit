@@ -17,7 +17,7 @@ from krubit.discord.content_commands import (
 from krubit.discord.content_runtime import ContentRuntime, delivery_id_for
 from krubit.domain.creator_signals import ContentKind, CreatorRoute, Platform
 from krubit.services.content_signals import ContentSignalService
-from krubit.storage.sqlite import SQLiteStore
+from krubit.storage.sqlite import CreatorRegistryReceipt, SQLiteStore
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
 
@@ -217,7 +217,15 @@ async def test_remove_pauses_rather_than_deletes(
     account_id = added.detail["account_id"]
     assert isinstance(account_id, str)
 
-    await commands.creator_remove(actor=creator_member(), account_id=account_id, confirm=True)
+    preview = await commands.creator_remove(actor=creator_member(), account_id=account_id)
+    assert preview.card is not None
+    assert "does not delete any data" in preview.card.description
+
+    result = await commands.creator_remove(
+        actor=creator_member(), account_id=account_id, confirm=True
+    )
+    assert result.card is not None
+    assert "Not Deleted" in result.card.title or "No data was deleted" in result.card.description
 
     stored = await store.get_creator_account(GUILD_ID, account_id)
     assert stored is not None  # history preserved, never hard-deleted
@@ -244,6 +252,101 @@ async def test_transfer_is_admin_only(commands: ContentCommandService) -> None:
         actor=admin_member(), account_id=account_id, new_owner_member_id=OTHER_ID
     )
     assert allowed.status is CommandStatus.CONFIRMATION_REQUIRED
+
+
+# -- route: produces a redacted audit receipt ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_route_change_records_a_redacted_audit_receipt(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=YOUTUBE_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+
+    def route_receipts(
+        receipts: list[CreatorRegistryReceipt],
+    ) -> list[CreatorRegistryReceipt]:
+        return [r for r in receipts if r.action == "route_account"]
+
+    preview = await commands.creator_route(
+        actor=creator_member(),
+        account_id=account_id,
+        content_kind=ContentKind.VIDEO,
+        channel_id=444,
+        mention_role_id=None,
+    )
+    assert preview.status is CommandStatus.CONFIRMATION_REQUIRED
+    before = await store.list_creator_registry_receipts(GUILD_ID, account_id)
+    assert route_receipts(before) == []  # confirmation alone never records a receipt
+
+    result = await commands.creator_route(
+        actor=creator_member(),
+        account_id=account_id,
+        content_kind=ContentKind.VIDEO,
+        channel_id=444,
+        mention_role_id=None,
+        confirm=True,
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+
+    routes = await store.list_creator_routes(GUILD_ID, account_id)
+    assert len(routes) == 1
+    assert routes[0].channel_id == 444
+
+    after = await store.list_creator_registry_receipts(GUILD_ID, account_id)
+    routed = route_receipts(after)
+    assert len(routed) == 1
+    assert routed[0].detail["channel_id"] == 444
+
+
+@pytest.mark.asyncio
+async def test_route_change_denied_for_non_owner_records_no_receipt(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=YOUTUBE_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+
+    denied = await commands.creator_route(
+        actor=other_member(),
+        account_id=account_id,
+        content_kind=ContentKind.VIDEO,
+        channel_id=444,
+        mention_role_id=None,
+        confirm=True,
+    )
+    assert denied.status is CommandStatus.DENIED
+    receipts = await store.list_creator_registry_receipts(GUILD_ID, account_id)
+    assert [r for r in receipts if r.action == "route_account"] == []
+    assert await store.list_creator_routes(GUILD_ID, account_id) == []
+
+
+# -- verify: discloses it is a static platform baseline, not a live per-account check --
+
+
+@pytest.mark.asyncio
+async def test_verify_card_discloses_it_is_a_static_platform_baseline(
+    commands: ContentCommandService,
+) -> None:
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=YOUTUBE_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+
+    result = await commands.creator_verify(actor=creator_member(), account_id=account_id)
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert "not a live check" in result.card.description
+    assert any(
+        field.name == "This account's monitoring state" for field in result.card.fields
+    )
 
 
 # -- notification preview: zero side effects ------------------------------------------

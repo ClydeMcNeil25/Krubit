@@ -15,7 +15,9 @@ from uuid import uuid4
 
 from krubit.domain.creator_signals import (
     Capability,
+    ContentKind,
     CreatorAccount,
+    CreatorRoute,
     Platform,
     RecognizedAccountUrl,
     creator_account_id,
@@ -198,6 +200,56 @@ class CreatorRegistry:
             detail={
                 "previous_owner_member_id": existing.owner_member_id,
                 "new_owner_member_id": new_owner_member_id,
+            },
+            now=now,
+        )
+        return saved
+
+    async def save_route(
+        self,
+        *,
+        guild_id: int,
+        actor_member_id: int,
+        account_id: str,
+        actor_is_admin: bool,
+        actor_has_creator_role: bool,
+        content_kind: ContentKind,
+        channel_id: int,
+        mention_role_id: int | None,
+        now: datetime,
+    ) -> CreatorRoute:
+        """Route one account's content-kind bucket to a Discord channel/mention role.
+
+        Enforces the same admin-or-owning-Creator authority as every other mutation
+        here, and records a redacted audit receipt on success — matching the global
+        constraint that route changes produce redacted audit receipts, the same as
+        add/pause/resume/transfer.
+        """
+        existing = await self._existing_account(guild_id, account_id)
+        _require_authority(
+            actor_member_id=actor_member_id,
+            owner_member_id=existing.owner_member_id,
+            actor_is_admin=actor_is_admin,
+            actor_has_creator_role=actor_has_creator_role,
+        )
+        route = CreatorRoute(
+            guild_id=guild_id,
+            account_id=account_id,
+            content_kind=content_kind,
+            channel_id=channel_id,
+            mention_role_id=mention_role_id,
+            updated_at=now,
+        )
+        saved = await self._store.save_creator_route(route)
+        await self._record_receipt(
+            guild_id=guild_id,
+            account_id=account_id,
+            action="route_account",
+            actor_member_id=actor_member_id,
+            detail={
+                "content_kind": content_kind.value,
+                "channel_id": channel_id,
+                "mention_role_id": mention_role_id,
             },
             now=now,
         )

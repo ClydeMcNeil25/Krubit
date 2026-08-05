@@ -45,7 +45,6 @@ from krubit.domain.creator_signals import (
     ContentEvent,
     ContentKind,
     ContentState,
-    CreatorRoute,
     Platform,
 )
 from krubit.domain.models import Card, CardField, JSONValue
@@ -224,7 +223,14 @@ class ContentCommandService:
         )
 
     async def _toggle_pause(
-        self, *, actor: ActorContext, account_id: str, paused: bool, confirm: bool, verb: str
+        self,
+        *,
+        actor: ActorContext,
+        account_id: str,
+        paused: bool,
+        confirm: bool,
+        verb: str,
+        is_removal: bool = False,
     ) -> CommandResult:
         existing = await self._store.get_creator_account(actor.guild_id, account_id)
         if existing is None:
@@ -239,11 +245,25 @@ class ContentCommandService:
         except CreatorAuthorityError as exc:
             return _denied(exc)
         if not confirm:
-            card = _confirmation(
-                title=f"{verb.title()} Creator Account",
-                description=f"{verb.title()} {existing.handle}?",
-                Account=existing.handle,
-            )
+            if is_removal:
+                # "Remove" has no hard-delete path in Krubit — it is operationally a
+                # pause. The confirmation copy must say so plainly so an operator or
+                # creator can never mistake this for their data being deleted.
+                card = _confirmation(
+                    title="Pause Creator Account (Remove)",
+                    description=(
+                        f"This does not delete any data. Pause monitoring for "
+                        f"{existing.handle}? History and receipts are preserved, and "
+                        f"you can resume it later with /fetch creator resume."
+                    ),
+                    Account=existing.handle,
+                )
+            else:
+                card = _confirmation(
+                    title=f"{verb.title()} Creator Account",
+                    description=f"{verb.title()} {existing.handle}?",
+                    Account=existing.handle,
+                )
             return CommandResult(
                 CommandStatus.CONFIRMATION_REQUIRED, card=card, detail={"account_id": account_id}
             )
@@ -257,7 +277,16 @@ class ContentCommandService:
             actor_has_creator_role=actor.has_creator_role,
             now=now,
         )
-        card = Card("fetched", f"Fetched: Account {verb.title()}d", updated.handle)
+        if is_removal:
+            card = Card(
+                "fetched",
+                "Fetched: Account Paused (Not Deleted)",
+                f"{updated.handle}'s monitoring is paused. No data was deleted — "
+                f"history and receipts are preserved, and this can be reversed with "
+                f"/fetch creator resume.",
+            )
+        else:
+            card = Card("fetched", f"Fetched: Account {verb.title()}d", updated.handle)
         return CommandResult(CommandStatus.SUCCEEDED, card=card, detail={"paused": updated.paused})
 
     async def creator_pause(
@@ -279,9 +308,16 @@ class ContentCommandService:
     ) -> CommandResult:
         """Krubit has no hard-delete path for a creator account — removal pauses it,
         preserving its ledger and receipt history, matching `CreatorRegistry.
-        pause_account`'s documented behavior."""
+        pause_account`'s documented behavior. Both the confirmation and result card
+        copy say this plainly (`is_removal=True`) so an operator or creator can never
+        mistake a pause for their data actually being deleted."""
         return await self._toggle_pause(
-            actor=actor, account_id=account_id, paused=True, confirm=confirm, verb="remove"
+            actor=actor,
+            account_id=account_id,
+            paused=True,
+            confirm=confirm,
+            verb="remove",
+            is_removal=True,
         )
 
     async def creator_transfer(
@@ -360,15 +396,17 @@ class ContentCommandService:
             return CommandResult(
                 CommandStatus.CONFIRMATION_REQUIRED, card=card, detail={"account_id": account_id}
             )
-        route = CreatorRoute(
+        saved = await self._registry.save_route(
             guild_id=actor.guild_id,
+            actor_member_id=actor.member_id,
             account_id=account_id,
+            actor_is_admin=actor.is_admin,
+            actor_has_creator_role=actor.has_creator_role,
             content_kind=content_kind,
             channel_id=channel_id,
             mention_role_id=mention_role_id,
-            updated_at=self._now(),
+            now=self._now(),
         )
-        saved = await self._store.save_creator_route(route)
         card = Card(
             "fetched",
             "Fetched: Route Saved",
@@ -452,14 +490,32 @@ class ContentCommandService:
         except CreatorAuthorityError as exc:
             return _denied(exc)
         descriptor = CATALOG[existing.platform]
-        fields = tuple(
-            CardField(fact.capability.value, fact.state.value, True)
-            for fact in descriptor.capabilities
+        # `CATALOG` facts are static and platform-wide — identical for every account on
+        # this platform, regardless of that specific account's real authorization
+        # state. `existing.paused` is the one genuinely account-specific signal this
+        # command can report without a live connector call (no connector instances are
+        # wired into this command layer yet). Both the title and the leading field make
+        # that distinction explicit so this is never mistaken for a live per-account
+        # authorization check.
+        fields = (
+            CardField(
+                "This account's monitoring state",
+                "paused" if existing.paused else "active",
+                False,
+            ),
+            *(
+                CardField(f"Platform baseline: {fact.capability.value}", fact.state.value, True)
+                for fact in descriptor.capabilities
+            ),
         )
         card = Card(
             "fetched",
-            f"Fetched: {existing.handle} Capability State",
-            "Declared capability states for this account's platform.",
+            f"Fetched: {existing.platform.value} Baseline Capability Declaration",
+            (
+                f"{existing.handle}'s platform-wide baseline capability declaration — "
+                "not a live check of this account's current authorization. Krubit does "
+                "not yet perform a live per-account verification call."
+            ),
             fields=fields,
         )
         return CommandResult(CommandStatus.SUCCEEDED, card=card, detail={"account_id": account_id})
@@ -897,7 +953,9 @@ class CreatorCommands(app_commands.Group):
         result = await self._service.creator_show(actor=actor, account_id=account_id)
         await self._present(interaction, result)
 
-    @app_commands.command(name="verify", description="Show one creator account's capability state")
+    @app_commands.command(
+        name="verify", description="Show the platform's baseline capability declaration"
+    )
     @app_commands.guild_only()
     async def verify(self, interaction: discord.Interaction, account_id: str) -> None:
         actor = await _actor_context(self._service, interaction)
