@@ -108,8 +108,8 @@ _CATALOG_ENTRIES: tuple[_PlatformEntry, ...] = (
             ),
             CapabilityFact(
                 Capability.LIVE,
-                CapabilityState.READY,
-                "Discord presence plus Twitch API verification",
+                CapabilityState.UNCONFIGURED,
+                "Requires Twitch API client credentials",
             ),
         ),
     ),
