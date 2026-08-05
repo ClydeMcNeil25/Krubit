@@ -9,11 +9,15 @@ contains no I/O, no platform-specific parsing, and no persistence.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
+from hashlib import sha256
 
 _MAX_HANDLE_LENGTH = 128
 _MAX_URL_LENGTH = 2_048
 _MAX_DETAIL_LENGTH = 200
+_MAX_EXTERNAL_ID_LENGTH = 200
+_MAX_ACCOUNT_ID_LENGTH = 64
 
 
 class Platform(StrEnum):
@@ -89,6 +93,16 @@ def _require_text(name: str, value: str, *, limit: int) -> None:
         raise ValueError(f"{name} exceeds {limit} characters")
 
 
+def _require_positive_id(name: str, value: int) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _require_aware(name: str, value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must include a timezone")
+
+
 @dataclass(frozen=True, slots=True)
 class RecognizedAccountUrl:
     """A pasted creator profile URL normalized to a stable platform/handle identity."""
@@ -121,3 +135,97 @@ class CapabilityFact:
             raise ValueError("state must be a CapabilityState")
         if self.detail is not None:
             _require_text("detail", self.detail, limit=_MAX_DETAIL_LENGTH)
+
+
+def creator_account_id(platform: Platform, external_id: str) -> str:
+    """Derive the stable, guild-independent identity for one platform account.
+
+    Two enrollment attempts for the same resolved platform identity always produce the
+    same account_id, which is what lets storage reject a second owner for that identity
+    within a guild.
+    """
+    if type(platform) is not Platform:
+        raise ValueError("platform must be a Platform")
+    _require_text("external_id", external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+    identity = f"{platform.value}:{external_id}"
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CreatorProfile:
+    """A Discord member's creator profile within one guild.
+
+    Grouping entity for a member's owned accounts. Carries no mutable display name;
+    identity comes from the Discord member ID.
+    """
+
+    guild_id: int
+    owner_member_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_positive_id("owner_member_id", self.owner_member_id)
+        _require_aware("created_at", self.created_at)
+        _require_aware("updated_at", self.updated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class CreatorAccount:
+    """One approved external platform account owned by a member in one guild.
+
+    `account_id` is the stable identity from `creator_account_id`; it is derived from
+    the platform and resolved external ID, not from `guild_id` or `owner_member_id`, so
+    the same external account is recognized consistently across guilds while storage
+    still enforces one owner per guild.
+    """
+
+    guild_id: int
+    account_id: str
+    owner_member_id: int
+    platform: Platform
+    handle: str
+    canonical_url: str
+    external_id: str
+    paused: bool
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        _require_positive_id("owner_member_id", self.owner_member_id)
+        if type(self.platform) is not Platform:
+            raise ValueError("platform must be a Platform")
+        _require_text("handle", self.handle, limit=_MAX_HANDLE_LENGTH)
+        _require_text("canonical_url", self.canonical_url, limit=_MAX_URL_LENGTH)
+        if not self.canonical_url.startswith("https://"):
+            raise ValueError("canonical_url must use https")
+        _require_text("external_id", self.external_id, limit=_MAX_EXTERNAL_ID_LENGTH)
+        if type(self.paused) is not bool:
+            raise ValueError("paused must be a bool")
+        _require_aware("created_at", self.created_at)
+        _require_aware("updated_at", self.updated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class CreatorRoute:
+    """The Discord destination for one account's content-kind bucket in one guild."""
+
+    guild_id: int
+    account_id: str
+    content_kind: ContentKind
+    channel_id: int
+    mention_role_id: int | None
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_text("account_id", self.account_id, limit=_MAX_ACCOUNT_ID_LENGTH)
+        if type(self.content_kind) is not ContentKind:
+            raise ValueError("content_kind must be a ContentKind")
+        _require_positive_id("channel_id", self.channel_id)
+        if self.mention_role_id is not None:
+            _require_positive_id("mention_role_id", self.mention_role_id)
+        _require_aware("updated_at", self.updated_at)

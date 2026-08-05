@@ -16,6 +16,7 @@ from uuid import uuid4
 import aiosqlite
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
+from krubit.domain.creator_signals import CreatorAccount, CreatorProfile, CreatorRoute
 from krubit.domain.live_signals import (
     LiveSignalConfig,
     LiveSignalSession,
@@ -24,6 +25,11 @@ from krubit.domain.live_signals import (
 )
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
 from krubit.security.redaction import redact
+from krubit.storage.creator_rows import (
+    creator_account_from_row,
+    creator_profile_from_row,
+    creator_route_from_row,
+)
 
 
 def _json_object(value: object) -> dict[str, JSONValue]:
@@ -64,6 +70,23 @@ class LiveSignalDelivery:
     attempt: int
     channel_id: int | None
     message_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CreatorRegistryReceipt:
+    """A guild-scoped, redacted audit record of a creator registry authority decision.
+
+    Storage-only view type: every row here represents a change that already succeeded,
+    so unlike `ActionReceipt` there is no `status` field to track a failed attempt.
+    """
+
+    guild_id: int
+    receipt_id: str
+    account_id: str | None
+    action: str
+    actor_member_id: int
+    detail: dict[str, JSONValue]
+    created_at: datetime
 
 
 class SQLiteStore:
@@ -222,6 +245,72 @@ class SQLiteStore:
                 checked_at TEXT NOT NULL,
                 PRIMARY KEY (guild_id, check_id)
             );
+
+            CREATE TABLE IF NOT EXISTS creator_profiles (
+                guild_id INTEGER NOT NULL,
+                owner_member_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, owner_member_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS creator_accounts (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                owner_member_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                handle TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 1 CHECK (paused IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id),
+                FOREIGN KEY (guild_id, owner_member_id)
+                    REFERENCES creator_profiles (guild_id, owner_member_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_creator_accounts_guild_owner
+                ON creator_accounts (guild_id, owner_member_id);
+
+            CREATE TABLE IF NOT EXISTS creator_routes (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                mention_role_id INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id, content_kind),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS connector_authorizations (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                secret_ref TEXT,
+                status TEXT NOT NULL,
+                expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id, capability),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS creator_registry_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                account_id TEXT,
+                action TEXT NOT NULL,
+                actor_member_id INTEGER NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_creator_registry_receipts_guild_account
+                ON creator_registry_receipts (guild_id, account_id, created_at DESC);
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -1210,3 +1299,283 @@ class SQLiteStore:
         )
         row = await cursor.fetchone()
         return str(row["status"]) if row is not None else None
+
+    async def save_creator_account(self, account: CreatorAccount) -> CreatorAccount:
+        """Insert or update a creator account, guarding against a silent owner change.
+
+        A platform identity (`account_id`) may exist at most once per guild. Saving an
+        account whose `account_id` is already registered to a different owner in this
+        guild raises `ValueError`; changing the owner requires `transfer_creator_account`.
+        """
+        _require_guild_id(account.guild_id)
+        async with self._write_transaction(immediate=True):
+            cursor = await self._connection.execute(
+                """
+                SELECT owner_member_id FROM creator_accounts
+                WHERE guild_id = ? AND account_id = ?
+                """,
+                (account.guild_id, account.account_id),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None and int(existing["owner_member_id"]) != account.owner_member_id:
+                raise ValueError(
+                    f"{account.platform.value} account {account.handle!r} is already "
+                    "registered to a different owner in this guild"
+                )
+            await self._connection.execute(
+                """
+                INSERT INTO creator_profiles (guild_id, owner_member_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, owner_member_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account.guild_id,
+                    account.owner_member_id,
+                    account.updated_at.isoformat(),
+                    account.updated_at.isoformat(),
+                ),
+            )
+            await self._connection.execute(
+                """
+                INSERT INTO creator_accounts (
+                    guild_id, account_id, owner_member_id, platform, handle, canonical_url,
+                    external_id, paused, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id) DO UPDATE SET
+                    owner_member_id = excluded.owner_member_id,
+                    platform = excluded.platform,
+                    handle = excluded.handle,
+                    canonical_url = excluded.canonical_url,
+                    external_id = excluded.external_id,
+                    paused = excluded.paused,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account.guild_id,
+                    account.account_id,
+                    account.owner_member_id,
+                    account.platform.value,
+                    account.handle,
+                    account.canonical_url,
+                    account.external_id,
+                    int(account.paused),
+                    account.created_at.isoformat(),
+                    account.updated_at.isoformat(),
+                ),
+            )
+        saved = await self.get_creator_account(account.guild_id, account.account_id)
+        if saved is None:
+            raise RuntimeError("saved creator account could not be read")
+        return saved
+
+    async def transfer_creator_account(
+        self, guild_id: int, account_id: str, new_owner_member_id: int, now: datetime
+    ) -> CreatorAccount:
+        """Reassign an existing account's owner.
+
+        The only path that may change `owner_member_id` for an existing account, kept
+        separate from `save_creator_account` so ownership changes are always an explicit,
+        auditable action rather than a side effect of an ordinary upsert.
+        """
+        _require_guild_id(guild_id)
+        if new_owner_member_id <= 0:
+            raise ValueError("new_owner_member_id must be positive")
+        async with self._write_transaction(immediate=True):
+            cursor = await self._connection.execute(
+                "SELECT 1 FROM creator_accounts WHERE guild_id = ? AND account_id = ?",
+                (guild_id, account_id),
+            )
+            if await cursor.fetchone() is None:
+                raise ValueError(f"creator account {account_id!r} was not found in this guild")
+            await self._connection.execute(
+                """
+                INSERT INTO creator_profiles (guild_id, owner_member_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, owner_member_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, new_owner_member_id, now.isoformat(), now.isoformat()),
+            )
+            await self._connection.execute(
+                """
+                UPDATE creator_accounts SET owner_member_id = ?, updated_at = ?
+                WHERE guild_id = ? AND account_id = ?
+                """,
+                (new_owner_member_id, now.isoformat(), guild_id, account_id),
+            )
+        saved = await self.get_creator_account(guild_id, account_id)
+        if saved is None:
+            raise RuntimeError("transferred creator account could not be read")
+        return saved
+
+    async def get_creator_account(self, guild_id: int, account_id: str) -> CreatorAccount | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM creator_accounts WHERE guild_id = ? AND account_id = ?",
+            (guild_id, account_id),
+        )
+        return creator_account_from_row(await cursor.fetchone())
+
+    async def list_creator_accounts(self, guild_id: int) -> list[CreatorAccount]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM creator_accounts WHERE guild_id = ?
+            ORDER BY created_at ASC, account_id ASC
+            """,
+            (guild_id,),
+        )
+        accounts = [creator_account_from_row(row) for row in await cursor.fetchall()]
+        return [account for account in accounts if account is not None]
+
+    async def list_creator_accounts_for_owner(
+        self, guild_id: int, owner_member_id: int
+    ) -> list[CreatorAccount]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM creator_accounts
+            WHERE guild_id = ? AND owner_member_id = ?
+            ORDER BY created_at ASC, account_id ASC
+            """,
+            (guild_id, owner_member_id),
+        )
+        accounts = [creator_account_from_row(row) for row in await cursor.fetchall()]
+        return [account for account in accounts if account is not None]
+
+    async def get_creator_profile(
+        self, guild_id: int, owner_member_id: int
+    ) -> CreatorProfile | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT * FROM creator_profiles WHERE guild_id = ? AND owner_member_id = ?",
+            (guild_id, owner_member_id),
+        )
+        return creator_profile_from_row(await cursor.fetchone())
+
+    async def save_creator_route(self, route: CreatorRoute) -> CreatorRoute:
+        _require_guild_id(route.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO creator_routes (
+                    guild_id, account_id, content_kind, channel_id, mention_role_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id, content_kind) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    mention_role_id = excluded.mention_role_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    route.guild_id,
+                    route.account_id,
+                    route.content_kind.value,
+                    route.channel_id,
+                    route.mention_role_id,
+                    route.updated_at.isoformat(),
+                ),
+            )
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM creator_routes
+            WHERE guild_id = ? AND account_id = ? AND content_kind = ?
+            """,
+            (route.guild_id, route.account_id, route.content_kind.value),
+        )
+        saved = creator_route_from_row(await cursor.fetchone())
+        if saved is None:
+            raise RuntimeError("saved creator route could not be read")
+        return saved
+
+    async def list_creator_routes(self, guild_id: int, account_id: str) -> list[CreatorRoute]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM creator_routes
+            WHERE guild_id = ? AND account_id = ?
+            ORDER BY content_kind ASC
+            """,
+            (guild_id, account_id),
+        )
+        routes = [creator_route_from_row(row) for row in await cursor.fetchall()]
+        return [route for route in routes if route is not None]
+
+    async def record_creator_registry_receipt(
+        self,
+        *,
+        guild_id: int,
+        receipt_id: str,
+        account_id: str | None,
+        action: str,
+        actor_member_id: int,
+        detail: dict[str, JSONValue],
+        created_at: datetime,
+    ) -> None:
+        """Record a redacted audit receipt for a creator registry authority decision."""
+        _require_guild_id(guild_id)
+        safe_detail = _json_object(redact(detail))
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO creator_registry_receipts (
+                    guild_id, receipt_id, account_id, action, actor_member_id, detail_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt_id,
+                    account_id,
+                    action,
+                    actor_member_id,
+                    json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def list_creator_registry_receipts(
+        self, guild_id: int, account_id: str | None = None, limit: int = 50
+    ) -> list[CreatorRegistryReceipt]:
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if account_id is None:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, account_id, action, actor_member_id, detail_json,
+                       created_at
+                FROM creator_registry_receipts
+                WHERE guild_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, receipt_id, account_id, action, actor_member_id, detail_json,
+                       created_at
+                FROM creator_registry_receipts
+                WHERE guild_id = ? AND account_id = ?
+                ORDER BY created_at DESC, receipt_id DESC
+                LIMIT ?
+                """,
+                (guild_id, account_id, limit),
+            )
+        rows = await cursor.fetchall()
+        return [self._creator_registry_receipt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _creator_registry_receipt_from_row(row: aiosqlite.Row) -> CreatorRegistryReceipt:
+        stored_account_id = row["account_id"]
+        return CreatorRegistryReceipt(
+            guild_id=int(row["guild_id"]),
+            receipt_id=str(row["receipt_id"]),
+            account_id=str(stored_account_id) if stored_account_id is not None else None,
+            action=str(row["action"]),
+            actor_member_id=int(row["actor_member_id"]),
+            detail=_json_object(json.loads(str(row["detail_json"]))),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
