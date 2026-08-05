@@ -412,6 +412,7 @@ class KrubitBot(discord.Client):
         connector: BaseConnector | None = None,
         twitch: TwitchClient | None = None,
         content_connectors: Mapping[Platform, Connector] | None = None,
+        request_message_content_intent: bool | None = None,
     ) -> None:
         # `phase_three_intents()`'s new `message_content`/`messages` flags are only
         # requested when `watchdog_enabled` is explicitly on: requesting a privileged
@@ -419,8 +420,26 @@ class KrubitBot(discord.Client):
         # Content in the Discord Developer Portal before the bot could connect at
         # all, even for a deployment that never opts into Watchdog -- breaking the
         # "safe by default" promise `watchdog_enabled=False` is supposed to keep.
+        #
+        # `request_message_content_intent` lets a caller override that default
+        # decision independently of `settings.watchdog_enabled`. This exists for
+        # exactly one caller: `krubit.__main__._run_bot`'s fallback retry after a
+        # `discord.PrivilegedIntentsRequired` failure -- see that function's
+        # docstring for why. Passing `False` here still leaves every other Watchdog
+        # behavior (`watchdog_enabled`-gated join-signal detection, sweeps, the four
+        # guild-scoped detectors) fully functional; only the message-content-
+        # dependent signals become honestly unavailable, matching the design doc's
+        # "degrades to join-signal-only detection ... rather than failing to start."
+        should_request_message_content = (
+            settings.watchdog_enabled
+            if request_message_content_intent is None
+            else request_message_content_intent
+        )
+        selected_intents = (
+            phase_three_intents() if should_request_message_content else phase_two_intents()
+        )
         super().__init__(
-            intents=phase_three_intents() if settings.watchdog_enabled else phase_two_intents(),
+            intents=selected_intents,
             application_id=settings.application_id,
             connector=connector,
         )

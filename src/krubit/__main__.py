@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
 import aiohttp
+import discord
 
 from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
@@ -24,6 +26,8 @@ from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
 from krubit.services.live_signals import migrate_all_twitch_content
 from krubit.storage.sqlite import SQLiteStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _build_content_connectors(
@@ -146,7 +150,43 @@ async def _run_bot(settings: Settings) -> int:
             twitch=twitch,
             content_connectors=content_connectors,
         )
-        await bot.start(settings.require_token())
+        try:
+            await bot.start(settings.require_token())
+        except discord.PrivilegedIntentsRequired:
+            # `KrubitBot.__init__` only requests the privileged Message Content
+            # intent when `watchdog_enabled`, so this can only fire when the
+            # operator turned Watchdog on but has not yet flipped Message Content on
+            # in the Discord Developer Portal. Per the Phase 3 design doc, that
+            # mismatch must degrade to join-signal-only detection, never crash the
+            # whole process (`watchdog_enabled=False` never reaches this branch at
+            # all, since it never requests the intent in the first place). Rebuild
+            # and reconnect once without the privileged intent rather than letting
+            # this exception propagate and take down every other Krubit capability
+            # with it.
+            if not settings.watchdog_enabled:
+                raise
+            _logger.warning(
+                "KRUBIT_WATCHDOG_ENABLED=true but the privileged Message Content "
+                "intent is not enabled for this application in the Discord "
+                "Developer Portal (https://discord.com/developers/applications -> "
+                "your application -> Bot -> Privileged Gateway Intents). "
+                "Reconnecting without it: watch-window message inspection and "
+                "spam-wave correlation are unavailable until it is enabled there, "
+                "but Entry Sniff join-signal detection, watch-window expiry, "
+                "raid/webhook-abuse/permission-risk detection, and every other "
+                "Krubit capability continue to run normally."
+            )
+            await bot.close()
+            connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+            bot = KrubitBot(
+                settings,
+                FoundationService(store),
+                connector=connector,
+                twitch=twitch,
+                content_connectors=content_connectors,
+                request_message_content_intent=False,
+            )
+            await bot.start(settings.require_token())
     except BaseException as exc:
         primary_error = exc
         raise

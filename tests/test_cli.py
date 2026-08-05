@@ -166,6 +166,56 @@ async def test_bot_uses_presence_intent_while_twitch_remains_optional(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_bot_requests_message_content_only_when_watchdog_enabled(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    disabled_bot = KrubitBot(
+        Settings(
+            application_id=123, database_path=tmp_path / "krubit.db", watchdog_enabled=False
+        ),
+        FoundationService(store),
+    )
+    enabled_bot = KrubitBot(
+        Settings(application_id=123, database_path=tmp_path / "krubit.db", watchdog_enabled=True),
+        FoundationService(store),
+    )
+
+    try:
+        assert disabled_bot.intents.message_content is False
+        assert enabled_bot.intents.message_content is True
+    finally:
+        await disabled_bot.close()
+        await enabled_bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_request_message_content_intent_override_forces_no_privileged_intent(
+    tmp_path: Path,
+) -> None:
+    """The fallback path `_run_bot` uses after `PrivilegedIntentsRequired`: even with
+    `watchdog_enabled=True`, passing `request_message_content_intent=False` must not
+    request the privileged intent, and `WatchdogRuntime` must see that honestly (its
+    `message_content_available` reflects what was actually requested, not the
+    settings flag)."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(application_id=123, database_path=tmp_path / "krubit.db", watchdog_enabled=True),
+        FoundationService(store),
+        request_message_content_intent=False,
+    )
+
+    try:
+        assert bot.intents.message_content is False
+        assert (
+            bot._watchdog_runtime._message_content_available  # pyright: ignore[reportPrivateUsage]
+            is False
+        )
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_run_bot_closes_every_resource_when_twitch_constructor_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -260,6 +310,156 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
         await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
 
     assert closed == ["bot", "store", "connector", "session", "connector"]
+
+
+@pytest.mark.asyncio
+async def test_run_bot_degrades_honestly_when_message_content_intent_is_not_granted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The design doc is explicit: "until enabled, Krubit degrades to join-signal-only
+    detection ... rather than failing to start." `discord.PrivilegedIntentsRequired`
+    raised from `bot.start()` when `KRUBIT_WATCHDOG_ENABLED=true` but Message Content
+    is not yet enabled in the Discord Developer Portal must NOT crash the whole
+    process -- `_run_bot` must catch it, reconnect once without the privileged intent,
+    and continue running. This exercises the real `_run_bot` retry path (not just a
+    unit-level flag on `WatchdogRuntime`), proving `request_message_content_intent`
+    genuinely reaches the second `KrubitBot` construction.
+    """
+    closed: list[str] = []
+    constructions: list[bool | None] = []
+
+    class FakeStore:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_live_signal_guild_ids(self) -> list[int]:
+            return []
+
+        async def close(self) -> None:
+            closed.append("store")
+
+    class FakeConnector:
+        async def close(self) -> None:
+            closed.append("connector")
+
+    class FakeSession:
+        def __init__(self, *, connector: FakeConnector) -> None:
+            self.connector = connector
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    class FakeBot:
+        def __init__(
+            self,
+            *args: object,
+            connector: FakeConnector,
+            request_message_content_intent: bool | None = None,
+            **kwargs: object,
+        ) -> None:
+            self.connector = connector
+            self.request_message_content_intent = request_message_content_intent
+            constructions.append(request_message_content_intent)
+
+        async def start(self, token: str) -> None:
+            # The first construction (no override -> defaults to
+            # `settings.watchdog_enabled`, i.e. True here) simulates the privileged
+            # intent not being granted yet. The retry construction explicitly passes
+            # `request_message_content_intent=False` and must succeed.
+            if self.request_message_content_intent is not False:
+                raise discord.PrivilegedIntentsRequired(shard_id=None)
+
+        async def close(self) -> None:
+            closed.append("bot")
+
+    async def open_store(path: Path) -> FakeStore:
+        return FakeStore()
+
+    def connector_factory(**kwargs: object) -> FakeConnector:
+        return FakeConnector()
+
+    monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
+    monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(cli, "KrubitBot", FakeBot)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        watchdog_enabled=True,
+    )
+
+    result = await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0  # must NOT crash the process
+    assert constructions == [None, False]
+    # Both bot instances (the failed one and the successful retry) were closed.
+    assert closed.count("bot") == 2
+
+
+@pytest.mark.asyncio
+async def test_run_bot_reraises_privileged_intents_error_when_watchdog_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`watchdog_enabled=False` never requests the privileged intent in the first
+    place (see `KrubitBot.__init__`), so a `PrivilegedIntentsRequired` in that
+    configuration reflects some other privileged intent (e.g. `members`/`presences`)
+    already required by every phase -- there is nothing safe to retry without, so it
+    must propagate rather than be silently swallowed."""
+    closed: list[str] = []
+
+    class FakeStore:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_live_signal_guild_ids(self) -> list[int]:
+            return []
+
+        async def close(self) -> None:
+            closed.append("store")
+
+    class FakeConnector:
+        async def close(self) -> None:
+            closed.append("connector")
+
+    class FakeSession:
+        def __init__(self, *, connector: FakeConnector) -> None:
+            self.connector = connector
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    class FakeBot:
+        def __init__(self, *args: object, connector: FakeConnector, **kwargs: object) -> None:
+            self.connector = connector
+
+        async def start(self, token: str) -> None:
+            raise discord.PrivilegedIntentsRequired(shard_id=None)
+
+        async def close(self) -> None:
+            closed.append("bot")
+
+    async def open_store(path: Path) -> FakeStore:
+        return FakeStore()
+
+    def connector_factory(**kwargs: object) -> FakeConnector:
+        return FakeConnector()
+
+    monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
+    monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+    monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(cli, "KrubitBot", FakeBot)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        watchdog_enabled=False,
+    )
+
+    with pytest.raises(discord.PrivilegedIntentsRequired):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    assert closed.count("bot") == 1
 
 
 @pytest.mark.asyncio
