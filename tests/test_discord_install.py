@@ -66,3 +66,38 @@ def test_phase_two_enables_presence_and_required_mutations() -> None:
     assert permissions.manage_roles
     assert permissions.mention_everyone
     assert permissions.administrator is False
+
+
+def test_phase_two_permissions_omit_scheduled_event_scopes_by_default() -> None:
+    permissions = phase_two_permissions()
+
+    assert permissions.create_events is False
+    assert permissions.manage_events is False
+
+
+def test_phase_two_permissions_add_scheduled_event_scopes_when_enabled() -> None:
+    permissions = phase_two_permissions(scheduled_events_enabled=True)
+
+    assert permissions.create_events is True
+    assert permissions.manage_events is True
+    # Enabling the feature must not silently grant anything else.
+    disabled = phase_two_permissions()
+    disabled.create_events = True
+    disabled.manage_events = True
+    assert permissions.value == disabled.value
+
+
+def test_install_url_omits_scheduled_event_scopes_by_default() -> None:
+    parsed = urlparse(install_url(123456789012345678))
+    query = parse_qs(parsed.query)
+
+    assert query["permissions"] == [str(phase_two_permissions().value)]
+
+
+def test_install_url_requests_scheduled_event_scopes_when_enabled() -> None:
+    parsed = urlparse(install_url(123456789012345678, scheduled_events_enabled=True))
+    query = parse_qs(parsed.query)
+
+    expected = phase_two_permissions(scheduled_events_enabled=True)
+    assert query["permissions"] == [str(expected.value)]
+    assert query["permissions"] != [str(phase_two_permissions().value)]

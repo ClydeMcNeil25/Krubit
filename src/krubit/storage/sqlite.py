@@ -143,6 +143,31 @@ class MentionBudgetReceipt:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledEventMapping:
+    """A guild-scoped, exact-ID owned link between one content item and a Discord
+    Scheduled Event, matching the `content_deliveries` guild-scoped mapping
+    convention.
+
+    Identity is `(guild_id, platform, external_id)`. `discord_event_id` is the only
+    field a `ScheduledEventSynchronizer` (Task 11) resolves the live Discord object
+    by — never the event's mutable `name`. `owned_by_krubit` is the ownership receipt:
+    once `False` (whether because Krubit never created this mapping's row, or the row
+    was seeded directly by a caller) the synchronizer must refuse to mutate it.
+    """
+
+    guild_id: int
+    account_id: str
+    platform: Platform
+    external_id: str
+    discord_event_id: int | None
+    discord_status: str
+    owned_by_krubit: bool
+    content_hash: str
+    created_at: datetime
+    updated_at: datetime
+
+
 _CONTENT_DELIVERY_STATUSES = frozenset({"pending", "delivered", "cancelled", "failed"})
 
 
@@ -485,6 +510,22 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_content_receipts_guild_created
                 ON content_receipts (guild_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS scheduled_event_mappings (
+                guild_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                discord_event_id INTEGER,
+                discord_status TEXT NOT NULL,
+                owned_by_krubit INTEGER NOT NULL DEFAULT 0 CHECK (owned_by_krubit IN (0, 1)),
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, platform, external_id),
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
+            );
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -2360,3 +2401,98 @@ class SQLiteStore:
         )
         rows = await cursor.fetchall()
         return [(Platform(str(row["platform"])), str(row["external_id"])) for row in rows]
+
+    async def save_scheduled_event_mapping(
+        self, mapping: ScheduledEventMapping
+    ) -> ScheduledEventMapping:
+        """Insert or overwrite one exact-ID Scheduled Event mapping row.
+
+        Used both by `ScheduledEventSynchronizer` (Task 11) after every create/update
+        and directly by tests/staff tooling to seed a mapping's `owned_by_krubit`
+        state ahead of a sync attempt.
+        """
+        _require_guild_id(mapping.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO scheduled_event_mappings (
+                    guild_id, platform, external_id, account_id, discord_event_id,
+                    discord_status, owned_by_krubit, content_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, platform, external_id) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    discord_event_id = excluded.discord_event_id,
+                    discord_status = excluded.discord_status,
+                    owned_by_krubit = excluded.owned_by_krubit,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    mapping.guild_id,
+                    mapping.platform.value,
+                    mapping.external_id,
+                    mapping.account_id,
+                    mapping.discord_event_id,
+                    mapping.discord_status,
+                    int(mapping.owned_by_krubit),
+                    mapping.content_hash,
+                    mapping.created_at.isoformat(),
+                    mapping.updated_at.isoformat(),
+                ),
+            )
+        saved = await self.get_scheduled_event_mapping(
+            mapping.guild_id, mapping.platform, mapping.external_id
+        )
+        if saved is None:
+            raise RuntimeError("saved scheduled event mapping could not be read")
+        return saved
+
+    async def get_scheduled_event_mapping(
+        self, guild_id: int, platform: Platform, external_id: str
+    ) -> ScheduledEventMapping | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM scheduled_event_mappings
+            WHERE guild_id = ? AND platform = ? AND external_id = ?
+            """,
+            (guild_id, platform.value, external_id),
+        )
+        return self._scheduled_event_mapping_from_row(await cursor.fetchone())
+
+    async def list_owned_scheduled_event_mappings(
+        self, guild_id: int
+    ) -> list[ScheduledEventMapping]:
+        """Return every Krubit-owned mapping for restart-time reconciliation sweeps."""
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT * FROM scheduled_event_mappings
+            WHERE guild_id = ? AND owned_by_krubit = 1
+            ORDER BY created_at ASC, platform ASC, external_id ASC
+            """,
+            (guild_id,),
+        )
+        mappings = [
+            self._scheduled_event_mapping_from_row(row) for row in await cursor.fetchall()
+        ]
+        return [mapping for mapping in mappings if mapping is not None]
+
+    @staticmethod
+    def _scheduled_event_mapping_from_row(
+        row: aiosqlite.Row | None,
+    ) -> ScheduledEventMapping | None:
+        if row is None:
+            return None
+        return ScheduledEventMapping(
+            guild_id=int(row["guild_id"]),
+            account_id=str(row["account_id"]),
+            platform=Platform(str(row["platform"])),
+            external_id=str(row["external_id"]),
+            discord_event_id=_optional_int(row["discord_event_id"]),
+            discord_status=str(row["discord_status"]),
+            owned_by_krubit=bool(row["owned_by_krubit"]),
+            content_hash=str(row["content_hash"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
