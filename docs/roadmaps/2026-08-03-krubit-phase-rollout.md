@@ -244,6 +244,35 @@ No warning, deletion, timeout, kick, ban, role mutation, channel mutation, or pu
 
 Advance when test raids and benign join surges show acceptable false-positive behavior; every risk result is explainable; clean members age out of watch state; private findings never appear publicly; and Krubit cannot execute an unapproved moderation action.
 
+### Build status (2026-08-05)
+
+Implemented and automated-test-verified through Task 9 (`docs: close Phase 3
+watchdog`), with no live Discord guild or credentialed environment available in this
+development session. The structural no-moderation-authority proof required by the
+exit gate (`tests/test_watchdog_structural_safety.py`) passed on first run — no
+watchdog module calls a Discord moderation-mutation client method. Full detail,
+including five named build gaps, is in the
+[Phase 3 Watchdog operations guide](../operations/phase-3-watchdog.md); the most
+important is summarized here so it is never mistaken for resolved:
+
+- **A lone `INCIDENT`-band join is never notified to staff in real time.**
+  `on_member_join` records the Entry Sniff assessment and opens a watch window but
+  never constructs an `Incident` or calls the staff-notification path; only the
+  periodic sweep-cycle detectors (raid/spam-wave/webhook-abuse/permission-risk) ever
+  notify. This is the single largest gap against this phase's "Zariya and staff are
+  notified of risk quickly" purpose statement.
+- `SpamWaveDetector`/`WebhookAbuseDetector` correlation state is in-memory only and is
+  lost on every process restart.
+- `join_velocity`/`join_cluster_similarity` depend on the live Discord gateway member
+  cache, not durable storage, leaving a weak-detection window right after a bot
+  restart — the highest-risk moment for a real raid.
+- No storage table persists a full evidence packet; `/fetch incident`/
+  `/fetch evidence` honestly reconstruct signal names from a receipt rather than
+  showing genuine stored per-signal weight/confidence/detail.
+- `KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL` is forward-declared and has no consumer in this
+  build — "notify Zariya" from this phase's automatic-authority list is not
+  implemented; only "notify staff" is.
+
 ## Phase 4: Member Activity Ledger and Retention Intelligence
 
 ### Goal

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import cast
 
@@ -28,6 +29,61 @@ _CAPABILITY_SEVERITY: dict[CapabilityState, str] = {
     CapabilityState.DEGRADED: "warning",
     CapabilityState.QUOTA_LIMITED: "warning",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class WatchdogHealthFacts:
+    """Process-level Phase 3 Watchdog capability facts, supplied by the caller.
+
+    These are not derived from a `SnapshotRecord` (unlike `_live_signal_findings`'s
+    `live_signal` dict) because they are properties of the running process's
+    `Settings`/gateway connection, not of a captured guild inventory -- the same
+    reason `server_health`'s `database_healthy`/`gateway_ready` are already passed as
+    explicit keyword arguments rather than read from a snapshot. Passing `None`
+    instead of a `WatchdogHealthFacts` (the default on every method below) skips
+    watchdog findings entirely, preserving every caller that predates Phase 3.
+    """
+
+    enabled: bool
+    notifications_enabled: bool
+    message_content_available: bool
+
+
+def _watchdog_findings(facts: WatchdogHealthFacts | None) -> list[HealthFinding]:
+    if facts is None:
+        return []
+    if not facts.enabled:
+        return [
+            HealthFinding(
+                "watchdog_disabled",
+                "limited",
+                "Watchdog detection is disabled (KRUBIT_WATCHDOG_ENABLED=false); no "
+                "join assessment, watch window, or incident detection is running.",
+            )
+        ]
+    findings: list[HealthFinding] = []
+    if not facts.notifications_enabled:
+        findings.append(
+            HealthFinding(
+                "watchdog_notifications_disabled",
+                "limited",
+                "Watchdog detection is running but staff notification delivery is "
+                "disabled (KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED=false); assessments "
+                "and incidents are recorded but never sent to the staff channel.",
+            )
+        )
+    if not facts.message_content_available:
+        findings.append(
+            HealthFinding(
+                "watchdog_message_content_unavailable",
+                "warning",
+                "Discord Message Content intent is not available; Watchdog is "
+                "running in join-signal-only mode -- no message-based signal "
+                "(mass mentions, malicious-link shape, repeated messages, spam-wave "
+                "correlation, or watch-window message inspection) can be observed.",
+            )
+        )
+    return findings
 
 
 def _dict(value: JSONValue | None) -> dict[str, JSONValue]:
@@ -177,6 +233,7 @@ class HealthService:
         now: datetime,
         database_healthy: bool,
         gateway_ready: bool,
+        watchdog: WatchdogHealthFacts | None = None,
     ) -> HealthReport:
         findings: list[HealthFinding] = []
         if not database_healthy:
@@ -191,10 +248,12 @@ class HealthService:
             findings.append(
                 HealthFinding("snapshot_missing", "critical", "No configuration snapshot exists.")
             )
+            findings.extend(_watchdog_findings(watchdog))
             return _report(findings, now)
         findings.extend(_permission_findings(snapshot))
         findings.extend(_integration_findings(snapshot))
         findings.extend(_live_signal_findings(snapshot))
+        findings.extend(_watchdog_findings(watchdog))
         if now - snapshot.captured_at > timedelta(hours=26):
             findings.append(
                 HealthFinding(
@@ -208,8 +267,12 @@ class HealthService:
     def permission_health(self, snapshot: SnapshotRecord) -> HealthReport:
         return _report(_permission_findings(snapshot), snapshot.captured_at)
 
-    def integration_health(self, snapshot: SnapshotRecord) -> HealthReport:
-        return _report(_integration_findings(snapshot), snapshot.captured_at)
+    def integration_health(
+        self, snapshot: SnapshotRecord, *, watchdog: WatchdogHealthFacts | None = None
+    ) -> HealthReport:
+        findings = _integration_findings(snapshot)
+        findings.extend(_watchdog_findings(watchdog))
+        return _report(findings, snapshot.captured_at)
 
     def creator_health(
         self,

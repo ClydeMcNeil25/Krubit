@@ -39,7 +39,7 @@ from krubit.services.foundation import (
     FoundationService,
     GuildDisabledError,
 )
-from krubit.services.health import HealthService
+from krubit.services.health import HealthService, WatchdogHealthFacts
 from krubit.services.incident_evidence import correlate_automod_action
 from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
@@ -70,6 +70,7 @@ class FetchCommands(app_commands.Group):
         twitch_credentials: bool = False,
         twitch_available: bool = False,
         content_runtime: ContentRuntime | None = None,
+        watchdog_facts: WatchdogHealthFacts | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -79,6 +80,15 @@ class FetchCommands(app_commands.Group):
         self._presence_intent = presence_intent
         self._twitch_credentials = twitch_credentials
         self._twitch_available = twitch_available
+        # See `WatchdogHealthFacts`'s own docstring for why this is a process-level
+        # fact bundle passed in at construction rather than derived from a captured
+        # `SnapshotRecord` -- it mirrors `presence_intent`/`twitch_credentials`/
+        # `twitch_available` immediately above. `None` (the default, and what both
+        # test-only `FetchCommands(...)` construction sites in this repository still
+        # use) means "no watchdog facts were supplied," which `HealthService`
+        # interprets as "report nothing about Watchdog" rather than "Watchdog is
+        # disabled" -- so pre-Phase-3 callers see no behavior change at all.
+        self._watchdog_facts = watchdog_facts
         # Share the same `ContentRuntime` instance `KrubitBot` polls into, rather than
         # letting `ContentCommandService` default-construct its own: that default
         # always has `social_delivery_enabled=True`, which would let `/fetch
@@ -210,7 +220,11 @@ class FetchCommands(app_commands.Group):
         guild, actor_id = context
         _, snapshot = await self.capture(guild)
         report = self._health.server_health(
-            snapshot, now=datetime.now(UTC), database_healthy=True, gateway_ready=True
+            snapshot,
+            now=datetime.now(UTC),
+            database_healthy=True,
+            gateway_ready=True,
+            watchdog=self._watchdog_facts,
         )
         await self.finish(
             interaction,
@@ -270,7 +284,7 @@ class FetchCommands(app_commands.Group):
             return
         guild, actor_id = context
         _, snapshot = await self.capture(guild)
-        report = self._health.integration_health(snapshot)
+        report = self._health.integration_health(snapshot, watchdog=self._watchdog_facts)
         await self.finish(
             interaction,
             action="fetch_integrations",
@@ -641,6 +655,11 @@ class KrubitBot(discord.Client):
                 ),
                 twitch_available=live_runtime_enabled,
                 content_runtime=self._content_runtime,
+                watchdog_facts=WatchdogHealthFacts(
+                    enabled=settings.watchdog_enabled,
+                    notifications_enabled=settings.watchdog_notifications_enabled,
+                    message_content_available=self.intents.message_content,
+                ),
             )
         )
 
@@ -799,6 +818,11 @@ class KrubitBot(discord.Client):
                 now=datetime.now(UTC),
                 database_healthy=True,
                 gateway_ready=self.is_ready(),
+                watchdog=WatchdogHealthFacts(
+                    enabled=self._settings.watchdog_enabled,
+                    notifications_enabled=self._settings.watchdog_notifications_enabled,
+                    message_content_available=self.intents.message_content,
+                ),
             )
             await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))
         except Exception as exc:

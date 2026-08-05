@@ -81,6 +81,43 @@ operator runbook, including all three gaps, and the
 [Phase 2 completion audit](docs/operations/phase-2-completion-audit.md) for exactly
 what is evidenced versus deferred to a credentialed operator.
 
+## Phase 3 capabilities
+
+- One-time Entry Sniff join assessment (`entry_sniff_assessments`): deterministic,
+  explainable risk-band evaluation from account age, bot/system flags, join velocity,
+  join-cluster similarity, invite source where exposed, profile-pattern indicators,
+  Rules Screening state, and guild allow/block lists
+- Bounded, automatically-expiring post-join watch window (`watch_windows`) inspecting
+  only guild-channel messages (never DMs) for mass mentions, malicious-link shape,
+  repeated messages, and coordinated timing
+- Guild-scoped raid, spam-wave, webhook-abuse, and permission-risk detection, each
+  producing a redacted evidence-backed `Incident` and one staff notification
+- AutoMod event correlation instead of duplicate keyword/spam enforcement
+- Staff-only `/fetch sniff <member>`, `/fetch sniff-report`,
+  `/fetch incident <incident_id>`, `/fetch evidence <incident_id>`, and
+  `/fetch watchlist`, all ephemeral and read-only
+- Watchdog capability facts (enabled/disabled, notification delivery
+  enabled/disabled, Message Content intent available/unavailable) surfaced through
+  `/fetch server-health` and `/fetch integrations`
+
+Phase 3 carries **zero autonomous moderation authority**: it can never kick, ban,
+timeout, delete a message, or remove a role — verified structurally, not just by
+behavioral test coverage, by
+`tests/test_watchdog_structural_safety.py::test_no_watchdog_module_imports_a_moderation_mutation_client_method`.
+Both `KRUBIT_WATCHDOG_ENABLED` and `KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED` default to
+`false` and are independently enforced — detection can run in shadow mode with
+notifications still off. **The single biggest known gap in this build:** a lone member
+whose join alone crosses the `INCIDENT` risk band is never notified to staff in real
+time — only the periodic sweep-cycle detectors (raid/spam-wave/webhook-abuse/
+permission-risk) ever send a staff notification; `on_member_join` only records the
+assessment. Four further gaps — in-memory-only spam-wave/webhook-abuse correlation
+state, join-signal reliance on the live gateway member cache (weak right after a
+restart), evidence packets that are reconstructed rather than durably stored in full,
+and a `KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL` setting with no consumer ("notify Zariya" is
+not implemented, only "notify staff") — are documented in the
+[Phase 3 operations guide](docs/operations/phase-3-watchdog.md), which every operator
+should read before enabling this phase.
+
 ## Development
 
 ```powershell
@@ -97,6 +134,8 @@ See the [Phase 1 operations guide](docs/operations/phase-1-operations.md),
 [Phase 2 creator signal hub operations guide](docs/operations/phase-2-creator-signal-hub.md),
 [Phase 2 completion development log](docs/devlogs/2026-08-04-phase-2-completion.md),
 [Phase 2 completion audit](docs/operations/phase-2-completion-audit.md),
+[Phase 3 Watchdog operations guide](docs/operations/phase-3-watchdog.md),
+[Phase 3 Watchdog development log](docs/devlogs/2026-08-05-phase-3-watchdog.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
 

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
 from krubit.domain.models import JSONValue
-from krubit.services.health import HealthService
+from krubit.services.health import HealthService, WatchdogHealthFacts
 
 
 def snapshot_with(
@@ -160,4 +160,81 @@ def test_server_health_reports_each_missing_live_signal_fact_distinctly() -> Non
         "live_role_missing",
         "live_twitch_credentials_missing",
         "live_twitch_unavailable",
+    ]
+
+
+def test_server_health_reports_nothing_about_watchdog_when_facts_are_not_supplied() -> None:
+    """A caller that never passes `watchdog=` (every pre-Phase-3 test and call site)
+    must see zero behavior change -- `None` means "don't report," not "disabled."
+    """
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now), now=now, database_healthy=True, gateway_ready=True
+    )
+
+    assert report.status == "healthy"
+    assert report.findings == ()
+
+
+def test_server_health_reports_watchdog_disabled_and_nothing_else_when_off() -> None:
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        watchdog=WatchdogHealthFacts(
+            enabled=False, notifications_enabled=False, message_content_available=False
+        ),
+    )
+
+    assert [finding.code for finding in report.findings] == ["watchdog_disabled"]
+
+
+def test_server_health_reports_notifications_and_message_content_facts_when_enabled() -> None:
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        watchdog=WatchdogHealthFacts(
+            enabled=True, notifications_enabled=False, message_content_available=False
+        ),
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "watchdog_message_content_unavailable",
+        "watchdog_notifications_disabled",
+    ]
+    assert report.status == "warning"
+
+
+def test_server_health_reports_nothing_about_watchdog_when_fully_enabled() -> None:
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        watchdog=WatchdogHealthFacts(
+            enabled=True, notifications_enabled=True, message_content_available=True
+        ),
+    )
+
+    assert report.findings == ()
+
+
+def test_integration_health_includes_watchdog_facts_when_supplied() -> None:
+    snapshot = snapshot_with(captured_at=datetime(2026, 8, 4, tzinfo=UTC))
+
+    report = HealthService().integration_health(
+        snapshot,
+        watchdog=WatchdogHealthFacts(
+            enabled=True, notifications_enabled=True, message_content_available=False
+        ),
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "watchdog_message_content_unavailable"
     ]
