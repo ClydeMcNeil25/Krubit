@@ -199,6 +199,8 @@ class CreatorRegistry:
         guild_id: int,
         actor_member_id: int,
         account_id: str,
+        actor_is_admin: bool,
+        actor_has_creator_role: bool,
         platform: Platform,
         capability: Capability,
         expires_at: datetime | None,
@@ -212,8 +214,20 @@ class CreatorRegistry:
         `capability` is now authorized for `account_id` and, if the provider supplied
         one, when that authorization expires. The audit receipt it records reflects the
         same: capability and expiry only, never a credential reference.
+
+        The OAuth state binds `actor_member_id` to a specific Discord member, but not
+        to a specific account — without this same authority check every other mutating
+        method here enforces, that member could otherwise complete an authorization
+        against an account_id they don't own by guessing or observing it. The same
+        admin-or-owning-Creator rule applies here as everywhere else in the registry.
         """
         existing = await self._existing_account(guild_id, account_id)
+        _require_authority(
+            actor_member_id=actor_member_id,
+            owner_member_id=existing.owner_member_id,
+            actor_is_admin=actor_is_admin,
+            actor_has_creator_role=actor_has_creator_role,
+        )
         if existing.platform is not platform:
             raise ValueError(
                 f"account {account_id!r} is registered for {existing.platform.value}, "

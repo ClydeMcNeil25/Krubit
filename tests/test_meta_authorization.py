@@ -21,7 +21,7 @@ from krubit.integrations.meta import (
     verify_meta_signed_request,
 )
 from krubit.security.credential_vault import CredentialVault
-from krubit.services.creator_registry import CreatorRegistry
+from krubit.services.creator_registry import CreatorAuthorityError, CreatorRegistry
 from krubit.storage.sqlite import SQLiteStore
 from krubit.web.callbacks import CallbackServer
 
@@ -155,6 +155,8 @@ async def test_record_oauth_authorization_unpauses_account_and_records_a_redacte
         guild_id=111,
         actor_member_id=222,
         account_id=account.account_id,
+        actor_is_admin=False,
+        actor_has_creator_role=True,
         platform=Platform.INSTAGRAM,
         capability=Capability.SOCIAL,
         expires_at=NOW + timedelta(days=60),
@@ -194,7 +196,43 @@ async def test_record_oauth_authorization_rejects_a_platform_mismatch(
             guild_id=111,
             actor_member_id=222,
             account_id=account.account_id,
+            actor_is_admin=False,
+            actor_has_creator_role=True,
             platform=Platform.THREADS,
+            capability=Capability.SOCIAL,
+            expires_at=None,
+            now=NOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_oauth_authorization_rejects_a_non_owner_without_admin_authority(
+    registry: CreatorRegistry,
+) -> None:
+    recognized = RecognizedAccountUrl(
+        platform=Platform.INSTAGRAM,
+        handle="krucialstudios",
+        canonical_url="https://www.instagram.com/krucialstudios",
+    )
+    account = await registry.add_account(
+        guild_id=111,
+        actor_member_id=222,
+        owner_member_id=222,
+        actor_is_admin=False,
+        actor_has_creator_role=True,
+        recognized=recognized,
+        resolved_external_id="ig-1",
+        now=NOW,
+    )
+
+    with pytest.raises(CreatorAuthorityError, match="administrator authority"):
+        await registry.record_oauth_authorization(
+            guild_id=111,
+            actor_member_id=333,
+            account_id=account.account_id,
+            actor_is_admin=False,
+            actor_has_creator_role=True,
+            platform=Platform.INSTAGRAM,
             capability=Capability.SOCIAL,
             expires_at=None,
             now=NOW,
