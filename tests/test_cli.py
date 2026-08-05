@@ -97,6 +97,11 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "notifications",
             "latest",
             "schedule",
+            "sniff",
+            "sniff-report",
+            "incident",
+            "evidence",
+            "watchlist",
         }
         backup = cast(
             app_commands.Group,

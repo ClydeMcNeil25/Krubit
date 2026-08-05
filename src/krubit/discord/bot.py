@@ -26,10 +26,11 @@ from krubit.discord.install import phase_three_intents, phase_two_intents, phase
 from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
+from krubit.discord.watchdog_commands import WatchdogActorContext, WatchdogCommandService
 from krubit.discord.watchdog_runtime import WatchdogRuntime
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.creator_signals import ContentPlan, Platform
-from krubit.domain.models import Card, CardField, GuildEvent
+from krubit.domain.models import Card, CardField, GuildEvent, JSONValue
 from krubit.integrations.base import Connector
 from krubit.integrations.twitch import TwitchClient, UnavailableTwitchClient
 from krubit.services.daily_summary import DailySummaryResult, DailySummaryService
@@ -45,6 +46,17 @@ from krubit.services.snapshots import SnapshotService, compare_inventory
 from krubit.services.watch_window import WATCH_WINDOW_DURATION, WatchWindowService
 
 _logger = logging.getLogger(__name__)
+
+
+def _receipt_detail(detail: dict[str, JSONValue]) -> dict[str, str | bool | int]:
+    """Narrow a `WatchdogCommandService` `CommandResult.detail` (`dict[str,
+    JSONValue]`) down to `record_action`'s stricter `dict[str, str | bool | int]`.
+    Every detail dict this command surface produces already only ever holds
+    str/bool/int values; anything else is dropped rather than raising, matching
+    this module's existing tolerant `int(count) if isinstance(count, (int, float))
+    else 0`-style coercions elsewhere in `FetchCommands`.
+    """
+    return {key: value for key, value in detail.items() if isinstance(value, (str, bool, int))}
 
 
 class FetchCommands(app_commands.Group):
@@ -75,6 +87,7 @@ class FetchCommands(app_commands.Group):
         self._content_commands = ContentCommandService(
             service.store, runtime=content_runtime or ContentRuntime(service.store)
         )
+        self._watchdog_commands = WatchdogCommandService(service.store)
         self.add_command(BackupCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
@@ -306,6 +319,135 @@ class FetchCommands(app_commands.Group):
             actor_id=actor_id,
             embed=render_card(result.card),
             detail={"count": int(count) if isinstance(count, (int, float)) else 0},
+        )
+
+    # -- Phase 3 Watchdog: staff-only evidentiary reads --------------------------
+    #
+    # Every one of these five delegates its actual authority check and query to
+    # `WatchdogCommandService`, but `self.authorize(...)` below is still the first
+    # thing each handler calls -- matching every other staff-only `/fetch` command
+    # in this class (`server_health`, `permissions`, `integrations`, ...) and
+    # `live_commands.py`/`content_commands.py`'s own established "denied before any
+    # query or render" convention. A member who fails `self.authorize` never reaches
+    # `WatchdogCommandService` at all; a member who passes it is still re-checked by
+    # `WatchdogCommandService` itself (`actor.is_staff`), since that service is also
+    # unit-tested directly, independent of this Discord-layer gate.
+
+    @app_commands.command(
+        name="sniff", description="Fetch a member's current or most recent Entry Sniff assessment"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def sniff(self, interaction: discord.Interaction, member: discord.Member) -> None:
+        context = await self.authorize(interaction, "fetch_sniff")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = WatchdogActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._watchdog_commands.sniff(actor=actor, target=target)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_sniff",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="sniff-report",
+        description="Fetch a guild-wide Watchdog sniff report: high-band joins and open windows",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def sniff_report(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_sniff_report")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._watchdog_commands.sniff_report(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_sniff_report",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="incident", description="Fetch one Watchdog incident's full evidence packet"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def incident(self, interaction: discord.Interaction, incident_id: str) -> None:
+        context = await self.authorize(interaction, "fetch_incident")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._watchdog_commands.incident(actor=actor, incident_id=incident_id)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_incident",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="evidence", description="Fetch one Watchdog incident's raw, redacted evidence export"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def evidence(self, interaction: discord.Interaction, incident_id: str) -> None:
+        context = await self.authorize(interaction, "fetch_evidence")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._watchdog_commands.evidence(actor=actor, incident_id=incident_id)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_evidence",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="watchlist", description="Fetch this guild's open watch windows and allow/block lists"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def watchlist(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_watchlist")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._watchdog_commands.watchlist(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_watchlist",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
         )
 
 
