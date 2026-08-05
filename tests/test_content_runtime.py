@@ -22,6 +22,7 @@ from krubit.domain.creator_signals import (
 from krubit.domain.models import JSONValue
 from krubit.integrations.base import ConnectorPage
 from krubit.services.content_signals import ContentSignalService
+from krubit.services.notification_policy import MentionBudgetState, NotificationPolicy
 from krubit.storage.sqlite import SQLiteStore
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
@@ -44,6 +45,7 @@ class FakeTextChannel:
         self.sent: list[dict[str, object]] = []
         self.messages: dict[int, FakeMessage] = {}
         self.send_failure: BaseException | None = None
+        self.fetch_failure: BaseException | None = None
 
     def permissions_for(self, member: object) -> object:
         return self.permissions
@@ -58,6 +60,8 @@ class FakeTextChannel:
         return message
 
     async def fetch_message(self, message_id: int) -> FakeMessage:
+        if self.fetch_failure is not None:
+            raise self.fetch_failure
         return self.messages[message_id]
 
     async def history(self, *, limit: int) -> AsyncIterator[FakeMessage]:
@@ -197,6 +201,69 @@ async def test_recovery_edits_matching_receipted_message_instead_of_resending(
 
     assert len(guild.channel.sent) == 1
     assert len(guild.channel.messages[1001].edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_edit_failure_records_a_failed_delivery_receipt_and_clears_stored_message(
+    env: tuple[ContentRuntime, SQLiteStore, FakeGuild],
+) -> None:
+    runtime, store, guild = env
+    plan = await claim_live_plan(store)
+    await runtime.apply_plan(as_guild(guild), plan)
+    # Simulate a moderator deleting the announcement message before the next transition.
+    guild.channel.fetch_failure = discord.NotFound(
+        cast(Any, SimpleNamespace(status=404, reason="Not Found", headers={})), "Unknown Message"
+    )
+    ended = await end_plan(store, plan)
+
+    applied = await runtime.apply_plan(as_guild(guild), ended)
+
+    assert applied is False
+    delivery = await store.get_content_delivery_by_seq(
+        111, plan.delivery.platform, plan.delivery.external_id, plan.delivery.transition_seq
+    )
+    assert delivery is not None
+    assert delivery.status == "failed"
+    assert delivery.discord_message_id is None
+    assert delivery.discord_channel_id is None
+
+
+@pytest.mark.asyncio
+async def test_editing_an_already_delivered_message_does_not_consume_mention_budget(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    await store.save_creator_account(account())
+    await store.save_creator_route(route())
+    channel = FakeTextChannel(444)
+    guild = FakeGuild(channel)
+
+    def limited_policy(_guild: object, creator_route: CreatorRoute) -> NotificationPolicy:
+        return NotificationPolicy(
+            quiet_hours=None,
+            live_everyone_budget=MentionBudgetState(limit=1),
+            social_role_budget=MentionBudgetState(limit=1),
+            social_mention_role_id=creator_route.mention_role_id,
+        )
+
+    runtime = ContentRuntime(store, policy_factory=limited_policy, now=lambda: NOW)
+    try:
+        plan = await claim_live_plan(store)
+
+        await runtime.apply_plan(as_guild(guild), plan)
+        ended = await end_plan(store, plan)
+        await runtime.apply_plan(as_guild(guild), ended)
+
+        consumed = await store.mention_budget_consumed(
+            111, "live_everyone", NOW.date().isoformat()
+        )
+        assert consumed == 1
+        assert len(guild.channel.sent) == 1
+        assert len(guild.channel.messages[1001].edits) == 1
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from krubit.services.notification_policy import (
     DeliveryDecision,
     DeliveryDisposition,
     MentionBudgetState,
+    MentionKind,
     NotificationPolicy,
 )
 from krubit.storage.sqlite import SQLiteStore
@@ -98,7 +99,15 @@ class ContentRuntime:
         return lock
 
     async def apply_plan(self, guild: discord.Guild, plan: ContentPlan) -> bool:
-        """Apply one claimed delivery idempotently; edits in place on replay."""
+        """Apply one claimed delivery idempotently; edits in place on replay.
+
+        The mention decision (and the budget claim inside it) is only made on the
+        genuinely-fresh-send path. Replaying an already-delivered transition — a later
+        state-transition plan, a `recover_pending` sweep, `retry_delivery` re-invoking
+        this method — edits the existing message's embed/view to reflect the event's
+        current state without re-deciding or re-consuming a mention: nothing new is
+        being announced, so nothing should be re-claimed.
+        """
         if guild.id != plan.event.guild_id or guild.id != plan.delivery.guild_id:
             return False
         if not await self._store.guild_is_enabled(guild.id):
@@ -118,13 +127,14 @@ class ContentRuntime:
             )
             if current is None or current.status == "cancelled":
                 return False
+            group = await self._build_group(guild.id, plan.event, route)
+            if current.discord_channel_id is not None and current.discord_message_id is not None:
+                card = self._render(plan.event.content_kind, group, MentionKind.NONE)
+                return await self._edit_existing(guild, channel, current, card)
             decision = await self._decide(guild, plan.event, route)
             if decision.disposition is DeliveryDisposition.QUEUE:
                 return False
-            group = await self._build_group(guild.id, plan.event, route)
-            card = self._render(plan.event.content_kind, group, decision)
-            if current.discord_channel_id is not None and current.discord_message_id is not None:
-                return await self._edit_existing(channel, current, card)
+            card = self._render(plan.event.content_kind, group, decision.mention)
             return await self._deliver_fresh(guild, channel, current, card)
 
     async def recover_pending(self, guild: discord.Guild) -> int:
@@ -291,21 +301,42 @@ class ContentRuntime:
 
     @staticmethod
     def _render(
-        content_kind: ContentKind, group: ContentGroup, decision: DeliveryDecision
+        content_kind: ContentKind, group: ContentGroup, mention: MentionKind
     ) -> RenderedCard:
         if content_kind is ContentKind.LIVE:
-            return build_live_card(group, mention=decision.mention)
-        return build_social_card(group, mention=decision.mention)
+            return build_live_card(group, mention=mention)
+        return build_social_card(group, mention=mention)
 
     async def _edit_existing(
-        self, channel: _TextChannel, current: ContentDelivery, card: RenderedCard
+        self,
+        guild: discord.Guild,
+        channel: _TextChannel,
+        current: ContentDelivery,
+        card: RenderedCard,
     ) -> bool:
+        """Edit the exact stored message's embed/view; content (mention text) is never
+        touched here — replaying an already-delivered transition never re-announces."""
         if current.discord_message_id is None:
             return False
         try:
             message = await channel.fetch_message(current.discord_message_id)
-            await message.edit(content=card.content, embed=card.embed, view=card.build_view())
+            await message.edit(embed=card.embed, view=card.build_view())
         except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+            # Durable failure receipt: the stored delivery must not keep silently
+            # claiming `delivered` against a message Discord can no longer serve (for
+            # example, a moderator deleted it). Clearing the stored ids lets a later
+            # `retry_delivery` send a fresh message instead of retrying a dead edit.
+            await self._store.update_content_delivery(
+                guild_id=guild.id,
+                platform=current.platform,
+                external_id=current.external_id,
+                transition_seq=current.transition_seq,
+                status="failed",
+                attempt=current.attempt,
+                channel_id=None,
+                message_id=None,
+                now=self._now(),
+            )
             return False
         return True
 
