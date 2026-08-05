@@ -1,11 +1,17 @@
 """Delivery policy: quiet hours, mention budgets, and template validation.
 
-`NotificationPolicy.evaluate` is a pure, deterministic function of a `ContentEvent`, the
-instant `at`, and the caller-supplied quiet-hours/mention-budget *state* — it performs no
-I/O and consumes no budget itself. Callers read current budget consumption from storage
-before calling `evaluate`, then atomically persist any consumption `evaluate` decided on
-via `SQLiteStore.claim_mention_budget`, so two concurrent evaluations against the same
-exhausted budget can never both walk away believing they own the last mention.
+`NotificationPolicy.evaluate` and `decide_mention` are pure, deterministic functions of
+a `ContentEvent`, the instant `at`, and the caller-supplied quiet-hours/mention-budget
+*state* — they perform no I/O and consume no budget themselves. They exist so the
+decision rules can be unit-tested deterministically without a database.
+
+Production delivery code must NOT call `evaluate`/`decide_mention` and then separately
+call `SQLiteStore.claim_mention_budget` — reading a budget snapshot and spending it are
+two different moments, and two concurrent callers can each read "available" before
+either one claims, both walking away believing they own the last `@everyone`/role
+mention. Instead, use `NotificationPolicy.evaluate_and_claim`, which performs the
+decision AND the atomic claim as one step and downgrades to `MentionKind.NONE` whenever
+the claim loses the race — there is no two-step sequence for a caller to get wrong.
 
 Quiet hours are evaluated in the guild's local timezone using `zoneinfo.ZoneInfo`, so
 `evaluate` gets the DST-correct wall-clock answer for free: the window is half-open
@@ -20,12 +26,21 @@ outside the small allowed set.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from krubit.domain.creator_signals import ContentEvent, ContentKind
+
+MentionClaim = Callable[[], Awaitable[bool]]
+"""An awaitable callback that atomically attempts to spend one mention-budget unit.
+
+Expected to wrap a single, already-bound call to `SQLiteStore.claim_mention_budget`
+(guild, budget kind, and period key fixed by the caller) and return whether this call
+won the claim. See `NotificationPolicy.evaluate_and_claim`.
+"""
 
 _MAX_HEADLINE_LENGTH = 256
 _MAX_FOOTER_LENGTH = 256
@@ -277,13 +292,45 @@ class NotificationPolicy:
             reason=mention_decision.reason,
         )
 
-    def decide_mention(self, event: ContentEvent) -> MentionDecision:
-        """Decide the mention for a delivery that is going out now.
+    async def evaluate_and_claim(
+        self, event: ContentEvent, at: datetime, *, claim_mention: MentionClaim
+    ) -> DeliveryDecision:
+        """The safe, atomicity-enforcing entry point for real delivery decisions.
 
-        Separated from `evaluate` so the live/social mention rules — and their budget
-        bookkeeping — can be reasoned about and tested independently of quiet-hours
-        timing. `consumed=True` marks the decisions a caller should atomically persist
-        via `SQLiteStore.claim_mention_budget` before delivering.
+        Identical to `evaluate`, except that whenever the tentative decision would
+        consume a mention budget (an `EVERYONE` or `ROLE` mention), it calls
+        `claim_mention` — expected to perform the matching
+        `SQLiteStore.claim_mention_budget` call — and only returns that mention if the
+        claim actually succeeds. If the claim loses the race (a concurrent caller
+        already spent the last unit), the decision is downgraded to `MentionKind.NONE`
+        with `mention_role_id` cleared; disposition and delivery are unaffected — a
+        suppressed mention never blocks or delays the underlying content delivery.
+
+        This is the method production delivery code should call. `evaluate` and
+        `decide_mention` remain available for deterministic, I/O-free unit testing of
+        the decision rules themselves.
+        """
+        tentative = self.evaluate(event, at)
+        if tentative.mention is MentionKind.NONE:
+            return tentative
+        won = await claim_mention()
+        if won:
+            return tentative
+        return replace(
+            tentative,
+            mention=MentionKind.NONE,
+            mention_role_id=None,
+            reason=f"{tentative.reason} (budget claim lost to a concurrent delivery)",
+        )
+
+    def decide_mention(self, event: ContentEvent) -> MentionDecision:
+        """Decide the mention for a delivery that is going out now, from a budget snapshot.
+
+        Separated from `evaluate` so the live/social mention rules can be reasoned
+        about and tested independently of quiet-hours timing. This does NOT perform
+        the atomic budget claim — `consumed=True` only marks that this decision
+        *would* spend one unit, not that it has. Do not use this method's output
+        directly to decide what mention actually ships; use `evaluate_and_claim`.
         """
         if event.content_kind is ContentKind.LIVE:
             budget = self.live_everyone_budget

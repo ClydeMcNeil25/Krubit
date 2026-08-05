@@ -23,6 +23,7 @@ import pytest
 
 from krubit.domain.creator_signals import ContentEvent, ContentKind, ContentState, Platform
 from krubit.services.notification_policy import (
+    DeliveryDecision,
     DeliveryDisposition,
     MentionBudgetState,
     MentionKind,
@@ -361,6 +362,77 @@ async def test_mention_budgets_are_tracked_separately_per_kind(store: SQLiteStor
     assert social_claim is True
     assert await store.mention_budget_consumed(GUILD_ID, "live_everyone", "p1") == 1
     assert await store.mention_budget_consumed(GUILD_ID, "social_role", "p1") == 1
+
+
+def _live_everyone_claim(store: SQLiteStore, *, period_key: str = "p1"):
+    async def claim() -> bool:
+        return await store.claim_mention_budget(
+            guild_id=GUILD_ID,
+            budget_kind="live_everyone",
+            period_key=period_key,
+            limit=1,
+            now=NOW,
+        )
+
+    return claim
+
+
+async def test_evaluate_and_claim_downgrades_to_none_when_budget_claim_loses_race(
+    store: SQLiteStore,
+) -> None:
+    """The decide+claim composition, not just `claim_mention_budget` in isolation.
+
+    Both calls independently *decide* EVERYONE is available (each policy object is
+    built with its own `MentionBudgetState(limit=1, consumed=0)` snapshot, exactly as
+    a real caller would after separately reading storage) — but only one of them can
+    actually win the underlying atomic claim against the same real budget row. The
+    loser's overall decision must come back NONE, proving the claim result — not the
+    stale snapshot — determines what mention actually ships.
+    """
+    claim = _live_everyone_claim(store)
+    winner_policy = policy(live_everyone_budget=1)
+    loser_policy = policy(live_everyone_budget=1)  # same limit=1, consumed=0 snapshot
+
+    winner = await winner_policy.evaluate_and_claim(live_event("s1"), NOW, claim_mention=claim)
+    loser = await loser_policy.evaluate_and_claim(live_event("s2"), LATER, claim_mention=claim)
+
+    assert winner.mention is MentionKind.EVERYONE
+    assert loser.mention is MentionKind.NONE
+    assert loser.mention_role_id is None
+    assert loser.disposition is DeliveryDisposition.DELIVER  # suppression never blocks delivery
+
+
+async def test_evaluate_and_claim_never_double_awards_everyone_under_concurrency(
+    store: SQLiteStore,
+) -> None:
+    """Ten concurrent `evaluate_and_claim` calls against a budget of one: exactly one EVERYONE."""
+    claim = _live_everyone_claim(store, period_key="p2")
+
+    async def attempt(index: int) -> DeliveryDecision:
+        return await policy(live_everyone_budget=1).evaluate_and_claim(
+            live_event(f"s{index}"), NOW, claim_mention=claim
+        )
+
+    decisions = await asyncio.gather(*(attempt(i) for i in range(10)))
+    everyone_count = sum(1 for decision in decisions if decision.mention is MentionKind.EVERYONE)
+    none_count = sum(1 for decision in decisions if decision.mention is MentionKind.NONE)
+    assert everyone_count == 1
+    assert none_count == 9
+    assert all(decision.disposition is DeliveryDisposition.DELIVER for decision in decisions)
+
+
+async def test_evaluate_and_claim_does_not_call_claim_when_mention_is_already_none(
+    store: SQLiteStore,
+) -> None:
+    """No route mention configured -> mention is NONE without ever touching the budget."""
+
+    async def unexpected_claim() -> bool:
+        raise AssertionError("claim_mention must not be called when mention is already NONE")
+
+    decision = await policy().evaluate_and_claim(
+        social_event(), NOW, claim_mention=unexpected_claim
+    )
+    assert decision.mention is MentionKind.NONE
 
 
 async def test_mention_receipts_record_every_outcome(store: SQLiteStore) -> None:
