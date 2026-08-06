@@ -3542,6 +3542,49 @@ class SQLiteStore:
         rows = await cursor.fetchall()
         return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
 
+    async def list_all_ledger_events_for_member(
+        self, guild_id: int, *, member_id: int
+    ) -> tuple[LedgerEvent, ...]:
+        """Return every raw ledger event for one member, most recent first, with no
+        row cap.
+
+        Unlike `list_ledger_events` (capped at 500 rows, sized for interactive
+        views), this backs `krubit.services.activity_privacy.export_member_data`:
+        a data export must be complete, never a silently truncated "first 500"
+        subset, so this method deliberately has no `limit` parameter.
+        """
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, kind, occurred_at, detail_json
+            FROM ledger_events
+            WHERE guild_id = ? AND member_id = ?
+            ORDER BY occurred_at DESC
+            """,
+            (guild_id, member_id),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
+
+    async def prune_ledger_events_older_than(self, guild_id: int, cutoff: datetime) -> int:
+        """Delete raw `ledger_events` rows for one guild whose `occurred_at` is
+        strictly before `cutoff`. Returns the number of rows removed.
+
+        This backs `krubit.services.activity_privacy.RetentionSweepService`'s
+        scheduled retention sweep. Only raw ledger rows are touched here —
+        `milestones` and `activity_receipts` are deliberately never pruned by age,
+        per the design doc's "the raw event, not the fact that a milestone was
+        reached, is what ages out" rule; those tables only shrink via explicit
+        member deletion (`delete_member_ledger_data`).
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            cursor = await self._connection.execute(
+                "DELETE FROM ledger_events WHERE guild_id = ? AND occurred_at < ?",
+                (guild_id, cutoff.isoformat()),
+            )
+        return cursor.rowcount if cursor.rowcount >= 0 else 0
+
     async def list_ledger_events_for_guild(
         self, guild_id: int, *, limit: int = 5000
     ) -> tuple[LedgerEvent, ...]:
