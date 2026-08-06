@@ -307,6 +307,39 @@ shared payload blasted by several members who individually look unremarkable, wh
 is structurally impossible if only already-watched members' messages are visible to
 it.
 
+### Gap 7: Per-detector cooldown can suppress notification of a genuinely new, distinct incident of the same kind
+
+A whole-branch review found that without any cooldown, a single ongoing incident
+(e.g. one raid) could re-fire a fresh `Incident` row and a fresh staff notification
+every 60-second sweep cycle for its entire correlation window (`_RAID_WINDOW`,
+`_ROLE_GRANT_LOOKBACK`, etc. — up to 30 minutes for `PERMISSION_RISK`), producing a
+notification storm for one real event. The fix added `_has_open_incident_of_kind`
+(`src/krubit/services/raid_detection.py`, mirrored in
+`webhook_and_permission_risk.py`): each detector now skips creating a new incident
+and notification if an incident of the *same kind* already exists for the guild with
+`opened_at` inside the detector's own correlation window.
+
+**This closes the storm, but reopens risk in the opposite direction.** `Incident` has
+no open/closed state — the cooldown check cannot distinguish "this is still the same
+ongoing incident" from "a second, entirely unrelated incident of the same kind just
+started, coincidentally inside the first one's window." Concretely: if a raid opens
+at T=0 (10-minute window), and a second, unrelated raid with different members
+crosses the threshold at T=9min, the cooldown sees the first raid's `opened_at`
+inside its cutoff and **suppresses the second raid's notification** for up to the
+remainder of that window. The same shape applies to spam-wave, webhook-abuse, and
+permission-risk detection (worst case up to 30 minutes for the latter).
+
+**Mitigation today:** the first incident's evidence and notification are unaffected —
+only a *second, same-kind, same-window* incident goes unnotified in real time. Staff
+can still discover it via `/fetch sniff-report` (which reads `entry_sniff_assessments`
+and `watch_windows` directly, independent of the `incidents` table) or by noticing
+elevated activity manually. This is a real, accepted trade-off between "notification
+storm" and "possible missed second alert," not a silent data-loss bug — the
+underlying signals that would have produced the second incident are never evaluated
+against a dedup key finer than `(guild_id, kind)`, so a future fix (e.g. scoping the
+cooldown to overlapping members/channels rather than guild+kind alone) should narrow
+this before Phase 3 is trusted for high-volume/high-target guilds.
+
 **What is and is not retained:** nothing from this cache is ever persisted to
 `SQLiteStore` — only signal *names* (never message content) reach durable storage via
 the `incident_recorded` receipt, matching Gap 4 above. The normalized message excerpt
