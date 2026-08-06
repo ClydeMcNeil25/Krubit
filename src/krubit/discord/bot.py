@@ -661,6 +661,8 @@ class KrubitBot(discord.Client):
             service.store,
             activity_ledger_enabled=settings.activity_ledger_enabled,
             guild_ids=lambda: tuple(guild.id for guild in self.guilds),
+            default_retention_days=settings.activity_ledger_retention_days,
+            default_retention_policy_owner_id=settings.application_id,
         )
         self.tree.add_command(
             FetchCommands(

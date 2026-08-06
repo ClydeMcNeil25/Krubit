@@ -96,6 +96,7 @@ from krubit.discord.activity_events import (
 from krubit.domain.activity_ledger import (
     AttendanceAction,
     JoinEvent,
+    RetentionPolicy,
     RoleChangeAction,
     RoleChangeEvent,
 )
@@ -209,6 +210,24 @@ class _AttendancePayload:
 class ActivityRuntime:
     """Wire Task 1-6's activity-ledger extraction/ingestion/privacy services into
     live Discord gateway events.
+
+    ## `default_retention_days`: seeding, not overriding
+
+    `Settings.activity_ledger_retention_days` (`KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS`)
+    is genuinely enforced here, not merely parsed-and-ignored: `sweep_cycle` seeds a
+    guild's default `RetentionPolicy` the first time it finds none configured for that
+    guild. This is deliberately a *seed*, never an override -- `RetentionSweepService.
+    sweep` already treats "no policy" as "retention is opt-in, not a default cap" (see
+    that method's own docstring), and a guild that already has a policy (staff-
+    configured, or seeded by an earlier sweep) is never touched again by this path.
+    Unlike `activity_ledger_excluded_channel_ids` (which this runtime deliberately
+    does NOT auto-apply -- see `ActivityRuntime`'s module-level design notes in the
+    Task 7 report: an `ExclusionEntry` carries a staff-set `reason` a blind reseed
+    could clobber), `RetentionPolicy` carries no such staff-authored field to lose --
+    only `max_age_days`/`updated_by`/`updated_at`, none of which this seed touches
+    again once a policy row exists at all. `default_retention_policy_owner_id` is the
+    `updated_by` attribution for a seeded row (the running application's own ID, not a
+    real staff member, since no staff member configured it).
     """
 
     def __init__(
@@ -219,12 +238,21 @@ class ActivityRuntime:
         guild_ids: GuildIds,
         ingestion: ActivityIngestionService | None = None,
         retention_sweep: RetentionSweepService | None = None,
+        default_retention_days: int | None = None,
+        default_retention_policy_owner_id: int | None = None,
     ) -> None:
+        if default_retention_days is not None and default_retention_policy_owner_id is None:
+            raise ValueError(
+                "default_retention_policy_owner_id is required when "
+                "default_retention_days is set"
+            )
         self._store = store
         self._activity_ledger_enabled = activity_ledger_enabled
         self._guild_ids = guild_ids
         self._ingestion = ingestion or ActivityIngestionService(store)
         self._retention_sweep = retention_sweep or RetentionSweepService(store)
+        self._default_retention_days = default_retention_days
+        self._default_retention_policy_owner_id = default_retention_policy_owner_id
         # See the module docstring's "voice-session tracking cache" section. Never
         # persisted -- a process restart loses in-flight joins gracefully (the
         # matching leave finds no cached snapshot and is skipped rather than
@@ -427,6 +455,7 @@ class ActivityRuntime:
         self._prune_stale_voice_joins(now)
         for guild_id in self._guild_ids():
             try:
+                await self._seed_default_retention_policy(guild_id, now)
                 await self._retention_sweep.sweep(guild_id, now)
             except Exception:
                 _logger.exception(
@@ -434,3 +463,26 @@ class ActivityRuntime:
                     "continuing with the next guild",
                     guild_id,
                 )
+
+    async def _seed_default_retention_policy(self, guild_id: int, now: datetime) -> None:
+        """Seed `guild_id`'s default `RetentionPolicy` from `Settings.
+        activity_ledger_retention_days` the first time none is configured. See the
+        class docstring's "`default_retention_days`: seeding, not overriding" section
+        -- this never touches a guild that already has a policy, staff-configured or
+        previously seeded.
+        """
+        if self._default_retention_days is None:
+            return
+        existing = await self._store.get_retention_policy(guild_id)
+        if existing is not None:
+            return
+        owner_id = self._default_retention_policy_owner_id
+        assert owner_id is not None  # enforced together in __init__
+        await self._store.save_retention_policy(
+            RetentionPolicy(
+                guild_id=guild_id,
+                max_age_days=self._default_retention_days,
+                updated_by=owner_id,
+                updated_at=now,
+            )
+        )

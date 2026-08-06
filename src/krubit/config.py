@@ -58,7 +58,20 @@ class Settings:
     watchdog_zariya_bridge_url: str | None = None
     activity_ledger_enabled: bool = False
     activity_ledger_excluded_channel_ids: tuple[int, ...] = ()
+    # Consumed by `krubit.discord.activity_runtime.ActivityRuntime.sweep_cycle`: when
+    # set, seeds a guild's default `RetentionPolicy` the first time a sweep finds none
+    # configured (never overwrites a staff-configured policy -- see that method's
+    # docstring).
     activity_ledger_retention_days: int | None = None
+    # NOT YET CONSUMED anywhere in this codebase. This is a query-time parameter for
+    # `krubit.services.activity_views.inactive_view`/`returning_member_view`
+    # (`inactivity_threshold: timedelta`), which only a later task's `/fetch
+    # inactive`/community-pulse-style command surface (Task 8 in the Phase 4 plan)
+    # will actually read and pass through. Parsed and validated here so operators can
+    # configure it ahead of that surface landing, but setting it currently has no
+    # observable effect -- unlike `activity_ledger_retention_days` above, there is no
+    # sensible "seed a default row" action for a per-query threshold, so there is
+    # nothing for this task to wire it into.
     activity_ledger_inactivity_threshold_days: int | None = None
 
     @classmethod

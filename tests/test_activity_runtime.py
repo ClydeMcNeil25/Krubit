@@ -577,3 +577,71 @@ async def test_sweep_cycle_isolates_one_guilds_failure_from_another_guild(
     await rt.sweep_cycle(NOW)  # must not raise
 
     assert await store.list_ledger_events(guild_b, member_id=MEMBER_ID) == ()
+
+
+# --- sweep_cycle: default_retention_days seeding -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_seeds_a_default_retention_policy_when_none_configured(
+    store: SQLiteStore,
+) -> None:
+    rt = ActivityRuntime(
+        store,
+        activity_ledger_enabled=True,
+        guild_ids=lambda: (GUILD_ID,),
+        default_retention_days=45,
+        default_retention_policy_owner_id=999,
+    )
+
+    await rt.sweep_cycle(NOW)
+
+    policy = await store.get_retention_policy(GUILD_ID)
+    assert policy is not None
+    assert policy.max_age_days == 45
+    assert policy.updated_by == 999
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_never_overwrites_an_existing_retention_policy(
+    store: SQLiteStore,
+) -> None:
+    from krubit.domain.activity_ledger import RetentionPolicy
+
+    staff_policy = RetentionPolicy(
+        guild_id=GUILD_ID, max_age_days=14, updated_by=555, updated_at=NOW
+    )
+    await store.save_retention_policy(staff_policy)
+    rt = ActivityRuntime(
+        store,
+        activity_ledger_enabled=True,
+        guild_ids=lambda: (GUILD_ID,),
+        default_retention_days=90,
+        default_retention_policy_owner_id=999,
+    )
+
+    await rt.sweep_cycle(NOW)
+
+    policy = await store.get_retention_policy(GUILD_ID)
+    assert policy is not None
+    assert policy.max_age_days == 14  # staff's own value, never overwritten
+    assert policy.updated_by == 555
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_does_not_seed_a_policy_when_default_retention_days_is_unset(
+    runtime: ActivityRuntime, store: SQLiteStore
+) -> None:
+    await runtime.sweep_cycle(NOW)
+
+    assert await store.get_retention_policy(GUILD_ID) is None
+
+
+def test_default_retention_days_requires_an_owner_id(store: SQLiteStore) -> None:
+    with pytest.raises(ValueError, match="default_retention_policy_owner_id"):
+        ActivityRuntime(
+            store,
+            activity_ledger_enabled=True,
+            guild_ids=lambda: (GUILD_ID,),
+            default_retention_days=30,
+        )
