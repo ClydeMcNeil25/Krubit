@@ -134,6 +134,28 @@ def _require_aware(name: str, value: datetime) -> None:
         raise ValueError(f"{name} must include a timezone")
 
 
+async def _has_open_incident_of_kind(
+    store: SQLiteStore, guild_id: int, kind: IncidentKind, cutoff: datetime
+) -> bool:
+    """Return whether `guild_id` already recorded a same-`kind` incident at or after
+    `cutoff` -- the per-detector cooldown/dedup guard for Important #4 (the final
+    whole-branch review's notification-storm finding).
+
+    Every detector's `evaluate` is a pure trailing-window re-scan with no memory of
+    its own previous fires: a single genuinely-ongoing incident (a raid still landing
+    joins, a spam wave still posting) would otherwise mint a brand-new `uuid4()`
+    incident and staff notification on *every* sweep cycle for as long as the
+    underlying condition persists, degrading exactly when staff most need a clean
+    signal. Checking `list_recent_incidents` (already-existing storage, no new table)
+    for a same-`kind` incident opened within the caller's own correlation window is
+    the cheapest guard that collapses a still-ongoing incident to the one notification
+    that opened it, while still allowing a *new* incident once the window has fully
+    elapsed since the last one closed.
+    """
+    recent = await store.list_recent_incidents(guild_id)
+    return any(incident.kind is kind and incident.opened_at >= cutoff for incident in recent)
+
+
 class RaidDetector:
     """Fire a `RAID` incident when a guild sees a burst of elevated-band joins."""
 
@@ -167,6 +189,11 @@ class RaidDetector:
         )
         elevated = tuple(a for a in assessments if a.band is not RiskBand.CLEAR)
         if len(elevated) < self._elevated_join_threshold:
+            return None
+
+        if await _has_open_incident_of_kind(
+            self._store, guild_id, IncidentKind.RAID, now - self._window
+        ):
             return None
 
         signal = RiskSignal(
@@ -274,6 +301,11 @@ class SpamWaveDetector:
         if cluster is None:
             return None
         member_ids, representative = cluster
+
+        if await _has_open_incident_of_kind(
+            self._store, guild_id, IncidentKind.SPAM_WAVE, now - self._window
+        ):
+            return None
 
         signal = RiskSignal(
             name="spam_wave_near_duplicate",

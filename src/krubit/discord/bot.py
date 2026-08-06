@@ -1118,26 +1118,37 @@ class KrubitBot(discord.Client):
         # open watch window, matching the plan's global message-content boundary —
         # this lookup is what supplies that answer (the function itself stays
         # side-effect-free).
-        open_windows = await self._service.store.list_open_watch_windows(execution.guild_id)
-        member_has_open_watch_window = any(
-            window.member_id == execution.user_id for window in open_windows
-        )
-        signal = correlate_automod_action(
-            execution,
-            datetime.now(UTC),
-            member_has_open_watch_window=member_has_open_watch_window,
-        )
-        if signal is not None:
-            await self._service.store.record_sniff_receipt(
-                guild_id=execution.guild_id,
-                receipt_id=f"automod-correlation:{uuid4().hex}",
-                member_id=execution.user_id,
-                action="automod_action_correlated",
-                detail={
-                    "signal_name": signal.name,
-                    "detail": signal.detail,
-                    "weight": signal.weight,
-                    "confidence": signal.confidence,
-                },
-                created_at=datetime.now(UTC),
+        #
+        # Gated on `watchdog_enabled`, matching every other Watchdog data-producing
+        # path in `WatchdogRuntime` (each of whose methods checks this flag as their
+        # first statement): with the flag off, this handler must still record the
+        # Phase-1-style `automod_action_executed` change above (that ingestion predates
+        # Watchdog and is not Watchdog-specific), but it must not read
+        # `list_open_watch_windows` or write a Watchdog `sniff_receipt`, or a disabled
+        # deployment would still see Watchdog storage reads/writes on every AutoMod
+        # action, contradicting the ops doc's "disabling the flag means no Watchdog
+        # activity" claim.
+        if self._settings.watchdog_enabled:
+            open_windows = await self._service.store.list_open_watch_windows(execution.guild_id)
+            member_has_open_watch_window = any(
+                window.member_id == execution.user_id for window in open_windows
             )
+            signal = correlate_automod_action(
+                execution,
+                datetime.now(UTC),
+                member_has_open_watch_window=member_has_open_watch_window,
+            )
+            if signal is not None:
+                await self._service.store.record_sniff_receipt(
+                    guild_id=execution.guild_id,
+                    receipt_id=f"automod-correlation:{uuid4().hex}",
+                    member_id=execution.user_id,
+                    action="automod_action_correlated",
+                    detail={
+                        "signal_name": signal.name,
+                        "detail": signal.detail,
+                        "weight": signal.weight,
+                        "confidence": signal.confidence,
+                    },
+                    created_at=datetime.now(UTC),
+                )

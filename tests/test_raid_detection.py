@@ -109,6 +109,32 @@ async def test_raid_detector_records_incident_and_receipt(store: SQLiteStore) ->
 
 
 @pytest.mark.asyncio
+async def test_raid_detector_does_not_renotify_for_the_same_ongoing_raid_across_sweeps(
+    store: SQLiteStore,
+) -> None:
+    """Important #4: a still-ongoing single raid must not mint a new incident (and
+    staff notification) on every 60-second sweep cycle for the full 10-minute window
+    duration. Simulates consecutive sweeps against the same still-elevated join
+    cluster: only the first sweep should fire.
+    """
+    for _ in range(10):
+        await seed_assessment(store, guild_id=111, band=RiskBand.WATCH, joined_within_seconds=30)
+    detector = RaidDetector(store)
+
+    first = await detector.evaluate(111, now=NOW)
+    assert first is not None
+
+    # Three more sweeps, one minute apart, well inside the 10-minute raid window --
+    # the underlying condition (same elevated joins still in window) is unchanged.
+    for minutes in (1, 2, 3):
+        again = await detector.evaluate(111, now=NOW + timedelta(minutes=minutes))
+        assert again is None
+
+    incidents = await store.list_recent_incidents(111)
+    assert len([i for i in incidents if i.kind is IncidentKind.RAID]) == 1
+
+
+@pytest.mark.asyncio
 async def test_raid_detector_is_scoped_to_its_own_guild(store: SQLiteStore) -> None:
     for _ in range(10):
         await seed_assessment(store, guild_id=222, band=RiskBand.WATCH, joined_within_seconds=30)
@@ -185,6 +211,29 @@ async def test_spam_wave_detector_ignores_messages_outside_window(store: SQLiteS
     # By the time all three are in the cache, only the most recent one is still
     # inside the 5-minute trailing window -- no cluster of 3 within the window.
     assert await detector.evaluate(GUILD_ID, now=NOW + timedelta(minutes=20)) is None
+
+
+@pytest.mark.asyncio
+async def test_spam_wave_detector_does_not_renotify_for_the_same_ongoing_wave_across_sweeps(
+    store: SQLiteStore,
+) -> None:
+    """Important #4, spam-wave case: repeated evaluation against the same still-
+    in-window cluster must not mint a new incident on every sweep."""
+    detector = SpamWaveDetector(store)
+    payload = "Free nitro! Click this link now: totally-legit-nitro.example"
+    detector.record_message(GUILD_ID, 1, payload, NOW)
+    detector.record_message(GUILD_ID, 2, payload, NOW + timedelta(seconds=5))
+    detector.record_message(GUILD_ID, 3, payload + "!!", NOW + timedelta(seconds=10))
+
+    first = await detector.evaluate(GUILD_ID, now=NOW + timedelta(seconds=15))
+    assert first is not None
+
+    for offset_seconds in (60, 120, 180):
+        again = await detector.evaluate(GUILD_ID, now=NOW + timedelta(seconds=15 + offset_seconds))
+        assert again is None
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len([i for i in incidents if i.kind is IncidentKind.SPAM_WAVE]) == 1
 
 
 @pytest.mark.asyncio

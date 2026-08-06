@@ -209,6 +209,29 @@ async def test_webhook_abuse_detector_records_incident_and_receipt(store: SQLite
 
 
 @pytest.mark.asyncio
+async def test_webhook_abuse_detector_does_not_renotify_for_the_same_ongoing_burst_across_sweeps(
+    store: SQLiteStore,
+) -> None:
+    """Important #4: a still-ongoing webhook-abuse burst must not mint a new incident
+    on every sweep cycle within its own 10-minute window."""
+    for index, offset in enumerate((0, 60, 120)):
+        await seed_webhook_event(
+            store, entity_id=555 + index, occurred_at=NOW - timedelta(seconds=offset)
+        )
+    detector = WebhookAbuseDetector(store)
+
+    first = await detector.evaluate(GUILD_ID, now=NOW)
+    assert first is not None
+
+    for minutes in (1, 2, 3):
+        again = await detector.evaluate(GUILD_ID, now=NOW + timedelta(minutes=minutes))
+        assert again is None
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len([i for i in incidents if i.kind is IncidentKind.WEBHOOK_ABUSE]) == 1
+
+
+@pytest.mark.asyncio
 async def test_webhook_abuse_detector_uses_injected_evidence_builder(store: SQLiteStore) -> None:
     for index, offset in enumerate((0, 60, 120)):
         await seed_webhook_event(
@@ -392,6 +415,54 @@ async def test_permission_risk_detector_does_not_fire_outside_grant_lookback(
     )
 
     assert await PermissionRiskDetector(store).evaluate(GUILD_ID, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_permission_risk_detector_does_not_renotify_for_the_same_grant_across_sweeps(
+    store: SQLiteStore,
+) -> None:
+    """Important #4: the same still-in-lookback role grant must not mint a new
+    incident on every 60-second sweep for the full 30-minute role-grant-lookback
+    window -- otherwise a single elevated role grant would produce roughly 30
+    incidents over its lookback, exactly the notification-storm scenario the final
+    review flagged.
+    """
+    member_id = 783
+    await seed_role_event(
+        store,
+        role_id=994,
+        permissions=ADMINISTRATOR_PERMISSIONS,
+        occurred_at=NOW - timedelta(minutes=20),
+    )
+    await seed_role_grant_event(
+        store,
+        member_id=member_id,
+        before_role_ids=(1,),
+        after_role_ids=(1, 994),
+        occurred_at=NOW - timedelta(minutes=5),
+    )
+    await store.open_watch_window(
+        WatchWindow(
+            guild_id=GUILD_ID,
+            member_id=member_id,
+            opened_at=NOW - timedelta(hours=1),
+            expires_at=NOW + timedelta(hours=23),
+            band=RiskBand.WATCH,
+            closed_at=None,
+            close_reason=None,
+        )
+    )
+    detector = PermissionRiskDetector(store)
+
+    first = await detector.evaluate(GUILD_ID, now=NOW)
+    assert first is not None
+
+    for minutes in (1, 2, 5):
+        again = await detector.evaluate(GUILD_ID, now=NOW + timedelta(minutes=minutes))
+        assert again is None
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len([i for i in incidents if i.kind is IncidentKind.PERMISSION_RISK]) == 1
 
 
 @pytest.mark.asyncio

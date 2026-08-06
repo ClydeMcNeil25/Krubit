@@ -11,7 +11,7 @@ wiring, and the staff-only `/fetch sniff`-family command surface.
 > increases monitoring temporarily, notifies staff, and recommends a reversible action
 > for a human to take. It cannot kick, ban, timeout, delete a message, or remove a
 > role; see [Structural no-moderation-authority proof](#structural-no-moderation-authority-proof)
-> below for how that is verified, not merely claimed. Five known limitations change
+> below for how that is verified, not merely claimed. Six known limitations change
 > what "enabled" actually means for an operator; they are called out prominently in
 > [Known limitations](#known-limitations-that-change-what-enabling-watchdog-actually-does)
 > below, most importantly
@@ -32,10 +32,14 @@ wiring, and the staff-only `/fetch sniff`-family command surface.
   Krubit inspects the member's own guild-channel messages (never DMs) for mass
   mentions, malicious-link shape, near-duplicate repeated messages, and timing
   correlation with other watched members.
-- **Four guild-scoped detectors**, run once per sweep cycle (every 5 minutes):
-  `RaidDetector`, `SpamWaveDetector`, `WebhookAbuseDetector`, `PermissionRiskDetector`
-  — each produces an `Incident` (`incidents` table) and one staff notification when it
-  fires.
+- **Four guild-scoped detectors**, run once per sweep cycle (every 60 seconds —
+  `KrubitBot.watchdog_sweep_cycle`, `@tasks.loop(seconds=60)` in `src/krubit/discord/
+  bot.py`): `RaidDetector`, `SpamWaveDetector`, `WebhookAbuseDetector`,
+  `PermissionRiskDetector` — each produces an `Incident` (`incidents` table) and one
+  staff notification when it fires, unless a same-kind incident already fired within
+  that detector's own correlation window (a per-detector cooldown guard — see
+  [Known limitations](#known-limitations-that-change-what-enabling-watchdog-actually-does)
+  for its bound).
 - **Evidence packets**: named signals, confidence/uncertainty per signal, message
   links, and event IDs, always passed through `redact()` before storage — see
   [Evidence packets are not durably recoverable in full](#gap-4-evidence-packets-are-not-durably-recoverable-in-full)
@@ -53,7 +57,15 @@ wiring, and the staff-only `/fetch sniff`-family command surface.
   `on_automod_action` event handlers (`KrubitBot` in `src/krubit/discord/bot.py`;
   referenced by handler name rather than line number here since line numbers drift —
   search the file for these method names) into evidence rather than re-implementing
-  keyword/spam enforcement.
+  keyword/spam enforcement. This needs Discord to actually dispatch the underlying
+  `AUTO_MODERATION_ACTION_EXECUTION`/rule-CRUD gateway events, which requires the
+  `auto_moderation_configuration`/`auto_moderation_execution` intents —
+  `phase_three_intents()` requests both. Both are **non-privileged**: no Developer
+  Portal toggle is needed for them, unlike Message Content below. The correlation
+  block itself is also gated on `watchdog_enabled`, matching every other Watchdog
+  data-producing path — disabling the flag stops it from reading watch windows or
+  writing a correlation receipt, even though the underlying `automod_action_executed`
+  event ingestion (a Phase 1 behavior, not Watchdog-specific) still runs.
 
 None of this is reachable in production until an operator opts in. Two independent
 flags gate it, both fully enforced end to end at the point they matter — not just
@@ -170,8 +182,15 @@ The Completion Gate requires "Krubit cannot execute an unapproved moderation act
 to be verified **structurally**, not just by behavioral test coverage.
 `tests/test_watchdog_structural_safety.py::test_no_watchdog_module_imports_a_moderation_mutation_client_method`
 scans the source text of every Watchdog module for a call to `kick(`, `ban(`,
-`timeout(`, `delete_messages(`, or `remove_roles(` and fails the build if any is found
-— regardless of whether that call would ever actually execute.
+`unban(`, `timeout(`, `delete_messages(`, `remove_roles(`, `add_roles(`, `edit(`,
+`delete(`, `purge(`, or `set_permissions(` and fails the build if any is found —
+regardless of whether that call would ever actually execute. The set was widened
+beyond the original five names (`kick`/`ban`/`timeout`/`delete_messages`/
+`remove_roles`) in the final whole-branch review: `add_roles` (auto-assigning a
+quarantine/unverified role), `edit` (discord.py's canonical `member.edit(timed_out_
+until=...)` timeout API, plus channel mutation via `channel.edit(...)`), `delete`/
+`purge` (the common single-message and bulk-message deletion forms, as opposed to
+only the bulk `delete_messages` API), and `unban` were all gaps in the original set.
 
 "Every Watchdog module" here is the union of two sets, not just a filename glob: the
 five `src/krubit/**/watchdog*.py`-named modules, **plus** an explicitly maintained
@@ -269,6 +288,38 @@ one item on the design doc's automatic-authority list, is therefore **not
 implemented** in this build. Only "notify staff" (`WatchdogRuntime.notify_staff`,
 sending to the configured Discord staff channel) exists. Do not configure this
 variable expecting it to do anything; it is a forward declaration for a future task.
+
+### Gap 6: Spam-wave correlation reads message content from EVERY guild member, not just watched ones — a deliberate, but privacy-relevant, exception to the general rule
+
+**Read this before enabling `watchdog_enabled` in a privacy-sensitive deployment.**
+The plan's stated global constraint (and this guide's own framing) is "Krubit reads
+message content only for a member with an actively open watch window." Spam-wave
+detection is a deliberate, design-doc-sanctioned exception to that rule:
+`SpamWaveDetector.record_message` (fed by `WatchdogRuntime` from `KrubitBot.
+on_message`, `src/krubit/discord/watchdog_runtime.py` / `src/krubit/services/
+raid_detection.py`) is called for **every non-bot guild message**, regardless of
+whether the sender has an open watch window, a prior Entry Sniff assessment, or has
+ever been flagged at all. Each message is normalized (stripped, lowercased) and held
+in an in-memory, per-guild cache for up to 5 minutes (`_SPAM_WAVE_WINDOW`) so
+near-duplicate posts from otherwise-uninvolved members can be correlated into a single
+coordinated spam-wave signal — the whole point of spam-wave detection is catching a
+shared payload blasted by several members who individually look unremarkable, which
+is structurally impossible if only already-watched members' messages are visible to
+it.
+
+**What is and is not retained:** nothing from this cache is ever persisted to
+`SQLiteStore` — only signal *names* (never message content) reach durable storage via
+the `incident_recorded` receipt, matching Gap 4 above. The normalized message excerpt
+itself lives only in a transient in-memory `RiskSignal.detail` and the bounded
+in-memory cache, both gone on process restart (see Gap 2). This is not a data-
+retention problem — it is a genuine, unresolved tension between two governing
+documents (the design doc's spam-wave bullet explicitly authorizes "multiple
+currently-watched (or even `clear`) members," while the same design doc's own global
+constraint says message content is read only for watched members) about reading
+message content from members who were never individually flagged. Evaluate this
+trade-off explicitly before enabling `watchdog_enabled` anywhere message-content
+privacy expectations are strict — this is a rollout-gate decision for a human, not
+something the code resolves on its own.
 
 ### Also worth a human sanity check: `mass_mentions` HIGH tier / a lone `@everyone` ping can reach `SUSPICIOUS` alone
 

@@ -74,6 +74,15 @@ def phase_three_intents() -> discord.Intents:
     intents = phase_two_intents()
     intents.message_content = True
     intents.messages = True
+    # AutoMod correlation (Task 6, `krubit.services.incident_evidence.
+    # correlate_automod_action`, wired in `KrubitBot.on_automod_action`) needs Discord
+    # to actually dispatch `AUTO_MODERATION_ACTION_EXECUTION`/rule-CRUD gateway events
+    # in the first place -- without these two intents Discord never sends them
+    # regardless of what the bot's own handlers do, silently dead-ending the entire
+    # correlation path. Both are non-privileged (no Developer Portal toggle required),
+    # unlike `message_content` above.
+    intents.auto_moderation_configuration = True
+    intents.auto_moderation_execution = True
     return intents
 
 

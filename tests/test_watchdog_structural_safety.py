@@ -78,7 +78,29 @@ def test_explicit_watchdog_modules_still_exist() -> None:
 
 
 def test_no_watchdog_module_imports_a_moderation_mutation_client_method() -> None:
-    forbidden = {"kick", "ban", "timeout", "delete_messages", "remove_roles"}
+    # Widened per the final whole-branch review (Critical #2): the original five-name
+    # set under-covered the design doc's own stated scope. `add_roles` is the most
+    # plausible future footgun (auto-assigning a quarantine/unverified role to a
+    # SUSPICIOUS member) and was not checked at all; `.timeout(` alone does not cover
+    # discord.py's canonical `member.edit(timed_out_until=...)` timeout API, nor
+    # `channel.edit(...)`/`channel.set_permissions(...)` channel mutation; `message.
+    # delete()`/`.purge(` (the common message-deletion forms) were not covered either,
+    # only bulk `delete_messages`. `unban` closes the matching gap on the ban side.
+    # Confirmed via grep across all currently-scanned modules that none contains any
+    # of the newly added names, so this widening passes today at zero cost.
+    forbidden = {
+        "kick",
+        "ban",
+        "unban",
+        "timeout",
+        "delete_messages",
+        "remove_roles",
+        "add_roles",
+        "edit",
+        "delete",
+        "purge",
+        "set_permissions",
+    }
     modules = _watchdog_modules()
     assert modules, "expected at least one Watchdog module to exist and be scanned"
     for module_path in modules:

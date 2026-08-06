@@ -113,6 +113,17 @@ def test_phase_three_intents_adds_messages_so_on_message_actually_dispatches() -
     assert intents.messages is True
 
 
+def test_phase_three_intents_requests_automod_intents_for_correlation_to_ever_fire() -> None:
+    """Without these two (non-privileged) intents, Discord never dispatches
+    `AUTO_MODERATION_ACTION_EXECUTION`/rule-CRUD gateway events at all, regardless of
+    whether `KrubitBot.on_automod_action` and `correlate_automod_action` exist --
+    silently dead-ending Task 6's entire AutoMod correlation path in production."""
+    intents = phase_three_intents()
+
+    assert intents.auto_moderation_configuration is True
+    assert intents.auto_moderation_execution is True
+
+
 def test_install_url_requests_scheduled_event_scopes_when_enabled() -> None:
     parsed = urlparse(install_url(123456789012345678, scheduled_events_enabled=True))
     query = parse_qs(parsed.query)

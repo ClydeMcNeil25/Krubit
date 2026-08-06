@@ -207,6 +207,19 @@ def _require_aware(name: str, value: datetime) -> None:
         raise ValueError(f"{name} must include a timezone")
 
 
+async def _has_open_incident_of_kind(
+    store: SQLiteStore, guild_id: int, kind: IncidentKind, cutoff: datetime
+) -> bool:
+    """Return whether `guild_id` already recorded a same-`kind` incident at or after
+    `cutoff` -- the per-detector cooldown/dedup guard for Important #4 (the final
+    whole-branch review's notification-storm finding). Mirrors
+    `krubit.services.raid_detection._has_open_incident_of_kind`; see that module's
+    docstring for the full rationale.
+    """
+    recent = await store.list_recent_incidents(guild_id)
+    return any(incident.kind is kind and incident.opened_at >= cutoff for incident in recent)
+
+
 def _role_ids_from_payload(payload: Mapping[str, JSONValue], key: str) -> frozenset[int]:
     side = payload.get(key)
     if not isinstance(side, dict):
@@ -321,6 +334,11 @@ class WebhookAbuseDetector:
         if not signals:
             return None
 
+        if await _has_open_incident_of_kind(
+            self._store, guild_id, IncidentKind.WEBHOOK_ABUSE, cutoff
+        ):
+            return None
+
         return await _record_incident(
             self._store,
             guild_id=guild_id,
@@ -408,6 +426,11 @@ class PermissionRiskDetector:
             member_id = int(entity_id)
 
             if not await self._is_watched_or_newly_joined(guild_id, member_id, now):
+                continue
+
+            if await _has_open_incident_of_kind(
+                self._store, guild_id, IncidentKind.PERMISSION_RISK, cutoff
+            ):
                 continue
 
             signal = RiskSignal(

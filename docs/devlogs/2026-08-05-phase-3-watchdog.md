@@ -48,10 +48,19 @@ in this phase kicks, bans, times out, deletes a message, or mutates a role.
   report genuine Watchdog capability facts rather than the facts existing only in
   tests.
 - `tests/test_watchdog_structural_safety.py`: the structural no-moderation-authority
-  proof required by the Completion Gate — scans every `src/krubit/**/watchdog*.py`
-  module's source text for a call to `kick(`/`ban(`/`timeout(`/`delete_messages(`/
-  `remove_roles(` and fails the build if any is found. **Passed on first run** —
-  Tasks 1-8 introduced no such call.
+  proof required by the Completion Gate. Scans the union of two sets — the filename
+  glob `src/krubit/**/watchdog*.py` **plus** an explicitly maintained
+  `_EXPLICIT_WATCHDOG_MODULES` list covering every Task 3-6 Watchdog service module
+  whose filename does not start with `watchdog` (`services/entry_sniff.py`,
+  `services/watch_window.py`, `services/raid_detection.py`,
+  `services/webhook_and_permission_risk.py`, `services/incident_evidence.py`) — for
+  every module's source text, for a call to a moderation-mutation client method.
+  `test_explicit_watchdog_modules_still_exist` guards that list against going stale on
+  a future rename. As widened in the final whole-branch review (post-Task-9), the
+  forbidden-call set itself covers `kick`/`ban`/`unban`/`timeout`/`delete_messages`/
+  `remove_roles`/`add_roles`/`edit`/`delete`/`purge`/`set_permissions`. **Passed** —
+  Tasks 1-9 and the final review's own fixes introduced no such call in any of the ten
+  scanned modules.
 - `tests/test_health_service.py`: six new tests covering the `None`-means-no-op
   default, the fully-disabled case, the enabled-but-degraded case, and the
   fully-healthy case for both `server_health` and `integration_health`.
@@ -84,7 +93,7 @@ Also flagged (not a build gap, a design nuance worth a human review): the
 unlike every other message signal, and does not account for the sender's own
 `mention_everyone` Discord permission.
 
-## Automated verification run in this session
+## Automated verification run in this session (Task 9, before the final whole-branch review)
 
 ```text
 .venv\Scripts\python.exe -m pytest -q                             -> 772 passed, 0 failed
@@ -98,3 +107,54 @@ available in this session. Live canary verification (a real join, a real raid
 simulation, a real notification delivery) is deferred to a credentialed operator, per
 the same discipline the [Phase 2 completion audit](../operations/phase-2-completion-audit.md)
 established.
+
+## Final whole-branch review fix wave (post-Task-9)
+
+A final review composed all nine tasks together and found seven problems only visible
+at that level (three Critical, four Important). All seven were fixed in one pass:
+
+1. **AutoMod correlation could never fire in production** — `phase_three_intents()`
+   (`src/krubit/discord/install.py`) never requested `auto_moderation_configuration`/
+   `auto_moderation_execution`, so Discord never dispatched the underlying gateway
+   events regardless of `on_automod_action`'s own logic. Fixed by adding both
+   (non-privileged) intents.
+2. **The structural no-moderation-authority proof under-covered its own scope** —
+   `tests/test_watchdog_structural_safety.py`'s forbidden-call set widened from five
+   names to eleven (`add_roles`/`edit`/`delete`/`purge`/`set_permissions`/`unban`
+   added), closing gaps around role-mutation, `member.edit(timed_out_until=...)`-style
+   timeout, channel mutation, and single-message deletion. Passed at zero cost, as
+   predicted by grepping the ten scanned modules first.
+3. **`on_automod_action`'s Watchdog block bypassed `watchdog_enabled`** — the
+   `list_open_watch_windows` read and `automod_action_correlated` sniff-receipt write
+   in `KrubitBot.on_automod_action` (`src/krubit/discord/bot.py`) ran unconditionally,
+   contradicting the ops doc's "disabling the flag means no Watchdog activity" claim.
+   Fixed by wrapping that block in `if self._settings.watchdog_enabled:`, applied
+   before/together with fix #1 so the widened intent never activated an unguarded path
+   even transiently.
+4. **No dedupe/cooldown — a single ongoing incident could notify staff every sweep**
+   — each of the four detectors' `evaluate` is a pure trailing-window re-scan with no
+   memory of a previous fire, so a raid still landing joins (or a spam wave, webhook-
+   abuse burst, or permission-risk grant still in its lookback) could mint a fresh
+   incident and staff notification on every 60-second sweep for the duration of its
+   window. Fixed with `_has_open_incident_of_kind` (added to `raid_detection.py` and
+   `webhook_and_permission_risk.py`), which skips firing a new incident if a same-kind
+   incident already exists within the detector's own correlation window — reusing
+   `list_recent_incidents`, no new storage.
+5. This devlog's Task 9 section was stale, describing the pre-fix five-module glob-
+   only structural test and the pre-fix `772 passed` count. Corrected above and in
+   this section.
+6. `docs/operations/phase-3-watchdog.md` misstated the sweep cadence as "every 5
+   minutes"; corrected to the actual 60 seconds (`@tasks.loop(seconds=60)`).
+7. Spam-wave message-content ingestion from all guild members (not just watched ones)
+   is design-doc-sanctioned but was not disclosed to operators. Added a prominent
+   "Gap 6" to the ops doc's Known limitations, documenting the trade-off — no behavior
+   change, per the review's explicit instruction that this is a rollout-gate decision
+   for a human, not a code change.
+
+## Automated verification run after the final review fix wave
+
+```text
+.venv\Scripts\python.exe -m pytest -q                             -> 780 passed, 0 failed
+.venv\Scripts\ruff.exe check .                                    -> All checks passed!
+.venv\Scripts\python.exe -m pyright --pythonpath .venv\Scripts\python.exe  -> 0 errors, 0 warnings, 0 informations
+```
