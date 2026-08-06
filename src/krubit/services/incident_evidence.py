@@ -13,9 +13,13 @@ Task 6 of the Phase 3 Watchdog plan. Two independent, pure, I/O-free functions:
   | None`: reads the payload of Discord's own `on_automod_action` event (already
   wired in `src/krubit/discord/bot.py`, `KrubitBot.on_automod_action`) and turns it
   into a `RiskSignal` that can feed the same `evaluate_risk_band` path every other
-  detector in this phase feeds. It adds no new AutoMod rule creation and no
-  enforcement call of any kind (no `.create_rule(`, `.timeout(`, `.kick(`, `.ban(`,
-  `.delete(`) — it is a read-only correlation of an event Discord already acted on.
+  detector in this phase feeds. It adds no new AutoMod rule creation and calls no
+  Discord moderation-mutation method of any kind (no rule creation, no member
+  timeout, kick, ban, or message deletion) — it is a read-only correlation of an
+  event Discord already acted on. (Written without a literal `.method(` pattern here
+  on purpose: `tests/test_watchdog_structural_safety.py` scans this file's raw source
+  text for exactly that shape, and a prose mention would otherwise trip its own
+  forbidden-call check as a false positive.)
 
 ## Redaction boundary (safety-sensitive — read before changing)
 

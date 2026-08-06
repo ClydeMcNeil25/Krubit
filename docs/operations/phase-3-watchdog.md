@@ -49,9 +49,11 @@ wiring, and the staff-only `/fetch sniff`-family command surface.
   `integration_health`'s new `watchdog=` parameter
   (`src/krubit/services/health.py::WatchdogHealthFacts`).
 - **AutoMod correlation**: Krubit correlates Discord AutoMod's own
-  `on_automod_rule_create/update/delete` and `on_automod_action` events
-  (`src/krubit/discord/bot.py:811,820,831,840`) into evidence rather than
-  re-implementing keyword/spam enforcement.
+  `on_automod_rule_create`/`on_automod_rule_update`/`on_automod_rule_delete`/
+  `on_automod_action` event handlers (`KrubitBot` in `src/krubit/discord/bot.py`;
+  referenced by handler name rather than line number here since line numbers drift —
+  search the file for these method names) into evidence rather than re-implementing
+  keyword/spam enforcement.
 
 None of this is reachable in production until an operator opts in. Two independent
 flags gate it, both fully enforced end to end at the point they matter — not just
@@ -167,12 +169,25 @@ matches the design doc's "degrades honestly... rather than failing to start" cla
 The Completion Gate requires "Krubit cannot execute an unapproved moderation action"
 to be verified **structurally**, not just by behavioral test coverage.
 `tests/test_watchdog_structural_safety.py::test_no_watchdog_module_imports_a_moderation_mutation_client_method`
-scans the source text of every `src/krubit/**/watchdog*.py` module for a call to
-`kick(`, `ban(`, `timeout(`, `delete_messages(`, or `remove_roles(` and fails the build
-if any is found — regardless of whether that call would ever actually execute. This
-test passed on the first run in this session, confirming Tasks 1-8 introduced no such
-call; it exists to keep that true going forward, since it re-runs on every future
-change to a watchdog module.
+scans the source text of every Watchdog module for a call to `kick(`, `ban(`,
+`timeout(`, `delete_messages(`, or `remove_roles(` and fails the build if any is found
+— regardless of whether that call would ever actually execute.
+
+"Every Watchdog module" here is the union of two sets, not just a filename glob: the
+five `src/krubit/**/watchdog*.py`-named modules, **plus** an explicitly maintained
+list of the Task 3-6 Watchdog service modules whose filenames do not start with
+`watchdog` — `services/entry_sniff.py`, `services/watch_window.py` (the module that
+reads live message content), `services/raid_detection.py`,
+`services/webhook_and_permission_risk.py`, and `services/incident_evidence.py`. An
+earlier version of this test scanned only the filename glob and silently missed all
+five of those service modules; a sibling test,
+`test_explicit_watchdog_modules_still_exist`, guards the explicit list against going
+stale on a future rename. This test passed on the first run in this session against
+the corrected, widened file set, confirming Tasks 1-8 introduced no forbidden call in
+any of the ten modules now covered; it re-runs on every future change to any of them.
+**A future task that adds a new Watchdog service module without a `watchdog`-prefixed
+filename must add it to `_EXPLICIT_WATCHDOG_MODULES` in the test file** — the glob
+alone will not discover it.
 
 ## Known limitations that change what "enabling Watchdog" actually does
 
