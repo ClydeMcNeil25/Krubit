@@ -483,6 +483,40 @@ class ParticipationTrend:
 
 
 @dataclass(frozen=True, slots=True)
+class RecognitionCandidate:
+    """A factual shortlist entry Krubit surfaces to staff/Zariya for recognition.
+
+    Per the design doc's "Recognition-candidate view" and the rollout doc's
+    Non-Negotiable Boundaries: Krubit never assigns a numeric "worthiness" score,
+    never ranks members against each other, and never drafts recognition wording —
+    deciding *who deserves recognition* and writing the words is explicitly
+    Zariya's role. `reasons` is a non-empty tuple of factual, independently
+    verifiable statements grounded in stored facts (milestones reached, trend
+    figures crossing a documented threshold) — enforced structurally here, not
+    just by convention, so a candidate with no cited reasons cannot be constructed.
+    """
+
+    guild_id: int
+    member_id: int
+    window: CohortWindow
+    reasons: tuple[str, ...]
+    evaluated_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_positive_id("guild_id", self.guild_id)
+        _require_positive_id("member_id", self.member_id)
+        if type(self.window) is not CohortWindow:
+            raise ValueError("window must be a CohortWindow")
+        if type(self.reasons) is not tuple:
+            raise ValueError("reasons must be a tuple")
+        if not self.reasons:
+            raise ValueError("reasons must not be empty: every candidate must cite facts")
+        for reason in self.reasons:
+            _require_text("reason", reason, limit=_MAX_REASON_LENGTH)
+        _require_aware("evaluated_at", self.evaluated_at)
+
+
+@dataclass(frozen=True, slots=True)
 class ExclusionEntry:
     """A guild-configured channel excluded from ledger ingestion.
 
