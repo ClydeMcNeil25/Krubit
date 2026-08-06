@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -11,7 +12,7 @@ from discord import app_commands
 import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
-from krubit.discord.bot import KrubitBot
+from krubit.discord.bot import FetchCommands, KrubitBot
 from krubit.discord.content_commands import NotificationCommands
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
@@ -102,6 +103,13 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "incident",
             "evidence",
             "watchlist",
+            "member",
+            "activity",
+            "newcomers",
+            "inactive",
+            "milestones",
+            "retention",
+            "community-pulse",
         }
         backup = cast(
             app_commands.Group,
@@ -130,6 +138,51 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "transfer",
             "template",
         }
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_resolves_configured_inactivity_threshold_for_fetch_commands(
+    tmp_path: Path,
+) -> None:
+    """`KrubitBot` must genuinely read `Settings.activity_ledger_inactivity_threshold_days`
+    and thread it into the `FetchCommands` group that backs `/fetch inactive`/
+    `/fetch activity` -- not silently ignore it, matching Task 7's review finding
+    that `activity_ledger_retention_days` was parsed but never wired anywhere."""
+    env = environment(tmp_path / "krubit.db")
+    env["KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS"] = "21"
+    settings = Settings.from_env(env)
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(settings, FoundationService(store))
+
+    try:
+        fetch = cast(
+            FetchCommands,
+            next(command for command in bot.tree.get_commands() if command.name == "fetch"),
+        )
+        assert fetch.inactivity_threshold == timedelta(days=21)
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_falls_back_to_the_default_inactivity_threshold_when_unset(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.from_env(environment(tmp_path / "krubit.db"))
+    assert settings.activity_ledger_inactivity_threshold_days is None
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(settings, FoundationService(store))
+
+    try:
+        fetch = cast(
+            FetchCommands,
+            next(command for command in bot.tree.get_commands() if command.name == "fetch"),
+        )
+        assert fetch.inactivity_threshold == timedelta(days=14)
     finally:
         await bot.close()
         await store.close()

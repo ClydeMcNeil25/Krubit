@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from krubit.config import Settings
+from krubit.discord.activity_commands import ActivityActorContext, ActivityCommandService
 from krubit.discord.activity_runtime import ActivityRuntime
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
 from krubit.discord.content_commands import (
@@ -48,6 +49,15 @@ from krubit.services.watch_window import WATCH_WINDOW_DURATION, WatchWindowServi
 
 _logger = logging.getLogger(__name__)
 
+# Fallback used by `FetchCommands._inactivity_threshold` when
+# `Settings.activity_ledger_inactivity_threshold_days` is unset (its default,
+# per Task 7's design -- see that field's `config.py` comment). Matches
+# `krubit.services.milestones._INACTIVITY_THRESHOLD`'s own 14-day figure, the
+# only other named default for this exact semantic threshold already
+# established in this codebase, rather than inventing a second unrelated
+# default.
+_DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS = 14
+
 
 def _receipt_detail(detail: dict[str, JSONValue]) -> dict[str, str | bool | int]:
     """Narrow a `WatchdogCommandService` `CommandResult.detail` (`dict[str,
@@ -72,6 +82,7 @@ class FetchCommands(app_commands.Group):
         twitch_available: bool = False,
         content_runtime: ContentRuntime | None = None,
         watchdog_facts: WatchdogHealthFacts | None = None,
+        activity_ledger_inactivity_threshold_days: int | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -99,6 +110,17 @@ class FetchCommands(app_commands.Group):
             service.store, runtime=content_runtime or ContentRuntime(service.store)
         )
         self._watchdog_commands = WatchdogCommandService(service.store)
+        self._activity_commands = ActivityCommandService(service.store)
+        # See the module-level `_DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS`
+        # comment: `Settings.activity_ledger_inactivity_threshold_days` is `None`
+        # by default (Task 7's deliberate "per-query parameter, never seeded"
+        # design), so a documented fallback is resolved here, once, rather than
+        # each command re-deriving its own default.
+        self._inactivity_threshold = timedelta(
+            days=activity_ledger_inactivity_threshold_days
+            if activity_ledger_inactivity_threshold_days is not None
+            else _DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS
+        )
         self.add_command(BackupCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
@@ -107,6 +129,16 @@ class FetchCommands(app_commands.Group):
     @property
     def snapshots(self) -> SnapshotService:
         return self._snapshots
+
+    @property
+    def inactivity_threshold(self) -> timedelta:
+        """The resolved `/fetch inactive`/`/fetch activity` inactivity threshold --
+        `Settings.activity_ledger_inactivity_threshold_days` when configured, else
+        the documented `_DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS`
+        fallback. Exposed as a public property (rather than requiring a test to
+        reach into `_inactivity_threshold`) so this resolution is verifiable
+        without `reportPrivateUsage` friction."""
+        return self._inactivity_threshold
 
     async def authorize(
         self, interaction: discord.Interaction, action: str
@@ -465,6 +497,202 @@ class FetchCommands(app_commands.Group):
             detail=_receipt_detail(result.detail),
         )
 
+    # -- Phase 4 Activity Ledger: staff-only and staff-or-self reads -------------
+    #
+    # `member`, `newcomers`, `inactive`, `retention`, and `community_pulse` are
+    # staff-only, exactly like the five Watchdog commands immediately above --
+    # `self.authorize(...)` denies a non-staff caller before this handler ever
+    # constructs an `ActivityActorContext` or touches storage. `activity` and
+    # `milestones` additionally accept a self-view: they deliberately do NOT use
+    # `self.authorize` (which unconditionally requires Manage Guild), matching
+    # `content_commands.py`'s `_actor_context` precedent for staff-or-self
+    # authority instead. The Discord-layer `member` parameter defaults to the
+    # caller when omitted, but that default is never trusted as the actual
+    # authority check -- `ActivityCommandService.activity`/`milestones` each
+    # re-derive `self_view` from `target.member_id == actor.member_id`
+    # themselves and deny a non-staff caller who explicitly names someone else.
+
+    async def _activity_actor(
+        self, interaction: discord.Interaction
+    ) -> tuple[discord.Guild, ActivityActorContext] | None:
+        if interaction.guild_id is None or interaction.guild is None:
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return None
+        user = interaction.user
+        if not isinstance(user, discord.Member):
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return None
+        is_staff = user.guild_permissions.manage_guild or user.guild_permissions.administrator
+        return interaction.guild, ActivityActorContext(
+            guild_id=interaction.guild_id, member_id=user.id, is_staff=is_staff
+        )
+
+    @app_commands.command(name="member", description="Fetch a member's detailed activity profile")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def activity_member(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        context = await self.authorize(interaction, "fetch_member")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._activity_commands.member(actor=actor, target=target)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_member",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="activity", description="Fetch a member's participation trend, or your own"
+    )
+    @app_commands.guild_only()
+    async def activity(
+        self, interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        resolved = await self._activity_actor(interaction)
+        if resolved is None:
+            return
+        guild, actor = resolved
+        target = (
+            ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+            if member is not None
+            else actor
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self._activity_commands.activity(
+            actor=actor, target=target, inactivity_threshold=self._inactivity_threshold
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="newcomers", description="Fetch guild-wide newcomer activation status"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def newcomers(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_newcomers")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._activity_commands.newcomers(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_newcomers",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="inactive", description="Fetch guild-wide inactive members"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def inactive(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_inactive")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._activity_commands.inactive(
+            actor=actor, inactivity_threshold=self._inactivity_threshold
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_inactive",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="milestones", description="Fetch a member's milestones, or your own"
+    )
+    @app_commands.guild_only()
+    async def milestones(
+        self, interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        resolved = await self._activity_actor(interaction)
+        if resolved is None:
+            return
+        guild, actor = resolved
+        target = (
+            ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+            if member is not None
+            else actor
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self._activity_commands.milestones(actor=actor, target=target)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="retention", description="Fetch guild-wide cohort retention (7-day and 30-day)"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def retention(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_retention")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._activity_commands.retention(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_retention",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="community-pulse", description="Fetch a guild-wide factual activity summary"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def community_pulse(self, interaction: discord.Interaction) -> None:
+        context = await self.authorize(interaction, "fetch_community_pulse")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._activity_commands.community_pulse(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self.finish(
+            interaction,
+            action="fetch_community_pulse",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
 
 class BackupCommands(app_commands.Group):
     def __init__(self, parent: FetchCommands) -> None:
@@ -680,6 +908,9 @@ class KrubitBot(discord.Client):
                     enabled=settings.watchdog_enabled,
                     notifications_enabled=settings.watchdog_notifications_enabled,
                     message_content_available=self.intents.message_content,
+                ),
+                activity_ledger_inactivity_threshold_days=(
+                    settings.activity_ledger_inactivity_threshold_days
                 ),
             )
         )
