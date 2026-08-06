@@ -141,6 +141,21 @@ def participation_trend(
 ) -> ParticipationTrend:
     """Compute active-day count, a "returning" flag, and channel/event diversity.
 
+    **CALLER CONTRACT — READ BEFORE CALLING:** `events` MUST already be pre-filtered
+    to a real trailing window ending at actual wall-clock "now" before it is passed
+    in here. This function is pure and never reads a clock, so it has no concept of
+    real "now" — it anchors its trailing window to the **latest event actually
+    present in `events`** (see below). If you pass a member's full, unfiltered
+    historical event log, the anchor day becomes that member's last-ever event, and
+    the result will show `active_day_count > 0` and look "currently active" no
+    matter how long ago that activity actually happened — a member silent for a
+    year looks identical to one active five minutes ago. There is no way for this
+    function to detect or warn about that misuse internally; filtering `events` to
+    the real trailing window before calling is entirely the caller's responsibility.
+    This matters most for the design doc's "Inactive view" and "community-pulse
+    view," which must be able to tell true current inactivity apart from old
+    activity — do not call this with an unfiltered history and expect it to work.
+
     Pure, so there is no clock to read for "now." Instead, the trailing `window`
     (7 or 30 calendar days) is anchored to the **latest meaningful-action event's
     calendar date** among the supplied `events` — the most recent day of observed
