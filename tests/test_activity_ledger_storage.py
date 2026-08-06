@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from krubit.domain.activity_ledger import (
@@ -39,13 +40,29 @@ LATER = datetime(2026, 8, 6, 12, 30, tzinfo=UTC)
 
 
 @pytest.fixture
-async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
-    value = await SQLiteStore.open(tmp_path / "krubit.db")
+def db_path(tmp_path: Path) -> Path:
+    return tmp_path / "krubit.db"
+
+
+@pytest.fixture
+async def store(db_path: Path) -> AsyncIterator[SQLiteStore]:
+    value = await SQLiteStore.open(db_path)
     await value.initialize()
     try:
         yield value
     finally:
         await value.close()
+
+
+async def _activity_receipt_count(db_path: Path, *, guild_id: int, member_id: int) -> int:
+    async with aiosqlite.connect(db_path) as connection:
+        cursor = await connection.execute(
+            "SELECT COUNT(*) FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
+            (guild_id, member_id),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
 
 
 def ledger_event(
@@ -267,8 +284,32 @@ async def test_delete_member_ledger_data_removes_events_and_milestones(
 
 
 @pytest.mark.asyncio
+async def test_delete_member_ledger_data_removes_activity_receipts(
+    store: SQLiteStore, db_path: Path
+) -> None:
+    """`activity_receipts` is a generic, caller-controlled receipt log, so a row
+    referencing a member may hold genuine member-scoped content (for example a rich
+    milestone or role-change receipt) — it must be deleted like any other
+    member-scoped table, not exempted as an inert audit marker.
+    """
+    await store.record_activity_receipt(
+        guild_id=111,
+        receipt_id="receipt-1",
+        member_id=222,
+        action="milestone_reached",
+        detail={"milestone_kind": "message_count"},
+        created_at=NOW,
+    )
+    assert await _activity_receipt_count(db_path, guild_id=111, member_id=222) == 1
+
+    await store.delete_member_ledger_data(111, 222)
+
+    assert await _activity_receipt_count(db_path, guild_id=111, member_id=222) == 0
+
+
+@pytest.mark.asyncio
 async def test_delete_member_ledger_data_seeds_and_clears_every_member_scoped_table(
-    store: SQLiteStore,
+    store: SQLiteStore, db_path: Path
 ) -> None:
     """The deletion-completeness property: seed every table `delete_member_ledger_data`
     is documented to touch for one member, then confirm every one is empty afterward
@@ -290,16 +331,33 @@ async def test_delete_member_ledger_data_seeds_and_clears_every_member_scoped_ta
             detail="1 year anniversary",
         )
     )
+    await store.record_activity_receipt(
+        guild_id=111,
+        receipt_id="receipt-1",
+        member_id=222,
+        action="milestone_reached",
+        detail={"milestone_kind": "message_count"},
+        created_at=NOW,
+    )
+    await store.record_activity_receipt(
+        guild_id=111,
+        receipt_id="receipt-2",
+        member_id=222,
+        action="role_change",
+        detail={"role_id": 7},
+        created_at=LATER,
+    )
 
     await store.delete_member_ledger_data(111, 222)
 
     assert await store.list_ledger_events(111, member_id=222) == ()
     assert await store.list_milestones(111, member_id=222) == ()
+    assert await _activity_receipt_count(db_path, guild_id=111, member_id=222) == 0
 
 
 @pytest.mark.asyncio
 async def test_delete_member_ledger_data_does_not_affect_other_members_or_guilds(
-    store: SQLiteStore,
+    store: SQLiteStore, db_path: Path
 ) -> None:
     await store.record_ledger_event(ledger_event(guild_id=111, member_id=222))
     await store.record_ledger_event(ledger_event(guild_id=111, member_id=333))
@@ -307,6 +365,22 @@ async def test_delete_member_ledger_data_does_not_affect_other_members_or_guilds
     await store.save_milestone(milestone(guild_id=111, member_id=222))
     await store.save_milestone(milestone(guild_id=111, member_id=333))
     await store.save_milestone(milestone(guild_id=999, member_id=222))
+    await store.record_activity_receipt(
+        guild_id=111,
+        receipt_id="receipt-kept-1",
+        member_id=333,
+        action="milestone_reached",
+        detail={},
+        created_at=NOW,
+    )
+    await store.record_activity_receipt(
+        guild_id=999,
+        receipt_id="receipt-kept-2",
+        member_id=222,
+        action="milestone_reached",
+        detail={},
+        created_at=NOW,
+    )
 
     await store.delete_member_ledger_data(111, 222)
 
@@ -316,6 +390,8 @@ async def test_delete_member_ledger_data_does_not_affect_other_members_or_guilds
     assert len(await store.list_milestones(111, member_id=333)) == 1
     assert len(await store.list_ledger_events(999, member_id=222)) == 1
     assert len(await store.list_milestones(999, member_id=222)) == 1
+    assert await _activity_receipt_count(db_path, guild_id=111, member_id=333) == 1
+    assert await _activity_receipt_count(db_path, guild_id=999, member_id=222) == 1
 
 
 @pytest.mark.asyncio

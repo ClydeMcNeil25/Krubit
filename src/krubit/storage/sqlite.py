@@ -3699,12 +3699,12 @@ class SQLiteStore:
         storage action, matching the `sniff_receipts`/`creator_registry_receipts`
         append-only receipt convention.
 
-        Per the design doc's Privacy Controls "Deletion" note, a deletion receipt
-        records *that* deletion occurred, never *what* was deleted — so this method
-        never itself decides what `detail` holds; it only redacts and stores whatever
-        the caller supplies. `activity_receipts` rows are never removed by
-        `delete_member_ledger_data`: like `sniff_receipts`, this table is the durable
-        audit trail, not member-scoped ledger data.
+        This method is generic and reusable across every activity-ledger action, not
+        restricted to deletion receipts — `detail` is fully caller-controlled. Because
+        of that, a row here referencing a `member_id` is genuine member-scoped ledger
+        data, not merely an inert "an action happened" marker, so it is deleted by
+        `delete_member_ledger_data` exactly like `ledger_events`/`milestones` rows.
+        See that method's docstring for the reasoning.
         """
         _require_guild_id(guild_id)
         safe_detail = _json_object(redact(cast(JSONValue, detail)))
@@ -3732,23 +3732,28 @@ class SQLiteStore:
         Tables this method must touch — every table this task creates that stores
         member-scoped ledger rows (keep this list in sync with the schema in
         `_initialize` above):
-          - `ledger_events`   (raw per-kind events, keyed by (guild_id, event_id))
-          - `milestones`      (materialized milestone facts)
+          - `ledger_events`      (raw per-kind events, keyed by (guild_id, event_id))
+          - `milestones`         (materialized milestone facts)
+          - `activity_receipts`  (member-referencing audit rows)
 
-        Deliberately NOT touched here (also created by this task, but not
-        member-scoped ledger data):
-          - `channel_exclusions`  — guild-level configuration (keyed by channel, no
-            member_id column at all).
-          - `retention_policies`  — guild-level configuration (one row per guild, no
-            member_id column at all).
-          - `activity_receipts`   — the durable audit trail *of* deletions (and other
-            storage actions); per the design doc, the receipt records that deletion
-            occurred, never what was deleted, so deleting receipts here would defeat
-            their purpose as an audit trail (matches `sniff_receipts` never being
-            cleared by any Phase 3 mutation).
+        `activity_receipts` is included deliberately, not exempted: `record_activity_receipt`
+        is a generic, reusable method whose `detail` is fully caller-controlled, so a
+        row referencing this `member_id` may hold genuine member-scoped content (for
+        example a rich milestone- or role-change receipt) — exactly the kind of
+        "retained copy of otherwise-deleted data" the design doc's Privacy Controls
+        "Deletion" section warns against. If a narrower, permanent "deletion occurred"
+        audit trail is ever wanted, that calls for a separate, deliberately minimal
+        mechanism (storing only `member_id` + a fixed action name + a timestamp,
+        written by the deletion caller as an explicit step *after* this method
+        returns) — not a carve-out inside this generic receipts table.
 
-        Idempotent: deleting a member with no rows in either table is a no-op, not an
-        error.
+        Deliberately NOT touched here (also created by this task, but never
+        member-scoped data — neither table has a `member_id` column at all):
+          - `channel_exclusions`  — guild-level configuration, keyed by channel.
+          - `retention_policies`  — guild-level configuration, one row per guild.
+
+        Idempotent: deleting a member with no rows in any of the three tables above is
+        a no-op, not an error.
         """
         _require_guild_id(guild_id)
         async with self._write_transaction():
@@ -3758,5 +3763,9 @@ class SQLiteStore:
             )
             await self._connection.execute(
                 "DELETE FROM milestones WHERE guild_id = ? AND member_id = ?",
+                (guild_id, member_id),
+            )
+            await self._connection.execute(
+                "DELETE FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
                 (guild_id, member_id),
             )
