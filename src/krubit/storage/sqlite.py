@@ -3542,6 +3542,32 @@ class SQLiteStore:
         rows = await cursor.fetchall()
         return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
 
+    async def list_ledger_events_for_guild(
+        self, guild_id: int, *, limit: int = 5000
+    ) -> tuple[LedgerEvent, ...]:
+        """Return every member's raw ledger events for one guild, most recent first.
+
+        Unlike `list_ledger_events` (scoped to one member), this backs the
+        guild-wide views in `krubit.services.activity_views` (newcomer, inactive,
+        returning-member, community-pulse), which all need to reason across every
+        member in a guild at once rather than one member's history.
+        """
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 20000:
+            raise ValueError("limit must be between 1 and 20000")
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, kind, occurred_at, detail_json
+            FROM ledger_events
+            WHERE guild_id = ?
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
+
     async def save_milestone(self, milestone: Milestone) -> Milestone:
         """Insert or replace one milestone record.
 
