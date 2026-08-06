@@ -118,6 +118,45 @@ not implemented, only "notify staff") — are documented in the
 [Phase 3 operations guide](docs/operations/phase-3-watchdog.md), which every operator
 should read before enabling this phase.
 
+## Phase 4 capabilities
+
+- Per-member, guild-scoped factual participation event ledger (`ledger_events`):
+  join, onboarding, message (channel + timestamp only, never text), reaction
+  (emoji shape only, never inferred sentiment), voice session (join/leave + computed
+  duration, never audio), event attendance (Scheduled Event RSVP), role change,
+  milestone, and moderation-receipt pointer
+- Deterministic, fixture-reproducing activation/retention/trend calculation
+  (`time_to_activation`, `cohort_membership`, `participation_trend`) — pure
+  functions, never a black-box engagement score
+- Newcomer, inactive-member, returning-member, milestone, and community-pulse views
+- Staff-only `/fetch member <member>`, `/fetch newcomers`, `/fetch inactive`,
+  `/fetch retention`, `/fetch community-pulse`, plus staff-or-self
+  `/fetch activity [member]` and `/fetch milestones [member]`, all ephemeral
+- Channel exclusion enforced structurally *before* storage (verified by
+  `tests/test_activity_privacy_structural_safety.py`, not just behavioral coverage),
+  a retention sweep, member deletion with a minimal content-free receipt, and
+  member data export — see the two gaps below for what is and is not reachable from
+  a command today
+- Activity-ledger capability facts (enabled/disabled, default retention window
+  configured/unconfigured) surfaced through `/fetch server-health` and
+  `/fetch integrations`
+
+`KRUBIT_ACTIVITY_LEDGER_ENABLED` defaults to `false` and is fully enforced at every
+real ingestion call site. **Two known gaps in this build, both given the same
+prominence as Phase 3's biggest gap:** (1) `returning_member_view` is fully built
+and fully tested but has **zero** production caller — no `/fetch` command in this
+nine-task plan surfaces it, so a member who went inactive and then resumed activity
+is invisible to staff through any command; (2) member deletion, export, and
+channel-exclusion configuration are fully implemented and tested at the service/
+storage layer but likewise have **no** `/fetch` command — today they require direct
+database access. Five further, lower-severity gaps (stale-presence detection in
+`/fetch inactive` for high-volume guilds, no atomicity between deletion and its
+receipt, an uncapped export in a never-retention-configured guild, an unseeded
+env var for channel exclusion, and a pure calculation function's caller-contract
+windowing requirement) are documented in the
+[Phase 4 operations guide](docs/operations/phase-4-activity-ledger.md), which every
+operator should read before enabling this phase.
+
 ## Development
 
 ```powershell
@@ -136,6 +175,8 @@ See the [Phase 1 operations guide](docs/operations/phase-1-operations.md),
 [Phase 2 completion audit](docs/operations/phase-2-completion-audit.md),
 [Phase 3 Watchdog operations guide](docs/operations/phase-3-watchdog.md),
 [Phase 3 Watchdog development log](docs/devlogs/2026-08-05-phase-3-watchdog.md),
+[Phase 4 Activity Ledger operations guide](docs/operations/phase-4-activity-ledger.md),
+[Phase 4 Activity Ledger development log](docs/devlogs/2026-08-06-phase-4-activity-ledger.md),
 [signal contract](docs/contracts/krubit-zariya-signal-v1.md), and
 [product rollout](docs/roadmaps/2026-08-03-krubit-phase-rollout.md).
 

@@ -49,6 +49,49 @@ class WatchdogHealthFacts:
     message_content_available: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ActivityLedgerHealthFacts:
+    """Process-level Phase 4 Activity Ledger capability facts, supplied by the
+    caller -- mirrors `WatchdogHealthFacts`'s own docstring rationale exactly: these
+    are properties of the running process's `Settings`, not of a captured guild
+    inventory, so they are passed as an explicit keyword argument rather than
+    derived from a `SnapshotRecord`. Passing `None` (the default) skips
+    activity-ledger findings entirely, preserving every caller that predates Phase 4.
+    """
+
+    enabled: bool
+    retention_configured: bool
+
+
+def _activity_ledger_findings(facts: ActivityLedgerHealthFacts | None) -> list[HealthFinding]:
+    if facts is None:
+        return []
+    if not facts.enabled:
+        return [
+            HealthFinding(
+                "activity_ledger_disabled",
+                "limited",
+                "Activity ledger is disabled (KRUBIT_ACTIVITY_LEDGER_ENABLED=false); no "
+                "participation event (message, reaction, voice, attendance, join, role "
+                "change) is being ingested, and every /fetch newcomers/inactive/"
+                "milestones/retention/community-pulse view has no data to report.",
+            )
+        ]
+    findings: list[HealthFinding] = []
+    if not facts.retention_configured:
+        findings.append(
+            HealthFinding(
+                "activity_ledger_retention_unconfigured",
+                "limited",
+                "No default retention window is configured "
+                "(KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS unset); raw ledger rows "
+                "accumulate indefinitely for any guild that has not separately been "
+                "given its own staff-configured retention policy.",
+            )
+        )
+    return findings
+
+
 def _watchdog_findings(facts: WatchdogHealthFacts | None) -> list[HealthFinding]:
     if facts is None:
         return []
@@ -234,6 +277,7 @@ class HealthService:
         database_healthy: bool,
         gateway_ready: bool,
         watchdog: WatchdogHealthFacts | None = None,
+        activity_ledger: ActivityLedgerHealthFacts | None = None,
     ) -> HealthReport:
         findings: list[HealthFinding] = []
         if not database_healthy:
@@ -249,11 +293,13 @@ class HealthService:
                 HealthFinding("snapshot_missing", "critical", "No configuration snapshot exists.")
             )
             findings.extend(_watchdog_findings(watchdog))
+            findings.extend(_activity_ledger_findings(activity_ledger))
             return _report(findings, now)
         findings.extend(_permission_findings(snapshot))
         findings.extend(_integration_findings(snapshot))
         findings.extend(_live_signal_findings(snapshot))
         findings.extend(_watchdog_findings(watchdog))
+        findings.extend(_activity_ledger_findings(activity_ledger))
         if now - snapshot.captured_at > timedelta(hours=26):
             findings.append(
                 HealthFinding(
@@ -268,10 +314,15 @@ class HealthService:
         return _report(_permission_findings(snapshot), snapshot.captured_at)
 
     def integration_health(
-        self, snapshot: SnapshotRecord, *, watchdog: WatchdogHealthFacts | None = None
+        self,
+        snapshot: SnapshotRecord,
+        *,
+        watchdog: WatchdogHealthFacts | None = None,
+        activity_ledger: ActivityLedgerHealthFacts | None = None,
     ) -> HealthReport:
         findings = _integration_findings(snapshot)
         findings.extend(_watchdog_findings(watchdog))
+        findings.extend(_activity_ledger_findings(activity_ledger))
         return _report(findings, snapshot.captured_at)
 
     def creator_health(

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
 from krubit.domain.models import JSONValue
-from krubit.services.health import HealthService, WatchdogHealthFacts
+from krubit.services.health import ActivityLedgerHealthFacts, HealthService, WatchdogHealthFacts
 
 
 def snapshot_with(
@@ -238,3 +238,88 @@ def test_integration_health_includes_watchdog_facts_when_supplied() -> None:
     assert [finding.code for finding in report.findings] == [
         "watchdog_message_content_unavailable"
     ]
+
+
+def test_server_health_reports_nothing_about_activity_ledger_when_facts_are_not_supplied() -> None:
+    """A caller that never passes `activity_ledger=` (every pre-Phase-4 test and call
+    site) must see zero behavior change -- `None` means "don't report," not "disabled."
+    """
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now), now=now, database_healthy=True, gateway_ready=True
+    )
+
+    assert report.status == "healthy"
+    assert report.findings == ()
+
+
+def test_server_health_reports_activity_ledger_disabled_and_nothing_else_when_off() -> None:
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(enabled=False, retention_configured=False),
+    )
+
+    assert [finding.code for finding in report.findings] == ["activity_ledger_disabled"]
+
+
+def test_server_health_reports_retention_unconfigured_when_ledger_enabled() -> None:
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=False),
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "activity_ledger_retention_unconfigured"
+    ]
+
+
+def test_server_health_reports_nothing_about_activity_ledger_when_fully_configured() -> None:
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=True),
+    )
+
+    assert report.findings == ()
+
+
+def test_integration_health_includes_activity_ledger_facts_when_supplied() -> None:
+    snapshot = snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC))
+
+    report = HealthService().integration_health(
+        snapshot,
+        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=False),
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "activity_ledger_retention_unconfigured"
+    ]
+
+
+def test_server_health_reports_missing_snapshot_still_reports_activity_ledger_facts() -> None:
+    """Mirrors `test_server_health_marks_missing_snapshot_and_database_as_critical`'s
+    missing-snapshot early-return path -- activity-ledger facts must still surface
+    even when there is no snapshot to derive permission/integration findings from.
+    """
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        None,
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(enabled=False, retention_configured=False),
+    )
+
+    assert "activity_ledger_disabled" in [finding.code for finding in report.findings]
+    assert "snapshot_missing" in [finding.code for finding in report.findings]

@@ -41,7 +41,7 @@ from krubit.services.foundation import (
     FoundationService,
     GuildDisabledError,
 )
-from krubit.services.health import HealthService, WatchdogHealthFacts
+from krubit.services.health import ActivityLedgerHealthFacts, HealthService, WatchdogHealthFacts
 from krubit.services.incident_evidence import correlate_automod_action
 from krubit.services.live_signals import LiveSignalService
 from krubit.services.snapshots import SnapshotService, compare_inventory
@@ -82,6 +82,7 @@ class FetchCommands(app_commands.Group):
         twitch_available: bool = False,
         content_runtime: ContentRuntime | None = None,
         watchdog_facts: WatchdogHealthFacts | None = None,
+        activity_ledger_facts: ActivityLedgerHealthFacts | None = None,
         activity_ledger_inactivity_threshold_days: int | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
@@ -101,6 +102,11 @@ class FetchCommands(app_commands.Group):
         # interprets as "report nothing about Watchdog" rather than "Watchdog is
         # disabled" -- so pre-Phase-3 callers see no behavior change at all.
         self._watchdog_facts = watchdog_facts
+        # See `ActivityLedgerHealthFacts`'s own docstring -- mirrors `_watchdog_facts`
+        # immediately above exactly: `None` (the default, and what every pre-Phase-4
+        # `FetchCommands(...)` construction site still uses) means "no activity-ledger
+        # facts were supplied," so pre-Phase-4 callers see no behavior change at all.
+        self._activity_ledger_facts = activity_ledger_facts
         # Share the same `ContentRuntime` instance `KrubitBot` polls into, rather than
         # letting `ContentCommandService` default-construct its own: that default
         # always has `social_delivery_enabled=True`, which would let `/fetch
@@ -258,6 +264,7 @@ class FetchCommands(app_commands.Group):
             database_healthy=True,
             gateway_ready=True,
             watchdog=self._watchdog_facts,
+            activity_ledger=self._activity_ledger_facts,
         )
         await self.finish(
             interaction,
@@ -317,7 +324,9 @@ class FetchCommands(app_commands.Group):
             return
         guild, actor_id = context
         _, snapshot = await self.capture(guild)
-        report = self._health.integration_health(snapshot, watchdog=self._watchdog_facts)
+        report = self._health.integration_health(
+            snapshot, watchdog=self._watchdog_facts, activity_ledger=self._activity_ledger_facts
+        )
         await self.finish(
             interaction,
             action="fetch_integrations",
@@ -909,6 +918,10 @@ class KrubitBot(discord.Client):
                     notifications_enabled=settings.watchdog_notifications_enabled,
                     message_content_available=self.intents.message_content,
                 ),
+                activity_ledger_facts=ActivityLedgerHealthFacts(
+                    enabled=settings.activity_ledger_enabled,
+                    retention_configured=settings.activity_ledger_retention_days is not None,
+                ),
                 activity_ledger_inactivity_threshold_days=(
                     settings.activity_ledger_inactivity_threshold_days
                 ),
@@ -1104,6 +1117,10 @@ class KrubitBot(discord.Client):
                     enabled=self._settings.watchdog_enabled,
                     notifications_enabled=self._settings.watchdog_notifications_enabled,
                     message_content_available=self.intents.message_content,
+                ),
+                activity_ledger=ActivityLedgerHealthFacts(
+                    enabled=self._settings.activity_ledger_enabled,
+                    retention_configured=self._settings.activity_ledger_retention_days is not None,
                 ),
             )
             await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))

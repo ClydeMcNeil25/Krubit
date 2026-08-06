@@ -302,6 +302,50 @@ Krubit calculates facts and trends. Zariya owns sentiment, relationship context,
 
 Advance when cohort calculations reproduce known fixtures, channel exclusions are enforced before storage, member deletion removes derived records as specified, detailed profiles are access-controlled, and the system cannot expose private-channel activity to unauthorized viewers.
 
+### Build status (2026-08-06)
+
+Implemented and automated-test-verified through Task 9 (`docs: close Phase 4
+activity ledger`), with no live Discord guild or credentialed environment available
+in this development session. Both structural proofs the exit gate requires passed
+on first run against a hand-verified (not filename-glob-derived) enumeration of
+ingestion entry points and schema tables:
+`tests/test_activity_privacy_structural_safety.py::test_excluded_channel_events_structurally_cannot_reach_storage`
+(channel exclusion is unconditionally on the path from every real Discord entry
+point — message, reaction, voice, attendance — to storage) and
+`test_activity_ledger_tables_matches_the_live_schema_exactly` /
+`test_member_deletion_covers_every_table_the_schema_actually_defines` (member
+deletion covers every table the live schema actually defines, not an assumed list).
+Full detail, including all seven named build gaps, is in the
+[Phase 4 Activity Ledger operations guide](../operations/phase-4-activity-ledger.md);
+the two most important are summarized here so neither is ever mistaken for
+resolved:
+
+- **`returning_member_view` has zero production callers.** It is fully built and
+  fully unit-tested, but no `/fetch` command in this nine-task plan surfaces it — a
+  member who went inactive past the configured threshold and then resumed activity
+  is invisible to staff through any command today. This is the single largest gap
+  against this phase's "measure participation and activation" purpose statement,
+  comparable in severity to Phase 3's "a lone `INCIDENT`-band join is never
+  notified in real time" gap.
+- **Deletion, export, and channel-exclusion configuration have no `/fetch`
+  command.** `delete_member`, `export_member_data`, and
+  `save_exclusion_entry`/`list_exclusion_entries` are fully implemented and tested
+  (including the deletion-completeness structural proof above) but are reachable
+  today only via direct database/Python access, not through any staff-facing
+  Discord command — three of the design doc's five named Privacy Controls have no
+  operational reach yet.
+- The `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` env var is parsed and validated
+  but never applied to storage — a deliberate Task 7 scope decision, not a bug, but
+  setting it has zero observable effect in this build.
+- `inactive_view`'s left-member detection scans only the 500 most-recent guild
+  events (an inherited Phase 1 read-cap), so a member who left long enough ago in a
+  high-volume guild could still incorrectly appear as present.
+- No atomicity between `delete_member_ledger_data` and its deletion receipt; an
+  uncapped `export_member_data` in a guild that never configures retention; and
+  `participation_trend`'s pure-function caller-contract requiring a pre-windowed,
+  now-anchored event list are three further, lower-severity gaps documented in the
+  operations guide.
+
 ## Phase 5: Zariya Companion Bridge and Supervised Protection
 
 ### Goal
