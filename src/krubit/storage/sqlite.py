@@ -15,6 +15,12 @@ from uuid import uuid4
 
 import aiosqlite
 
+from krubit.domain.activity_ledger import (
+    ExclusionEntry,
+    LedgerEvent,
+    Milestone,
+    RetentionPolicy,
+)
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
 from krubit.domain.creator_signals import (
     CapabilityState,
@@ -46,6 +52,13 @@ from krubit.domain.watchdog import (
     WatchWindowCloseReason,
 )
 from krubit.security.redaction import redact
+from krubit.storage.activity_ledger_rows import (
+    exclusion_entry_from_row,
+    ledger_event_detail,
+    ledger_event_from_row,
+    milestone_from_row,
+    retention_policy_from_row,
+)
 from krubit.storage.creator_rows import (
     content_cursor_from_row,
     content_delivery_from_row,
@@ -691,6 +704,60 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_sniff_receipts_guild_created
                 ON sniff_receipts (guild_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS ledger_events (
+                guild_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                member_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                PRIMARY KEY (guild_id, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ledger_events_guild_member_occurred
+                ON ledger_events (guild_id, member_id, occurred_at DESC);
+
+            CREATE TABLE IF NOT EXISTS milestones (
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                reached_at TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                PRIMARY KEY (guild_id, member_id, kind, reached_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_milestones_guild_member
+                ON milestones (guild_id, member_id, reached_at DESC);
+
+            CREATE TABLE IF NOT EXISTS channel_exclusions (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                excluded_by INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                excluded_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS retention_policies (
+                guild_id INTEGER PRIMARY KEY,
+                max_age_days INTEGER NOT NULL CHECK (max_age_days > 0),
+                updated_by INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS activity_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                member_id INTEGER,
+                action TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_activity_receipts_guild_created
+                ON activity_receipts (guild_id, created_at DESC);
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
@@ -3425,3 +3492,271 @@ class SQLiteStore:
             detail=_json_object(json.loads(str(row["detail_json"]))),
             created_at=datetime.fromisoformat(str(row["created_at"])),
         )
+
+    # -- Activity Ledger (Phase 4) ---------------------------------------------
+
+    async def record_ledger_event(self, event: LedgerEvent) -> None:
+        """Append one raw ledger event, matching the append-only `guild_events`/
+        `sniff_receipts` convention: never updated, never upserted. Storage shape is
+        the single polymorphic `ledger_events` table (see
+        `storage/activity_ledger_rows.py`'s module docstring for why); `event_id` is
+        generated here since domain `LedgerEvent` value objects carry no identifier of
+        their own.
+        """
+        _require_guild_id(event.guild_id)
+        safe_detail = _json_object(redact(cast(JSONValue, ledger_event_detail(event))))
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO ledger_events (
+                    guild_id, event_id, member_id, kind, occurred_at, detail_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.guild_id,
+                    str(uuid4()),
+                    event.member_id,
+                    event.kind.value,
+                    event.occurred_at.isoformat(),
+                    json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+
+    async def list_ledger_events(
+        self, guild_id: int, *, member_id: int, limit: int = 500
+    ) -> tuple[LedgerEvent, ...]:
+        """Return one member's raw ledger events, most recent first."""
+        _require_guild_id(guild_id)
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, kind, occurred_at, detail_json
+            FROM ledger_events
+            WHERE guild_id = ? AND member_id = ?
+            ORDER BY occurred_at DESC
+            LIMIT ?
+            """,
+            (guild_id, member_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
+
+    async def save_milestone(self, milestone: Milestone) -> Milestone:
+        """Insert or replace one milestone record.
+
+        Identity is `(guild_id, member_id, kind, reached_at)`, matching `Milestone` —
+        re-saving the same member/kind/timestamp (for example a re-computed `detail`
+        wording) replaces that row rather than accumulating duplicates.
+        """
+        _require_guild_id(milestone.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO milestones (guild_id, member_id, kind, reached_at, detail)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, member_id, kind, reached_at) DO UPDATE SET
+                    detail = excluded.detail
+                """,
+                (
+                    milestone.guild_id,
+                    milestone.member_id,
+                    milestone.kind.value,
+                    milestone.reached_at.isoformat(),
+                    milestone.detail,
+                ),
+            )
+        stored = await self.list_milestones(milestone.guild_id, member_id=milestone.member_id)
+        for candidate in stored:
+            if candidate.kind == milestone.kind and candidate.reached_at == milestone.reached_at:
+                return candidate
+        raise RuntimeError("saved milestone could not be read")
+
+    async def list_milestones(
+        self, guild_id: int, *, member_id: int
+    ) -> tuple[Milestone, ...]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, member_id, kind, reached_at, detail
+            FROM milestones
+            WHERE guild_id = ? AND member_id = ?
+            ORDER BY reached_at DESC
+            """,
+            (guild_id, member_id),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(Milestone, milestone_from_row(row)) for row in rows)
+
+    async def save_exclusion_entry(self, entry: ExclusionEntry) -> ExclusionEntry:
+        """Insert or replace one guild-configured excluded channel.
+
+        Identity is `(guild_id, channel_id)`, matching `ExclusionEntry` — re-excluding
+        an already-excluded channel (for example to update `reason`) replaces the row
+        rather than accumulating history.
+        """
+        _require_guild_id(entry.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO channel_exclusions (
+                    guild_id, channel_id, excluded_by, reason, excluded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                    excluded_by = excluded.excluded_by,
+                    reason = excluded.reason,
+                    excluded_at = excluded.excluded_at
+                """,
+                (
+                    entry.guild_id,
+                    entry.channel_id,
+                    entry.excluded_by,
+                    entry.reason,
+                    entry.excluded_at.isoformat(),
+                ),
+            )
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, channel_id, excluded_by, reason, excluded_at
+            FROM channel_exclusions
+            WHERE guild_id = ? AND channel_id = ?
+            """,
+            (entry.guild_id, entry.channel_id),
+        )
+        saved = exclusion_entry_from_row(await cursor.fetchone())
+        if saved is None:
+            raise RuntimeError("saved exclusion entry could not be read")
+        return saved
+
+    async def list_exclusion_entries(self, guild_id: int) -> tuple[ExclusionEntry, ...]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, channel_id, excluded_by, reason, excluded_at
+            FROM channel_exclusions
+            WHERE guild_id = ?
+            ORDER BY excluded_at DESC
+            """,
+            (guild_id,),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(ExclusionEntry, exclusion_entry_from_row(row)) for row in rows)
+
+    async def save_retention_policy(self, policy: RetentionPolicy) -> RetentionPolicy:
+        """Insert or replace the one retention policy for a guild.
+
+        Identity is `guild_id` alone, matching `RetentionPolicy` — a guild holds at
+        most one configured retention window at a time.
+        """
+        _require_guild_id(policy.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO retention_policies (
+                    guild_id, max_age_days, updated_by, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    max_age_days = excluded.max_age_days,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    policy.guild_id,
+                    policy.max_age_days,
+                    policy.updated_by,
+                    policy.updated_at.isoformat(),
+                ),
+            )
+        saved = await self.get_retention_policy(policy.guild_id)
+        if saved is None:
+            raise RuntimeError("saved retention policy could not be read")
+        return saved
+
+    async def get_retention_policy(self, guild_id: int) -> RetentionPolicy | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, max_age_days, updated_by, updated_at
+            FROM retention_policies
+            WHERE guild_id = ?
+            """,
+            (guild_id,),
+        )
+        row = await cursor.fetchone()
+        return retention_policy_from_row(row)
+
+    async def record_activity_receipt(
+        self,
+        *,
+        guild_id: int,
+        receipt_id: str,
+        member_id: int | None,
+        action: str,
+        detail: dict[str, JSONValue],
+        created_at: datetime,
+    ) -> None:
+        """Record a redacted, append-only audit receipt for one activity-ledger
+        storage action, matching the `sniff_receipts`/`creator_registry_receipts`
+        append-only receipt convention.
+
+        Per the design doc's Privacy Controls "Deletion" note, a deletion receipt
+        records *that* deletion occurred, never *what* was deleted — so this method
+        never itself decides what `detail` holds; it only redacts and stores whatever
+        the caller supplies. `activity_receipts` rows are never removed by
+        `delete_member_ledger_data`: like `sniff_receipts`, this table is the durable
+        audit trail, not member-scoped ledger data.
+        """
+        _require_guild_id(guild_id)
+        safe_detail = _json_object(redact(cast(JSONValue, detail)))
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO activity_receipts (
+                    guild_id, receipt_id, member_id, action, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt_id,
+                    member_id,
+                    action,
+                    json.dumps(safe_detail, sort_keys=True, separators=(",", ":")),
+                    created_at.isoformat(),
+                ),
+            )
+
+    async def delete_member_ledger_data(self, guild_id: int, member_id: int) -> None:
+        """Delete every member-scoped activity ledger row for one member, in a single
+        transaction.
+
+        Tables this method must touch — every table this task creates that stores
+        member-scoped ledger rows (keep this list in sync with the schema in
+        `_initialize` above):
+          - `ledger_events`   (raw per-kind events, keyed by (guild_id, event_id))
+          - `milestones`      (materialized milestone facts)
+
+        Deliberately NOT touched here (also created by this task, but not
+        member-scoped ledger data):
+          - `channel_exclusions`  — guild-level configuration (keyed by channel, no
+            member_id column at all).
+          - `retention_policies`  — guild-level configuration (one row per guild, no
+            member_id column at all).
+          - `activity_receipts`   — the durable audit trail *of* deletions (and other
+            storage actions); per the design doc, the receipt records that deletion
+            occurred, never what was deleted, so deleting receipts here would defeat
+            their purpose as an audit trail (matches `sniff_receipts` never being
+            cleared by any Phase 3 mutation).
+
+        Idempotent: deleting a member with no rows in either table is a no-op, not an
+        error.
+        """
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                "DELETE FROM ledger_events WHERE guild_id = ? AND member_id = ?",
+                (guild_id, member_id),
+            )
+            await self._connection.execute(
+                "DELETE FROM milestones WHERE guild_id = ? AND member_id = ?",
+                (guild_id, member_id),
+            )
