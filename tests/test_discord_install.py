@@ -4,6 +4,7 @@ import discord
 
 from krubit.discord.install import (
     install_url,
+    phase_four_intents,
     phase_one_intents,
     phase_one_permissions,
     phase_three_intents,
@@ -131,3 +132,20 @@ def test_install_url_requests_scheduled_event_scopes_when_enabled() -> None:
     expected = phase_two_permissions(scheduled_events_enabled=True)
     assert query["permissions"] == [str(expected.value)]
     assert query["permissions"] != [str(phase_two_permissions().value)]
+
+
+def test_phase_four_intents_adds_reactions_voice_and_events_to_phase_three() -> None:
+    intents = phase_four_intents()
+    assert intents.guild_reactions is True
+    assert intents.voice_states is True
+    assert intents.guild_scheduled_events is True
+    assert intents.message_content is True  # inherited from phase_three_intents()
+
+
+def test_phase_four_intents_inherits_phase_three_dispatch_and_automod_intents() -> None:
+    intents = phase_four_intents()
+    assert intents.messages is True
+    assert intents.auto_moderation_configuration is True
+    assert intents.auto_moderation_execution is True
+    assert intents.members is True
+    assert intents.presences is True

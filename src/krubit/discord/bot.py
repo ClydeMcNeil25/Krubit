@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from krubit.config import Settings
+from krubit.discord.activity_runtime import ActivityRuntime
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
 from krubit.discord.content_commands import (
     ActorContext,
@@ -594,6 +595,19 @@ class KrubitBot(discord.Client):
         selected_intents = (
             phase_three_intents() if should_request_message_content else phase_two_intents()
         )
+        # Phase 4 Activity Ledger's three intents (`guild_reactions`/`voice_states`/
+        # `guild_scheduled_events`) are all non-privileged, but are still only
+        # requested when `activity_ledger_enabled` is explicitly on -- matching every
+        # other phase's "request a feature's intents only when that feature's flag
+        # is on" convention (see `phase_three_intents()`'s own docstring for
+        # `message_content`). Added on top of whichever intent set was already
+        # selected above rather than via `phase_four_intents()` directly, since that
+        # function unconditionally inherits `phase_three_intents()`'s privileged
+        # `message_content` -- which must stay gated on `watchdog_enabled` alone.
+        if settings.activity_ledger_enabled:
+            selected_intents.guild_reactions = True
+            selected_intents.voice_states = True
+            selected_intents.guild_scheduled_events = True
         super().__init__(
             intents=selected_intents,
             application_id=settings.application_id,
@@ -643,6 +657,11 @@ class KrubitBot(discord.Client):
             message_content_available=self.intents.message_content,
             watch_window=WatchWindowService(service.store, duration=watch_window_duration),
         )
+        self._activity_runtime = ActivityRuntime(
+            service.store,
+            activity_ledger_enabled=settings.activity_ledger_enabled,
+            guild_ids=lambda: tuple(guild.id for guild in self.guilds),
+        )
         self.tree.add_command(
             FetchCommands(
                 service,
@@ -672,12 +691,15 @@ class KrubitBot(discord.Client):
             self.content_scheduler_cycle.start()
         if self._settings.watchdog_enabled:
             self.watchdog_sweep_cycle.start()
+        if self._settings.activity_ledger_enabled:
+            self.activity_ledger_sweep_cycle.start()
 
     async def close(self) -> None:
         self.daily_health_summary.cancel()
         self.live_signal_reconciliation.cancel()
         self.content_scheduler_cycle.cancel()
         self.watchdog_sweep_cycle.cancel()
+        self.activity_ledger_sweep_cycle.cancel()
         await super().close()
 
     async def _deliver_content_plans(self, guild_id: int, plans: tuple[ContentPlan, ...]) -> None:
@@ -749,6 +771,33 @@ class KrubitBot(discord.Client):
     async def on_watchdog_sweep_cycle_error(self, exception: BaseException) -> None:
         _logger.exception(
             "watchdog_sweep_cycle: exception escaped the loop body", exc_info=exception
+        )
+
+    @tasks.loop(seconds=60)
+    async def activity_ledger_sweep_cycle(self) -> None:
+        """Run one activity-ledger retention sweep cycle without ever letting the
+        loop itself stop -- the same second-layer guarantee `watchdog_sweep_cycle`/
+        `content_scheduler_cycle` both rely on: `ActivityRuntime.sweep_cycle` already
+        isolates every per-guild failure internally, but `discord.ext.tasks.Loop`
+        only auto-retries a narrow set of reconnect-worthy exceptions, so anything
+        else escaping this coroutine would otherwise stop retention pruning
+        permanently until a process restart.
+        """
+        try:
+            await self._activity_runtime.sweep_cycle(datetime.now(UTC))
+        except Exception:
+            _logger.exception(
+                "activity_ledger_sweep_cycle: unhandled exception during sweep_cycle"
+            )
+
+    @activity_ledger_sweep_cycle.before_loop
+    async def before_activity_ledger_sweep_cycle(self) -> None:
+        await self.wait_until_ready()
+
+    @activity_ledger_sweep_cycle.error
+    async def on_activity_ledger_sweep_cycle_error(self, exception: BaseException) -> None:
+        _logger.exception(
+            "activity_ledger_sweep_cycle: exception escaped the loop body", exc_info=exception
         )
 
     async def run_daily_summary_for_guild(
@@ -935,15 +984,18 @@ class KrubitBot(discord.Client):
             "member_joined", member.guild.id, member.id, None, {"bot": member.bot}
         )
         await self._watchdog_runtime.on_member_join(member, datetime.now(UTC))
+        await self._activity_runtime.on_member_join(member, datetime.now(UTC))
 
     async def on_message(self, message: discord.Message) -> None:
         await self._watchdog_runtime.on_message(message, datetime.now(UTC))
+        await self._activity_runtime.on_message(message, datetime.now(UTC))
 
     async def on_member_remove(self, member: discord.Member) -> None:
         await self._ingest_change(
             "member_left", member.guild.id, member.id, {"bot": member.bot}, None
         )
         await self._live_runtime.handle_member_leave(member)
+        await self._activity_runtime.on_member_remove(member, datetime.now(UTC))
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         before_roles = ",".join(str(role.id) for role in before.roles)
@@ -956,6 +1008,32 @@ class KrubitBot(discord.Client):
                 {"role_ids": before_roles},
                 {"role_ids": after_roles},
             )
+        await self._activity_runtime.on_member_update(before, after, datetime.now(UTC))
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        await self._activity_runtime.on_reaction_add(payload, datetime.now(UTC))
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        await self._activity_runtime.on_reaction_remove(payload, datetime.now(UTC))
+
+    async def on_voice_state_update(
+        self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+    ) -> None:
+        await self._activity_runtime.on_voice_state_update(
+            member, before, after, datetime.now(UTC)
+        )
+
+    async def on_scheduled_event_user_add(
+        self, event: discord.ScheduledEvent, user: discord.User | discord.Member
+    ) -> None:
+        await self._activity_runtime.on_scheduled_event_user_add(event, user, datetime.now(UTC))
+
+    async def on_scheduled_event_user_remove(
+        self, event: discord.ScheduledEvent, user: discord.User | discord.Member
+    ) -> None:
+        await self._activity_runtime.on_scheduled_event_user_remove(
+            event, user, datetime.now(UTC)
+        )
 
     @staticmethod
     def _role_state(role: discord.Role) -> dict[str, str | bool | int | None]:

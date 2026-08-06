@@ -56,6 +56,10 @@ class Settings:
     watchdog_notifications_enabled: bool = False
     watchdog_watch_window_hours: int | None = None
     watchdog_zariya_bridge_url: str | None = None
+    activity_ledger_enabled: bool = False
+    activity_ledger_excluded_channel_ids: tuple[int, ...] = ()
+    activity_ledger_retention_days: int | None = None
+    activity_ledger_inactivity_threshold_days: int | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -111,6 +115,18 @@ class Settings:
         raw_watchdog_zariya_bridge_url = values.get(
             "KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL", ""
         ).strip()
+        raw_activity_ledger_enabled = values.get(
+            "KRUBIT_ACTIVITY_LEDGER_ENABLED", "false"
+        ).strip()
+        raw_activity_ledger_excluded_channel_ids = values.get(
+            "KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS", ""
+        ).strip()
+        raw_activity_ledger_retention_days = values.get(
+            "KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS", ""
+        ).strip()
+        raw_activity_ledger_inactivity_threshold_days = values.get(
+            "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS", ""
+        ).strip()
 
         creator_signals_enabled = _parse_bool(
             "KRUBIT_CREATOR_SIGNALS_ENABLED", raw_creator_signals_enabled
@@ -149,6 +165,47 @@ class Settings:
         ):
             raise SettingsError("KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL must use https")
 
+        activity_ledger_enabled = _parse_bool(
+            "KRUBIT_ACTIVITY_LEDGER_ENABLED", raw_activity_ledger_enabled
+        )
+        activity_ledger_excluded_channel_ids: tuple[int, ...] = ()
+        if raw_activity_ledger_excluded_channel_ids:
+            raw_ids = [
+                part.strip()
+                for part in raw_activity_ledger_excluded_channel_ids.split(",")
+                if part.strip()
+            ]
+            if not raw_ids or any(
+                not raw_id.isdigit() or int(raw_id) <= 0 for raw_id in raw_ids
+            ):
+                raise SettingsError(
+                    "KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS must be a comma-separated "
+                    "list of positive numeric Discord snowflakes"
+                )
+            activity_ledger_excluded_channel_ids = tuple(int(raw_id) for raw_id in raw_ids)
+        activity_ledger_retention_days: int | None = None
+        if raw_activity_ledger_retention_days:
+            if (
+                not raw_activity_ledger_retention_days.isdigit()
+                or int(raw_activity_ledger_retention_days) <= 0
+            ):
+                raise SettingsError(
+                    "KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS must be a positive integer"
+                )
+            activity_ledger_retention_days = int(raw_activity_ledger_retention_days)
+        activity_ledger_inactivity_threshold_days: int | None = None
+        if raw_activity_ledger_inactivity_threshold_days:
+            if (
+                not raw_activity_ledger_inactivity_threshold_days.isdigit()
+                or int(raw_activity_ledger_inactivity_threshold_days) <= 0
+            ):
+                raise SettingsError(
+                    "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS must be a positive integer"
+                )
+            activity_ledger_inactivity_threshold_days = int(
+                raw_activity_ledger_inactivity_threshold_days
+            )
+
         return cls(
             application_id=int(raw_application_id),
             database_path=Path(raw_path),
@@ -175,6 +232,10 @@ class Settings:
             watchdog_notifications_enabled=watchdog_notifications_enabled,
             watchdog_watch_window_hours=watchdog_watch_window_hours,
             watchdog_zariya_bridge_url=raw_watchdog_zariya_bridge_url or None,
+            activity_ledger_enabled=activity_ledger_enabled,
+            activity_ledger_excluded_channel_ids=activity_ledger_excluded_channel_ids,
+            activity_ledger_retention_days=activity_ledger_retention_days,
+            activity_ledger_inactivity_threshold_days=activity_ledger_inactivity_threshold_days,
         )
 
     def require_token(self) -> str:

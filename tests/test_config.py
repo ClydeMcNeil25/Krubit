@@ -225,6 +225,56 @@ def test_require_credential_encryption_key_returns_configured_key() -> None:
     assert settings.require_credential_encryption_key() == "a-long-random-encryption-key"
 
 
+def test_activity_ledger_settings_default_disabled() -> None:
+    settings = Settings.from_env(base_env())
+    assert settings.activity_ledger_enabled is False
+    assert settings.activity_ledger_excluded_channel_ids == ()
+    assert settings.activity_ledger_retention_days is None
+    assert settings.activity_ledger_inactivity_threshold_days is None
+
+
+def test_activity_ledger_settings_parse_when_enabled() -> None:
+    settings = Settings.from_env(
+        {
+            **base_env(),
+            "KRUBIT_ACTIVITY_LEDGER_ENABLED": "true",
+            "KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS": "111,222,333",
+            "KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS": "90",
+            "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS": "30",
+        }
+    )
+    assert settings.activity_ledger_enabled is True
+    assert settings.activity_ledger_excluded_channel_ids == (111, 222, 333)
+    assert settings.activity_ledger_retention_days == 90
+    assert settings.activity_ledger_inactivity_threshold_days == 30
+
+
+def test_activity_ledger_settings_reject_invalid_enabled_value() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_ACTIVITY_LEDGER_ENABLED"):
+        Settings.from_env({**base_env(), "KRUBIT_ACTIVITY_LEDGER_ENABLED": "sure"})
+
+
+def test_activity_ledger_settings_reject_non_numeric_excluded_channel_id() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS"):
+        Settings.from_env(
+            {**base_env(), "KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS": "111,not-a-id"}
+        )
+
+
+def test_activity_ledger_settings_reject_non_positive_retention_days() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS"):
+        Settings.from_env({**base_env(), "KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS": "0"})
+
+
+def test_activity_ledger_settings_reject_non_positive_inactivity_threshold_days() -> None:
+    with pytest.raises(
+        SettingsError, match="KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS"
+    ):
+        Settings.from_env(
+            {**base_env(), "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS": "-1"}
+        )
+
+
 def test_settings_repr_never_renders_configured_secret_values() -> None:
     secret_values = {
         "DISCORD_KRUBIT_BOT_TOKEN": "bot-token-value",

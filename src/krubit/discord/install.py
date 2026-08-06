@@ -86,6 +86,26 @@ def phase_three_intents() -> discord.Intents:
     return intents
 
 
+def phase_four_intents() -> discord.Intents:
+    """The Phase 4 Activity Ledger intent set: reactions, voice states, and
+    Scheduled Event RSVPs, additively on top of Phase 3.
+
+    All three are non-privileged (no Developer Portal toggle required), unlike
+    `phase_three_intents()`'s `message_content`. `guild_reactions` lets
+    `on_raw_reaction_add`/`on_raw_reaction_remove` dispatch at all; `voice_states`
+    lets `on_voice_state_update` dispatch (the activity ledger's voice-session
+    tracking has nothing to bridge without it); `guild_scheduled_events` lets
+    `on_scheduled_event_user_add`/`on_scheduled_event_user_remove` dispatch (the
+    attendance bridge's two source callbacks). `phase_three_intents()`'s own flags
+    (including `message_content`) are inherited unchanged.
+    """
+    intents = phase_three_intents()
+    intents.guild_reactions = True
+    intents.voice_states = True
+    intents.guild_scheduled_events = True
+    return intents
+
+
 def install_url(application_id: int, *, scheduled_events_enabled: bool = False) -> str:
     if application_id <= 0:
         raise ValueError("application_id must be positive")
