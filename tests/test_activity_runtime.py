@@ -645,3 +645,158 @@ def test_default_retention_days_requires_an_owner_id(store: SQLiteStore) -> None
             guild_ids=lambda: (GUILD_ID,),
             default_retention_days=30,
         )
+
+
+# --- sweep_cycle: excluded_channel_ids seeding (Critical #1) -----------------------
+#
+# Before this fix, `save_exclusion_entry` had zero non-test callers anywhere in the
+# running bot: `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` was parsed but applied
+# nowhere, so no operator action could actually keep a channel out of the ledger.
+# These tests prove the fix end-to-end: a configured channel ID genuinely produces
+# an `ExclusionEntry` row via `sweep_cycle`, and a subsequent `on_message` call for
+# that exact channel is genuinely excluded from ingestion -- not just a unit test of
+# the seed method in isolation.
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_seeds_exclusions_and_ingestion_honors_them_end_to_end(
+    store: SQLiteStore,
+) -> None:
+    rt = ActivityRuntime(
+        store,
+        activity_ledger_enabled=True,
+        guild_ids=lambda: (GUILD_ID,),
+        excluded_channel_ids=(CHANNEL_ID,),
+        default_retention_policy_owner_id=999,
+    )
+
+    await rt.sweep_cycle(NOW)
+
+    entries = await store.list_exclusion_entries(GUILD_ID)
+    assert [entry.channel_id for entry in entries] == [CHANNEL_ID]
+    assert entries[0].excluded_by == 999
+
+    # The seeded row must be genuinely enforced by real message ingestion, not just
+    # present in storage.
+    await rt.on_message(FakeMessage(channel_id=CHANNEL_ID), NOW)
+    assert await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID) == ()
+
+    # A different, non-excluded channel is unaffected.
+    await rt.on_message(FakeMessage(channel_id=CHANNEL_ID + 1), NOW)
+    events = await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID)
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_seeds_one_entry_per_configured_channel(
+    store: SQLiteStore,
+) -> None:
+    other_channel_id = CHANNEL_ID + 1
+    rt = ActivityRuntime(
+        store,
+        activity_ledger_enabled=True,
+        guild_ids=lambda: (GUILD_ID,),
+        excluded_channel_ids=(CHANNEL_ID, other_channel_id),
+        default_retention_policy_owner_id=999,
+    )
+
+    await rt.sweep_cycle(NOW)
+
+    entries = await store.list_exclusion_entries(GUILD_ID)
+    assert {entry.channel_id for entry in entries} == {CHANNEL_ID, other_channel_id}
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_never_overwrites_a_staff_set_exclusion_entry(
+    store: SQLiteStore,
+) -> None:
+    staff_entry = ExclusionEntry(
+        guild_id=GUILD_ID,
+        channel_id=CHANNEL_ID,
+        excluded_by=42,
+        reason="staff lounge -- do not touch",
+        excluded_at=NOW - timedelta(days=1),
+    )
+    await store.save_exclusion_entry(staff_entry)
+    rt = ActivityRuntime(
+        store,
+        activity_ledger_enabled=True,
+        guild_ids=lambda: (GUILD_ID,),
+        excluded_channel_ids=(CHANNEL_ID,),
+        default_retention_policy_owner_id=999,
+    )
+
+    await rt.sweep_cycle(NOW)
+
+    entries = await store.list_exclusion_entries(GUILD_ID)
+    assert len(entries) == 1
+    assert entries[0].excluded_by == 42  # staff's own value, never overwritten
+    assert entries[0].reason == "staff lounge -- do not touch"
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_does_not_seed_exclusions_when_unset(
+    runtime: ActivityRuntime, store: SQLiteStore
+) -> None:
+    await runtime.sweep_cycle(NOW)
+
+    assert await store.list_exclusion_entries(GUILD_ID) == ()
+
+
+def test_excluded_channel_ids_requires_an_owner_id(store: SQLiteStore) -> None:
+    with pytest.raises(ValueError, match="default_retention_policy_owner_id"):
+        ActivityRuntime(
+            store,
+            activity_ledger_enabled=True,
+            guild_ids=lambda: (GUILD_ID,),
+            excluded_channel_ids=(CHANNEL_ID,),
+        )
+
+
+# --- DM double-gate: checked at the dispatch site, not just inside the extractor ---
+#
+# See Important #4 of the 2026-08-06 Phase 4 final-review fix report: the design
+# doc requires `guild is None` be checked both at the dispatch site (here) and again
+# inside the consuming extraction function -- matching `WatchdogRuntime`'s existing
+# double-gate pattern. These tests prove the gate exists at *this* layer specifically
+# by asserting the extractor is never even called for a DM, not merely that no event
+# ends up ingested (which the extractor's own internal check alone would already
+# guarantee).
+
+
+@pytest.mark.asyncio
+async def test_on_message_dm_gate_short_circuits_before_extraction(
+    runtime: ActivityRuntime, store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import krubit.discord.activity_runtime as activity_runtime_module
+
+    calls: list[object] = []
+
+    def _tracking_extract(message: object, now: datetime) -> None:
+        calls.append(message)
+        return None
+
+    monkeypatch.setattr(activity_runtime_module, "extract_message_event", _tracking_extract)
+
+    await runtime.on_message(FakeMessage(guild=None), NOW)
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_add_dm_gate_short_circuits_before_extraction(
+    runtime: ActivityRuntime, store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import krubit.discord.activity_runtime as activity_runtime_module
+
+    calls: list[object] = []
+
+    def _tracking_extract(payload: object, now: datetime) -> None:
+        calls.append(payload)
+        return None
+
+    monkeypatch.setattr(activity_runtime_module, "extract_reaction_event", _tracking_extract)
+
+    await runtime.on_reaction_add(FakeReactionPayload(guild_id=None), NOW)
+
+    assert calls == []

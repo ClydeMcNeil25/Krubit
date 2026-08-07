@@ -95,6 +95,7 @@ from krubit.discord.activity_events import (
 )
 from krubit.domain.activity_ledger import (
     AttendanceAction,
+    ExclusionEntry,
     JoinEvent,
     RetentionPolicy,
     RoleChangeAction,
@@ -220,14 +221,30 @@ class ActivityRuntime:
     sweep` already treats "no policy" as "retention is opt-in, not a default cap" (see
     that method's own docstring), and a guild that already has a policy (staff-
     configured, or seeded by an earlier sweep) is never touched again by this path.
-    Unlike `activity_ledger_excluded_channel_ids` (which this runtime deliberately
-    does NOT auto-apply -- see `ActivityRuntime`'s module-level design notes in the
-    Task 7 report: an `ExclusionEntry` carries a staff-set `reason` a blind reseed
-    could clobber), `RetentionPolicy` carries no such staff-authored field to lose --
-    only `max_age_days`/`updated_by`/`updated_at`, none of which this seed touches
-    again once a policy row exists at all. `default_retention_policy_owner_id` is the
-    `updated_by` attribution for a seeded row (the running application's own ID, not a
-    real staff member, since no staff member configured it).
+    `RetentionPolicy` carries no staff-authored field beyond `max_age_days`/
+    `updated_by`/`updated_at`, none of which this seed touches again once a policy row
+    exists at all. `default_retention_policy_owner_id` is the `updated_by` attribution
+    for a seeded row (the running application's own ID, not a real staff member,
+    since no staff member configured it).
+
+    ## `excluded_channel_ids`: seeding, per-channel, same non-clobbering discipline
+
+    `Settings.activity_ledger_excluded_channel_ids`
+    (`KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS`) is the one operator-facing
+    control that can keep a channel out of the ledger today -- before this, nothing
+    in the running bot ever wrote an `ExclusionEntry`, so the whole channel-exclusion
+    mechanism (enforced in `krubit.services.activity_ingestion.
+    ActivityIngestionService`) was unreachable in production. `sweep_cycle` seeds one
+    `ExclusionEntry` per configured channel ID the first time it finds *no* entry for
+    that exact `(guild_id, channel_id)` -- unlike `RetentionPolicy`, an
+    `ExclusionEntry` carries a staff-set `reason` a blind reseed could clobber, so
+    this is a per-channel presence check, not an all-or-nothing per-guild one: a
+    channel a staff member already excluded (with their own `reason`) is never
+    touched again by this path, even if the env var's channel list changes, while a
+    channel newly added to the env var still gets seeded on the next sweep.
+    `default_retention_policy_owner_id` doubles as the `excluded_by` attribution for
+    a seeded exclusion entry, for the same reason it is the `updated_by` attribution
+    for a seeded retention policy.
     """
 
     def __init__(
@@ -240,11 +257,14 @@ class ActivityRuntime:
         retention_sweep: RetentionSweepService | None = None,
         default_retention_days: int | None = None,
         default_retention_policy_owner_id: int | None = None,
+        excluded_channel_ids: tuple[int, ...] = (),
     ) -> None:
-        if default_retention_days is not None and default_retention_policy_owner_id is None:
+        if (
+            default_retention_days is not None or excluded_channel_ids
+        ) and default_retention_policy_owner_id is None:
             raise ValueError(
                 "default_retention_policy_owner_id is required when "
-                "default_retention_days is set"
+                "default_retention_days is set or excluded_channel_ids is non-empty"
             )
         self._store = store
         self._activity_ledger_enabled = activity_ledger_enabled
@@ -253,6 +273,7 @@ class ActivityRuntime:
         self._retention_sweep = retention_sweep or RetentionSweepService(store)
         self._default_retention_days = default_retention_days
         self._default_retention_policy_owner_id = default_retention_policy_owner_id
+        self._excluded_channel_ids = excluded_channel_ids
         # See the module docstring's "voice-session tracking cache" section. Never
         # persisted -- a process restart loses in-flight joins gracefully (the
         # matching leave finds no cached snapshot and is skipped rather than
@@ -262,15 +283,20 @@ class ActivityRuntime:
     # -- messages / reactions --------------------------------------------------
 
     async def on_message(self, message: MessageSubject, now: datetime) -> None:
-        """Ingest one guild message as a `MessageEvent`. A no-op for a DM (handled
-        by `extract_message_event` itself) or a bot-authored message (checked here,
-        matching `WatchdogRuntime.on_message`'s own `getattr(author, "bot", False)`
-        idiom -- a bot's own posts, including Krubit's, are never member
+        """Ingest one guild message as a `MessageEvent`. A no-op for a DM (the first
+        gate: `message.guild is None`, checked here at the dispatch site, exactly
+        matching `WatchdogRuntime.on_message`'s own `guild is None` check -- `krubit.
+        discord.activity_events.extract_message_event` is the *second* gate, per the
+        design doc's DM double-gate requirement) or a bot-authored message (checked
+        here, matching `WatchdogRuntime.on_message`'s own `getattr(author, "bot",
+        False)` idiom -- a bot's own posts, including Krubit's, are never member
         participation).
         """
         if not self._activity_ledger_enabled:
             return
         _require_aware("now", now)
+        if message.guild is None:
+            return
         if getattr(message.author, "bot", False):
             return
         event = extract_message_event(message, now)
@@ -279,11 +305,16 @@ class ActivityRuntime:
 
     async def on_reaction_add(self, payload: ReactionPayloadSubject, now: datetime) -> None:
         """Ingest one reaction add as a `ReactionEvent`. A no-op for a DM reaction
-        (handled by `extract_reaction_event` itself).
+        (the first gate: `payload.guild_id is None`, checked here at the dispatch
+        site, mirroring `on_message`'s own dispatch-site `guild is None` check --
+        `krubit.discord.activity_events.extract_reaction_event` is the *second* gate,
+        per the design doc's DM double-gate requirement).
         """
         if not self._activity_ledger_enabled:
             return
         _require_aware("now", now)
+        if payload.guild_id is None:
+            return
         event = extract_reaction_event(payload, now)
         if event is not None:
             await self._ingestion.ingest(event)
@@ -455,6 +486,7 @@ class ActivityRuntime:
         self._prune_stale_voice_joins(now)
         for guild_id in self._guild_ids():
             try:
+                await self._seed_default_exclusions(guild_id, now)
                 await self._seed_default_retention_policy(guild_id, now)
                 await self._retention_sweep.sweep(guild_id, now)
             except Exception:
@@ -463,6 +495,36 @@ class ActivityRuntime:
                     "continuing with the next guild",
                     guild_id,
                 )
+
+    async def _seed_default_exclusions(self, guild_id: int, now: datetime) -> None:
+        """Seed one `ExclusionEntry` per channel ID in `Settings.
+        activity_ledger_excluded_channel_ids` for `guild_id`, skipping any channel
+        that already has an entry. See the class docstring's "`excluded_channel_ids`:
+        seeding, per-channel, same non-clobbering discipline" section -- this never
+        touches a channel that already has an `ExclusionEntry`, staff-configured or
+        previously seeded, since that entry may carry a staff-authored `reason` this
+        seed must never overwrite.
+        """
+        if not self._excluded_channel_ids:
+            return
+        existing = await self._store.list_exclusion_entries(guild_id)
+        already_excluded = {entry.channel_id for entry in existing}
+        owner_id = self._default_retention_policy_owner_id
+        assert owner_id is not None  # enforced together in __init__
+        for channel_id in self._excluded_channel_ids:
+            if channel_id in already_excluded:
+                continue
+            await self._store.save_exclusion_entry(
+                ExclusionEntry(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    excluded_by=owner_id,
+                    reason=(
+                        "Seeded from KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS"
+                    ),
+                    excluded_at=now,
+                )
+            )
 
     async def _seed_default_retention_policy(self, guild_id: int, now: datetime) -> None:
         """Seed `guild_id`'s default `RetentionPolicy` from `Settings.

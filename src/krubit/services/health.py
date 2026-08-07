@@ -61,6 +61,7 @@ class ActivityLedgerHealthFacts:
 
     enabled: bool
     retention_configured: bool
+    exclusions_configured: bool = False
 
 
 def _activity_ledger_findings(facts: ActivityLedgerHealthFacts | None) -> list[HealthFinding]:
@@ -87,6 +88,18 @@ def _activity_ledger_findings(facts: ActivityLedgerHealthFacts | None) -> list[H
                 "(KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS unset); raw ledger rows "
                 "accumulate indefinitely for any guild that has not separately been "
                 "given its own staff-configured retention policy.",
+            )
+        )
+    if not facts.exclusions_configured:
+        findings.append(
+            HealthFinding(
+                "activity_ledger_exclusions_unconfigured",
+                "limited",
+                "No excluded channels are configured "
+                "(KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS unset); every guild "
+                "channel's activity is being ingested into the ledger, including any "
+                "private, vent, or mod-only channel that has not separately been "
+                "given its own staff-configured exclusion.",
             )
         )
     return findings

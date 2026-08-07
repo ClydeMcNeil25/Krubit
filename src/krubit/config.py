@@ -57,21 +57,27 @@ class Settings:
     watchdog_watch_window_hours: int | None = None
     watchdog_zariya_bridge_url: str | None = None
     activity_ledger_enabled: bool = False
+    # Consumed by `krubit.discord.activity_runtime.ActivityRuntime.sweep_cycle`: when
+    # set, seeds a guild's `ExclusionEntry` rows for these channel IDs the first time
+    # a sweep finds no entry for that `(guild_id, channel_id)` (never overwrites a
+    # staff-configured entry, including one this same seed created earlier -- see
+    # `ActivityRuntime._seed_default_exclusions`'s docstring). This is the only
+    # operator-facing control that can keep a channel out of the activity ledger
+    # today; enforcement of an already-seeded row happens in
+    # `krubit.services.activity_ingestion.ActivityIngestionService`.
     activity_ledger_excluded_channel_ids: tuple[int, ...] = ()
     # Consumed by `krubit.discord.activity_runtime.ActivityRuntime.sweep_cycle`: when
     # set, seeds a guild's default `RetentionPolicy` the first time a sweep finds none
     # configured (never overwrites a staff-configured policy -- see that method's
     # docstring).
     activity_ledger_retention_days: int | None = None
-    # NOT YET CONSUMED anywhere in this codebase. This is a query-time parameter for
-    # `krubit.services.activity_views.inactive_view`/`returning_member_view`
-    # (`inactivity_threshold: timedelta`), which only a later task's `/fetch
-    # inactive`/community-pulse-style command surface (Task 8 in the Phase 4 plan)
-    # will actually read and pass through. Parsed and validated here so operators can
-    # configure it ahead of that surface landing, but setting it currently has no
-    # observable effect -- unlike `activity_ledger_retention_days` above, there is no
-    # sensible "seed a default row" action for a per-query threshold, so there is
-    # nothing for this task to wire it into.
+    # Consumed by `krubit.discord.bot.FetchCommands` (`_DEFAULT_ACTIVITY_LEDGER_
+    # INACTIVITY_THRESHOLD_DAYS` fallback / `inactivity_threshold` property), which
+    # resolves this value and passes it through to `/fetch inactive` and `/fetch
+    # activity` (`krubit.discord.activity_commands.ActivityCommandService.inactive`/
+    # `.activity`) as their `inactivity_threshold: timedelta` argument. When unset,
+    # those commands fall back to a documented 14-day default instead of having no
+    # effect.
     activity_ledger_inactivity_threshold_days: int | None = None
 
     @classmethod

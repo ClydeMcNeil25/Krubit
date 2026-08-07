@@ -37,10 +37,12 @@ privacy controls (channel exclusion, retention, deletion, export).
   and 30-day cohorts), `participation_trend` — reproducing the design doc's own
   worked fixtures exactly, with inclusive-both-ends day-boundary discipline
   (matching Phase 3's quiet-hours half-open-interval precedent).
-- **Views**: `newcomer_view`, `inactive_view`, `returning_member_view`,
-  `milestone_view`, and `community_pulse_view` (`krubit.services.activity_views`),
-  plus `recognition_candidates` (`krubit.services.milestones`) — six views total,
-  matching the design doc's Views section exactly. See
+- **Views**: `newcomer_view`, `inactive_view`, `returning_member_view`, and
+  `community_pulse` (`krubit.services.activity_views`), plus `recognition_candidates`
+  (`krubit.services.milestones`) — the milestone view is satisfied by
+  `list_milestones` (`krubit.storage.sqlite.SQLiteStore`) plus `/fetch milestones`,
+  not a dedicated view function — six views total, matching the design doc's Views
+  section exactly. See
   [Gap 1](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap)
   and
   [Gap 2](#gap-2-recognition-candidate-data-is-invisible-to-staff-through-any-fetch-command--the-identical-defect-shape-as-gap-1)
@@ -95,7 +97,7 @@ to produce data in the first place, exactly matching Phase 3 Watchdog's
 | Variable | Required | Purpose |
 |---|---|---|
 | `KRUBIT_ACTIVITY_LEDGER_ENABLED` | Optional, default `false` | Master ingestion flag — message/reaction/voice/attendance/join/role-change ingestion and the retention sweep |
-| `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` | Optional, comma-separated positive snowflakes | **Parsed and validated only — see [Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage) below; nothing in this build seeds it into the real, enforced exclusion table** |
+| `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` | Optional, comma-separated positive snowflakes | Seeds one `ExclusionEntry` per listed channel ID the first time `ActivityRuntime.sweep_cycle` finds no entry for that `(guild_id, channel_id)` (never overwrites a staff-set entry, including one this same seed created earlier) — see [Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-now-seeded-not-just-parsed) below |
 | `KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS` | Optional, positive integer | Seeds a guild's default `RetentionPolicy` the first time none is configured (never overrides a guild that already has one, staff-configured or previously seeded) |
 | `KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS` | Optional, positive integer | Read once at the Discord layer (`FetchCommands`) and passed as a plain argument to `/fetch inactive`/`/fetch activity` — deliberately never stored or seeded into any table (Task 7's design decision) |
 
@@ -293,59 +295,70 @@ since both are the same missing-command defect.
 ### Gap 3: Deletion, export, and channel-exclusion configuration have no `/fetch` command — direct database access only
 
 `delete_member` and `export_member_data` (`src/krubit/services/activity_privacy.py`)
-and `SQLiteStore.save_exclusion_entry`/`list_exclusion_entries`
-(`src/krubit/storage/sqlite.py`) are fully implemented, fully tested against a real
-on-disk database (including the deletion-completeness structural proof above), and
-directly satisfy three of the design doc's five Privacy Controls (Deletion, Export,
-Channel exclusion). **None of the three has a Discord-facing command anywhere in
-this nine-task plan.** Confirmed by grep: neither `delete_member(`,
-`export_member_data(`, nor `save_exclusion_entry(` is called from any file under
+are fully implemented and fully tested against a real on-disk database (including
+the deletion-completeness structural proof above), and directly satisfy two of the
+design doc's five Privacy Controls (Deletion, Export). **Neither has a
+Discord-facing command anywhere in this nine-task plan.** Confirmed by grep:
+neither `delete_member(` nor `export_member_data(` is called from any file under
 `src/krubit/discord`, and there is no CLI script under `scripts/` that calls them
-either. This was a deliberate, documented Task 7 scope decision for the
-exclusion-ids setting specifically (see [Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)),
-and an artifact of the design doc's own Commands section never listing a
-deletion/export/exclusion command for Task 8 to build — not a bug introduced by any
-single task, but a real, confirmed plan-level gap all the same, exactly like
+either. This is an artifact of the design doc's own Commands section never listing
+a deletion/export command for Task 8 to build — not a bug introduced by any single
+task, but a real, confirmed plan-level gap all the same, exactly like
 [Gap 1](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap)
 above.
 
-**Practical consequence:** today, honoring a member's deletion or export request, or
-configuring a channel exclusion at all, requires an operator to call these
-functions directly (e.g. from a Python REPL against the running `SQLiteStore`) or
-write ad hoc SQL against `data/krubit.db` — there is no staff-facing, auditable,
-in-Discord path for any of the three. This mirrors Phase 3's own documented gap
-("no allow/block-list UI exists yet ... rows must be inserted directly against the
-SQLite database"), but is more significant here because Deletion and Channel
-exclusion are two of the design doc's five named Privacy Controls, not an
-enforcement-detail configuration table. A future task must add staff-facing
-(deletion/exclusion) and member-facing (export, staff-on-behalf-of-a-member)
-command surfaces before these controls have any operational reach.
+Channel exclusion is in a different state as of the 2026-08-06 whole-branch final
+review: `SQLiteStore.save_exclusion_entry` now IS called in production, from
+`ActivityRuntime.sweep_cycle` (`src/krubit/discord/activity_runtime.py`) — see
+[Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-now-seeded-not-just-parsed) — so
+an operator can protect a channel today via
+`KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` without touching the database
+directly. What is still missing is a **per-channel, staff-facing Discord command**
+(e.g. `/fetch exclude-channel`) that would let staff exclude one channel, with a
+`reason`, without a bot restart/redeploy — today, excluding (or un-excluding) a
+single channel with a specific `reason` still requires either editing the env var
+(a bulk, redeploy-gated operation) or writing directly against `channel_exclusions`.
 
-### Gap 4: The excluded-channel-ids env var is parsed and validated, but never applied to storage
+**Practical consequence:** today, honoring a member's deletion or export request
+requires an operator to call `delete_member`/`export_member_data` directly (e.g.
+from a Python REPL against the running `SQLiteStore`) or write ad hoc SQL against
+`data/krubit.db` — there is no staff-facing, auditable, in-Discord path for either.
+This mirrors Phase 3's own documented gap ("no allow/block-list UI exists yet ...
+rows must be inserted directly against the SQLite database"), but is more
+significant here because Deletion is one of the design doc's five named Privacy
+Controls, not an enforcement-detail configuration table. A future task must add
+staff-facing (deletion, per-channel exclusion) and member-facing (export,
+staff-on-behalf-of-a-member) command surfaces before these controls have full
+operational reach.
 
-`Settings.activity_ledger_excluded_channel_ids` (`KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS`)
-is parsed, validated (comma-separated positive snowflakes), and unit-tested, but
-**no code path in this build ever writes it into the real, enforced
-`channel_exclusions` table.** This was a deliberate Task 7 judgment call, not an
-oversight: `ExclusionEntry` carries a staff-set `reason` and `excluded_by`
-attribution that a flat env-var list cannot express, and `save_exclusion_entry` is
-an upsert, so blindly reseeding from this setting on every guild connect would
-silently clobber a staff member's own configured `reason` for an overlapping
-channel ID. Unlike `KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS` (which genuinely is
-enforced — see below), setting this variable today has **zero observable effect**.
-Do not configure it expecting channel exclusion to happen automatically; channel
-exclusion is fully enforced (see the structural proof above) once a
-`channel_exclusions` row exists, but a row must be written directly against
-storage per [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
-today.
+### Gap 4: The excluded-channel-ids env var is now seeded, not just parsed
 
-`KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS`, by contrast, **is** genuinely enforced:
-`ActivityRuntime.sweep_cycle` seeds a guild's default `RetentionPolicy` from this
-setting the first time it finds none configured for that guild — a one-time seed,
-never an override of an existing (staff-configured or previously-seeded) policy.
-`RetentionPolicy` carries no staff-authored field this seeding could clobber
-(unlike `ExclusionEntry`'s `reason`), which is exactly why this setting was safe to
-auto-wire while the exclusion-ids setting was not.
+**Resolved** as of the 2026-08-06 whole-branch final review (previously: parsed and
+validated, but no code path ever wrote it into the real, enforced
+`channel_exclusions` table — a Critical finding, since it meant no operator action,
+env var or otherwise, could actually protect a channel). `Settings.
+activity_ledger_excluded_channel_ids` (`KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS`)
+is now genuinely enforced: `ActivityRuntime.sweep_cycle` seeds one `ExclusionEntry`
+per configured channel ID the first time it finds *no* entry for that exact
+`(guild_id, channel_id)` — mirroring the non-clobbering, per-guild seed discipline
+`KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS` already used (see immediately below), just
+applied per-channel instead of per-guild: a channel a staff member already excluded
+(with their own `reason`) is never touched again by this path, staff-set or
+previously seeded, even if the env var's channel list later changes.
+
+This env var is the one operator-facing control that can protect a channel today.
+A dedicated `/fetch exclude-channel`-style staff command (see
+[Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only))
+would still be a better long-term answer — it would let staff exclude a channel
+without a bot restart/redeploy and without editing process environment variables —
+but is not required for the exclusion mechanism to be genuinely reachable in
+production, which it now is.
+
+`KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS` uses the identical pattern at the per-guild
+level: `ActivityRuntime.sweep_cycle` seeds a guild's default `RetentionPolicy` from
+this setting the first time it finds none configured for that guild — a one-time
+seed, never an override of an existing (staff-configured or previously-seeded)
+policy.
 
 ### Gap 5: `inactive_view`'s left-member detection can miss a member who left long ago in a high-volume guild
 
@@ -375,7 +388,7 @@ partial or reversed by the crash, only the audit trail of it having happened.
 uncapped so an export is never silently truncated the way the 500-row interactive
 view cap would truncate it) loads every one of a member's events into memory at
 once. A guild that never configures a retention policy (see
-[Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)
+[Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-now-seeded-not-just-parsed)
 above — retention is opt-in, not a default cap) could accumulate years of
 unpruned events for one long-tenured member, and exporting that member loads all of
 them into process memory in a single call. A real, low-probability resource risk in

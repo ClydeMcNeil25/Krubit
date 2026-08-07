@@ -1,8 +1,126 @@
+import ast
 from pathlib import Path
 
 import pytest
 
 from krubit.config import Settings, SettingsError
+
+_SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "krubit"
+_CONFIG_FILE = _SRC_ROOT / "config.py"
+
+# Fields intentionally exempt from `test_every_settings_field_has_a_non_test_reader`
+# below, each with a documented reason -- see Critical #2 of the 2026-08-06 Phase 4
+# final-review fix report: a `Settings` field with zero readers advertises a control
+# that does not exist, and "documented but not read" is not an adequate fix (that
+# exact gap is what let `activity_ledger_excluded_channel_ids` go unwired for two
+# task-level reviews in a row). Keep this list small, and give every entry a real
+# reason -- a silent exemption defeats the entire point of this test.
+_UNREAD_FIELD_EXEMPTIONS: dict[str, str] = {
+    "bot_token": (
+        "read via the `Settings.require_token()` accessor (called from "
+        "`__main__.py`), never by direct `.bot_token` attribute access or a "
+        "`bot_token=` keyword -- the only two patterns this test's AST scan "
+        "recognizes as a 'read'."
+    ),
+    "credential_encryption_key": (
+        "pre-existing (pre-Phase-4) forward declaration for the not-yet-wired "
+        "encrypted-credential-storage path; `Settings."
+        "require_credential_encryption_key()` exists but has no production caller "
+        "yet. Out of scope for the Phase 4 activity ledger -- flagged here instead "
+        "of silently passing."
+    ),
+    "meta_app_id": "pre-existing forward declaration for the not-yet-wired Meta connector.",
+    "meta_app_secret": "pre-existing forward declaration for the not-yet-wired Meta connector.",
+    "meta_callback_base_url": (
+        "pre-existing forward declaration for the not-yet-wired Meta connector."
+    ),
+    "tiktok_client_key": (
+        "pre-existing forward declaration for the not-yet-wired TikTok connector."
+    ),
+    "tiktok_client_secret": (
+        "pre-existing forward declaration for the not-yet-wired TikTok connector."
+    ),
+    "tiktok_callback_base_url": (
+        "pre-existing forward declaration for the not-yet-wired TikTok connector."
+    ),
+    "youtube_push_callback_secret": (
+        "pre-existing forward declaration for a not-yet-built YouTube "
+        "push-notification callback verification path -- distinct from "
+        "`youtube_api_key`, which IS read (by `__main__.py`)."
+    ),
+    "callback_public_base_url": (
+        "pre-existing forward declaration for the not-yet-built generic OAuth "
+        "callback HTTP server that would host it."
+    ),
+    "callback_port": (
+        "pre-existing forward declaration for the not-yet-built generic OAuth "
+        "callback HTTP server that would bind it."
+    ),
+    "watchdog_zariya_bridge_url": (
+        "pre-existing forward declaration for a not-yet-built Watchdog-to-Zariya "
+        "escalation bridge integration."
+    ),
+}
+
+
+def _identifiers_referenced(tree: ast.AST) -> set[str]:
+    """Every attribute name and keyword-argument name referenced anywhere in
+    `tree`. Deliberately does NOT match plain identifiers/strings, so a field name
+    that only appears inside a comment or a docstring sentence -- exactly how
+    `activity_ledger_excluded_channel_ids` looked "documented" before it was
+    actually wired -- does not count as a reference here.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            names.add(node.arg)
+    return names
+
+
+def test_every_settings_field_has_a_non_test_reader() -> None:
+    """Standing safeguard for the "Settings field parsed but never read" bug class.
+
+    This is the THIRD confirmed instance of this bug class in this codebase's
+    history (per the 2026-08-06 Phase 4 whole-branch final review): Phase 2's and
+    Phase 3's final reviews each caught one, and Phase 4 had two of its own --
+    `activity_ledger_retention_days` was caught and fixed at the task level, but
+    `activity_ledger_excluded_channel_ids` was only caught and *documented*, not
+    wired, until this final review. This test exists so a fourth instance fails
+    CI instead of shipping.
+
+    A field counts as "read" if its name appears as an attribute access
+    (`settings.field_name` / `self._settings.field_name`) or a keyword argument
+    anywhere under `src/krubit`, outside `config.py` itself -- this deliberately
+    does not attempt real control-flow analysis (that would need to prove the read
+    is actually reachable at runtime); it only proves *some* production code
+    references the field by name in a way a plain grep would not have caught
+    reliably (see `_identifiers_referenced`'s docstring for why AST attribute/
+    keyword matching is used instead of a text search).
+    """
+    referenced: set[str] = set()
+    for path in _SRC_ROOT.rglob("*.py"):
+        if path == _CONFIG_FILE or "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        referenced |= _identifiers_referenced(tree)
+
+    unread = sorted(
+        name
+        for name in Settings.__dataclass_fields__
+        if name not in referenced and name not in _UNREAD_FIELD_EXEMPTIONS
+    )
+    assert not unread, (
+        f"Settings field(s) with zero non-test readers and no documented "
+        f"exemption: {unread}. Either wire the field into production code or add "
+        f"a reasoned entry to _UNREAD_FIELD_EXEMPTIONS in this file."
+    )
+
+    # Every exemption must name a field that still exists, so a renamed or removed
+    # field doesn't leave a stale, meaningless exemption behind.
+    stale_exemptions = sorted(set(_UNREAD_FIELD_EXEMPTIONS) - set(Settings.__dataclass_fields__))
+    assert not stale_exemptions, f"stale exemption(s) for nonexistent fields: {stale_exemptions}"
 
 
 def base_env() -> dict[str, str]:

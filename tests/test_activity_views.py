@@ -277,6 +277,35 @@ async def test_returning_member_view_excludes_members_with_steady_activity(
 
 
 @pytest.mark.asyncio
+async def test_returning_member_view_reachable_when_threshold_at_least_window(
+    store: SQLiteStore,
+) -> None:
+    """Reproduces and closes Important #3's second concrete scenario: `/fetch
+    activity`'s (and this view's own) fixed 30-day trend window combined with an
+    operator-configured `inactivity_threshold >= 30` days used to make `returning`
+    structurally unreachable, silently, with no warning. This member has a genuine
+    ~39-day gap that resumes inside the trailing 30-day window, and must still be
+    found now that the fetch window is widened past the trend window alone."""
+    await store.record_ledger_event(
+        JoinEvent(guild_id=_GUILD_ID, member_id=2, occurred_at=NOW - timedelta(days=80))
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=_GUILD_ID, member_id=2, occurred_at=NOW - timedelta(days=40), channel_id=1
+        )
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=_GUILD_ID, member_id=2, occurred_at=NOW - timedelta(days=1), channel_id=1
+        )
+    )
+    view = await returning_member_view(
+        store, _GUILD_ID, inactivity_threshold=timedelta(days=30), now=NOW
+    )
+    assert [m.member_id for m in view] == [2]
+
+
+@pytest.mark.asyncio
 async def test_returning_member_view_is_guild_scoped(store: SQLiteStore) -> None:
     for guild_id in (_GUILD_ID, 999):
         await store.record_ledger_event(

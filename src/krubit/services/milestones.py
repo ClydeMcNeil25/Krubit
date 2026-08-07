@@ -70,7 +70,10 @@ from krubit.domain.activity_ledger import (
     RecognitionCandidate,
     cohort_window_days,
 )
-from krubit.services.activation_retention import participation_trend
+from krubit.services.activation_retention import (
+    participation_trend,
+    participation_trend_fetch_window_days,
+)
 
 _MESSAGE_COUNT_THRESHOLDS: tuple[int, ...] = (1, 10, 50, 100, 500, 1000)
 
@@ -227,13 +230,24 @@ def _reasons_for_member(
     now: datetime,
 ) -> tuple[str, ...]:
     window_days = cohort_window_days(window)
-    windowed_events = _trailing_window_events(member_events, window_days, now)
     window_start = now - timedelta(days=window_days - 1)
 
     milestones = evaluate_milestones(member_id, guild_id, member_events, now)
     milestones_in_window = tuple(
         m for m in milestones if window_start <= m.reached_at <= now
     )
+
+    # Fetch a wider trailing slice than `window_days` alone -- see
+    # `participation_trend_fetch_window_days`'s docstring: with a fixed 14-day
+    # `_INACTIVITY_THRESHOLD` and, e.g., `CohortWindow.SEVEN_DAY`, a bare
+    # `window_days`-wide pre-filter can never represent a gap long enough to set
+    # `returning=True` at all (a Critical/Important finding from the whole-branch
+    # Phase 4 review). `window` (unwidened) is still what's passed to
+    # `participation_trend` below, so its reported figures stay scoped correctly.
+    fetch_window_days = participation_trend_fetch_window_days(
+        window_days, _INACTIVITY_THRESHOLD
+    )
+    windowed_events = _trailing_window_events(member_events, fetch_window_days, now)
 
     trend = participation_trend(
         windowed_events, window, inactivity_threshold=_INACTIVITY_THRESHOLD

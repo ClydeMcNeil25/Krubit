@@ -70,6 +70,7 @@ from krubit.domain.models import Card, CardField
 from krubit.services.activation_retention import (
     cohort_membership,
     participation_trend,
+    participation_trend_fetch_window_days,
     time_to_activation,
 )
 from krubit.services.activity_views import community_pulse as _community_pulse_view
@@ -243,9 +244,16 @@ class ActivityCommandService:
             actor.guild_id, member_id=effective_member_id, limit=_PROFILE_EVENT_LIMIT
         )
         now = self._now()
-        windowed = _trailing_window_events(
-            events, cohort_window_days(_ACTIVITY_TREND_WINDOW), now
+        # See `participation_trend_fetch_window_days`'s docstring: fetching only
+        # `_ACTIVITY_TREND_WINDOW`'s 30 days makes `returning=True` structurally
+        # unreachable whenever an operator sets `KRUBIT_ACTIVITY_LEDGER_
+        # INACTIVITY_THRESHOLD_DAYS >= 30` -- a real, whole-branch-review finding.
+        # `_ACTIVITY_TREND_WINDOW` (unwidened) is still what's passed to
+        # `participation_trend` below.
+        fetch_window_days = participation_trend_fetch_window_days(
+            cohort_window_days(_ACTIVITY_TREND_WINDOW), inactivity_threshold
         )
+        windowed = _trailing_window_events(events, fetch_window_days, now)
         trend = participation_trend(
             windowed, _ACTIVITY_TREND_WINDOW, inactivity_threshold=inactivity_threshold
         )

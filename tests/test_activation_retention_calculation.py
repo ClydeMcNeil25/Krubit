@@ -27,6 +27,7 @@ from krubit.domain.activity_ledger import (
 from krubit.services.activation_retention import (
     cohort_membership,
     participation_trend,
+    participation_trend_fetch_window_days,
     time_to_activation,
 )
 
@@ -308,3 +309,68 @@ def test_participation_trend_rejects_non_positive_inactivity_threshold() -> None
         participation_trend((), CohortWindow.SEVEN_DAY, timedelta(0))
     with pytest.raises(ValueError):
         participation_trend((), CohortWindow.SEVEN_DAY, timedelta(days=-1))
+
+
+# --- participation_trend_fetch_window_days / dead-branch fix (Important #3) --------
+#
+# Without widening the fetch window, `returning` is structurally unreachable
+# whenever `inactivity_threshold >= window_days - 1`, since the widest gap two
+# active days inside a bare `window_days`-wide pre-filter can ever have is
+# `window_days - 1` days. These tests reproduce that dead branch against a
+# `window_days`-only pre-filter, then prove `participation_trend_fetch_window_days`
+# genuinely resolves it once callers use it to widen their fetch window.
+
+
+def test_participation_trend_fetch_window_days_widens_beyond_window_and_threshold() -> None:
+    assert participation_trend_fetch_window_days(7, timedelta(days=14)) == 21
+    assert participation_trend_fetch_window_days(30, timedelta(days=30)) == 60
+    assert participation_trend_fetch_window_days(30, timedelta(days=14)) == 60
+
+
+def _seven_day_pre_filtered(events: tuple[LedgerEvent, ...], anchor: datetime) -> tuple[
+    LedgerEvent, ...
+]:
+    window_start = anchor - timedelta(days=6)
+    return tuple(event for event in events if window_start <= event.occurred_at <= anchor)
+
+
+def test_returning_is_a_dead_branch_with_a_bare_window_wide_pre_filter() -> None:
+    """Reproduces the exact scenario the final-review finding names: a 7-day
+    trend window with a 14-day inactivity threshold. A member who was active 20
+    days ago and is active again today has a real 19-day gap -- but a bare
+    7-day-wide pre-filter cannot represent it at all, so `returning` stays False
+    no matter how long the real gap was."""
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    events = (
+        ledger_event(kind=LedgerEventKind.MESSAGE, occurred_at=now - timedelta(days=20)),
+        ledger_event(kind=LedgerEventKind.MESSAGE, occurred_at=now),
+    )
+    naively_filtered = _seven_day_pre_filtered(events, now)
+
+    trend = participation_trend(naively_filtered, CohortWindow.SEVEN_DAY, timedelta(days=14))
+
+    assert trend.returning is False  # the dead branch: the real gap is invisible
+
+
+def test_returning_is_reachable_once_the_fetch_window_is_widened() -> None:
+    """Same real gap as above, but pre-filtered using
+    `participation_trend_fetch_window_days` before calling `participation_trend` --
+    matching the fix applied to `krubit.services.milestones._reasons_for_member`,
+    `krubit.services.activity_views.returning_member_view`, and `krubit.discord.
+    activity_commands.ActivityCommandService.activity`."""
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    inactivity_threshold = timedelta(days=14)
+    events = (
+        ledger_event(kind=LedgerEventKind.MESSAGE, occurred_at=now - timedelta(days=20)),
+        ledger_event(kind=LedgerEventKind.MESSAGE, occurred_at=now),
+    )
+    fetch_days = participation_trend_fetch_window_days(7, inactivity_threshold)
+    window_start = now - timedelta(days=fetch_days - 1)
+    widened = tuple(event for event in events if window_start <= event.occurred_at <= now)
+
+    trend = participation_trend(widened, CohortWindow.SEVEN_DAY, inactivity_threshold)
+
+    assert trend.returning is True
+    # The trend's own reported window figures stay scoped to the real 7-day window,
+    # not the widened fetch window -- only today's event falls inside it.
+    assert trend.active_day_count == 1

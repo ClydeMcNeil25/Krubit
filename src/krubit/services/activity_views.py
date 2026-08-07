@@ -48,6 +48,7 @@ from krubit.domain.activity_ledger import (
 from krubit.services.activation_retention import (
     cohort_membership,
     participation_trend,
+    participation_trend_fetch_window_days,
     time_to_activation,
 )
 from krubit.storage.sqlite import SQLiteStore
@@ -318,10 +319,19 @@ async def returning_member_view(
     all_events = await store.list_ledger_events_for_guild(guild_id)
     events_by_member = _group_events_by_member(all_events)
     window_days = cohort_window_days(_RETURNING_TREND_WINDOW)
+    # See `participation_trend_fetch_window_days`'s docstring: fetching only
+    # `window_days` makes `returning=True` structurally unreachable whenever an
+    # operator's `inactivity_threshold` is as large as, or larger than, the fixed
+    # 30-day `_RETURNING_TREND_WINDOW` -- a real, whole-branch-review finding.
+    # `_RETURNING_TREND_WINDOW` (unwidened) is still what's passed to
+    # `participation_trend` below.
+    fetch_window_days = participation_trend_fetch_window_days(window_days, inactivity_threshold)
 
     entries: list[ReturningMemberEntry] = []
     for member_id in sorted(events_by_member):
-        windowed_events = _trailing_window_events(events_by_member[member_id], window_days, now)
+        windowed_events = _trailing_window_events(
+            events_by_member[member_id], fetch_window_days, now
+        )
         trend = participation_trend(
             windowed_events, _RETURNING_TREND_WINDOW, inactivity_threshold=inactivity_threshold
         )

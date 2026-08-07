@@ -239,3 +239,31 @@ def test_recognition_candidates_rejects_naive_now() -> None:
         recognition_candidates(
             _GUILD_ID, events=(), window=CohortWindow.THIRTY_DAY, now=datetime(2026, 8, 6)
         )
+
+
+def test_recognition_candidates_returning_is_reachable_with_seven_day_window() -> None:
+    """Reproduces and closes Important #3's dead-branch finding: with
+    `_INACTIVITY_THRESHOLD` fixed at 14 days, `recognition_candidates(...,
+    window=CohortWindow.SEVEN_DAY, ...)` could never surface a `returning=true`
+    reason before the fetch-window-widening fix -- a bare 7-day-wide pre-filter
+    cannot represent a gap longer than 6 days, so no 14-day gap could ever be seen,
+    no matter how real. This member has a genuine ~18-day gap that resumes inside
+    the trailing 7-day window, and must surface a "returning" reason."""
+    member_id = 7
+    events = (
+        ledger_event(
+            kind=LedgerEventKind.REACTION,
+            occurred_at=NOW - timedelta(days=19),
+            member_id=member_id,
+        ),
+        ledger_event(
+            kind=LedgerEventKind.REACTION,
+            occurred_at=NOW - timedelta(days=1),
+            member_id=member_id,
+        ),
+    )
+    candidates = recognition_candidates(
+        _GUILD_ID, events=events, window=CohortWindow.SEVEN_DAY, now=NOW
+    )
+    candidate = next(c for c in candidates if c.member_id == member_id)
+    assert any("returning" in reason for reason in candidate.reasons)

@@ -25,7 +25,7 @@ never message content, audio, or DM ingestion.
 | 2 | Storage: `ledger_events`, `milestones`, `channel_exclusions`, `retention_policies`, `activity_receipts`, including `delete_member_ledger_data` |
 | 3 | Structural pre-storage exclusion: `extract_*` functions (pure, content-free) and `ActivityIngestionService` (the sole exclusion gate) |
 | 4 | Milestone materialization (`krubit.services.milestones`) |
-| 5 | Views: `newcomer_view`, `inactive_view`, `returning_member_view`, `milestone_view`, `recognition_candidates`, `community_pulse_view` |
+| 5 | Views: `newcomer_view`, `inactive_view`, `returning_member_view`, `community_pulse`, `recognition_candidates` (the milestone view is satisfied by `list_milestones` + `/fetch milestones`, not a dedicated view function) |
 | 6 | Retention sweep, member deletion with a minimal receipt, member data export |
 | 7 | Live gateway wiring: `ActivityRuntime`, `phase_four_intents()`, `Settings` enforcement at every real call site |
 | 8 | Staff-only/staff-or-self `/fetch` command surface (`member`, `activity`, `newcomers`, `inactive`, `milestones`, `retention`, `community-pulse`) |

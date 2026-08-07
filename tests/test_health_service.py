@@ -273,12 +273,52 @@ def test_server_health_reports_retention_unconfigured_when_ledger_enabled() -> N
         now=now,
         database_healthy=True,
         gateway_ready=True,
-        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=False),
+        activity_ledger=ActivityLedgerHealthFacts(
+            enabled=True, retention_configured=False, exclusions_configured=True
+        ),
     )
 
     assert [finding.code for finding in report.findings] == [
         "activity_ledger_retention_unconfigured"
     ]
+
+
+def test_server_health_reports_exclusions_unconfigured_when_ledger_enabled() -> None:
+    """See Important #7 of the 2026-08-06 Phase 4 final-review fix report: an
+    operator running `/fetch server-health` on an enabled ledger with zero channel
+    exclusions configured must see a finding, not a clean bill of health."""
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(
+            enabled=True, retention_configured=True, exclusions_configured=False
+        ),
+    )
+
+    assert [finding.code for finding in report.findings] == [
+        "activity_ledger_exclusions_unconfigured"
+    ]
+
+
+def test_server_health_reports_both_retention_and_exclusions_unconfigured() -> None:
+    now = datetime(2026, 8, 6, tzinfo=UTC)
+    report = HealthService().server_health(
+        snapshot_with(captured_at=now),
+        now=now,
+        database_healthy=True,
+        gateway_ready=True,
+        activity_ledger=ActivityLedgerHealthFacts(
+            enabled=True, retention_configured=False, exclusions_configured=False
+        ),
+    )
+
+    assert {finding.code for finding in report.findings} == {
+        "activity_ledger_retention_unconfigured",
+        "activity_ledger_exclusions_unconfigured",
+    }
 
 
 def test_server_health_reports_nothing_about_activity_ledger_when_fully_configured() -> None:
@@ -288,7 +328,9 @@ def test_server_health_reports_nothing_about_activity_ledger_when_fully_configur
         now=now,
         database_healthy=True,
         gateway_ready=True,
-        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=True),
+        activity_ledger=ActivityLedgerHealthFacts(
+            enabled=True, retention_configured=True, exclusions_configured=True
+        ),
     )
 
     assert report.findings == ()
@@ -299,7 +341,9 @@ def test_integration_health_includes_activity_ledger_facts_when_supplied() -> No
 
     report = HealthService().integration_health(
         snapshot,
-        activity_ledger=ActivityLedgerHealthFacts(enabled=True, retention_configured=False),
+        activity_ledger=ActivityLedgerHealthFacts(
+            enabled=True, retention_configured=False, exclusions_configured=True
+        ),
     )
 
     assert [finding.code for finding in report.findings] == [

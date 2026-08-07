@@ -233,6 +233,43 @@ async def test_staff_can_view_another_members_activity(
     assert result.status is CommandStatus.SUCCEEDED
 
 
+@pytest.mark.asyncio
+async def test_activity_returning_field_is_reachable_when_threshold_at_least_window(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    """Reproduces and closes Important #3: `/fetch activity` uses a fixed 30-day
+    trend window, but the inactivity threshold is operator-settable
+    (`KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS`). Before the fetch-window
+    widening fix, any operator setting the threshold to 30 or more made the
+    "Returning" field permanently render "No", silently, with no warning, no
+    matter how real a member's resumed-activity gap actually was. This member has
+    a genuine ~39-day gap that resumes inside the trailing 30-day window."""
+    await store.record_ledger_event(
+        JoinEvent(guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=80))
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=40),
+            channel_id=900,
+        )
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=1),
+            channel_id=900,
+        )
+    )
+    result = await commands.activity(
+        actor=staff_member(),
+        target=other_member(),
+        inactivity_threshold=timedelta(days=30),
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    returning_field = next(f for f in result.card.fields if f.name == "Returning")
+    assert returning_field.value == "Yes"
+
+
 # ---------------------------------------------------------------------------
 # newcomers
 # ---------------------------------------------------------------------------

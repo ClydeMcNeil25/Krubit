@@ -134,6 +134,31 @@ def _in_inclusive_date_range(value: date, start: date, end: date) -> bool:
     return start <= value <= end
 
 
+def participation_trend_fetch_window_days(
+    window_days: int, inactivity_threshold: timedelta
+) -> int:
+    """How many trailing days of raw events a caller must fetch/pre-filter before
+    calling `participation_trend`, so a real gap longer than `inactivity_threshold`
+    can still be represented even when the threshold is as large as, or larger
+    than, `window_days` itself.
+
+    See `participation_trend`'s `returning` docstring: it looks for a gap between
+    two consecutive active days among ALL the events it is given, not just the
+    events inside its own reported `window`. If a caller pre-filters `events` to
+    exactly `window_days` before calling, the widest gap two active days within
+    that filtered set can ever have is `window_days - 1` days -- so whenever
+    `inactivity_threshold >= window_days - 1`, `returning` becomes structurally
+    unreachable: no representable gap can exceed the threshold. This function
+    returns a wider trailing-day count -- `max(window_days, threshold_days) +
+    window_days` -- that a caller should use for the *fetch/pre-filter* step only,
+    while still passing the original, unwidened `window` (a `CohortWindow`) to
+    `participation_trend` itself so its reported `active_day_count`/diversity
+    figures stay scoped to the real, unwidened window.
+    """
+    threshold_days = inactivity_threshold.days
+    return max(window_days, threshold_days) + window_days
+
+
 def participation_trend(
     events: tuple[LedgerEvent, ...],
     window: CohortWindow,

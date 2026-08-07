@@ -900,6 +900,7 @@ class KrubitBot(discord.Client):
             guild_ids=lambda: tuple(guild.id for guild in self.guilds),
             default_retention_days=settings.activity_ledger_retention_days,
             default_retention_policy_owner_id=settings.application_id,
+            excluded_channel_ids=settings.activity_ledger_excluded_channel_ids,
         )
         self.tree.add_command(
             FetchCommands(
@@ -921,6 +922,9 @@ class KrubitBot(discord.Client):
                 activity_ledger_facts=ActivityLedgerHealthFacts(
                     enabled=settings.activity_ledger_enabled,
                     retention_configured=settings.activity_ledger_retention_days is not None,
+                    exclusions_configured=bool(
+                        settings.activity_ledger_excluded_channel_ids
+                    ),
                 ),
                 activity_ledger_inactivity_threshold_days=(
                     settings.activity_ledger_inactivity_threshold_days
@@ -1121,6 +1125,9 @@ class KrubitBot(discord.Client):
                 activity_ledger=ActivityLedgerHealthFacts(
                     enabled=self._settings.activity_ledger_enabled,
                     retention_configured=self._settings.activity_ledger_retention_days is not None,
+                    exclusions_configured=bool(
+                        self._settings.activity_ledger_excluded_channel_ids
+                    ),
                 ),
             )
             await channel.send(embed=render_health_card(report, title="Krubit Daily Server Health"))
