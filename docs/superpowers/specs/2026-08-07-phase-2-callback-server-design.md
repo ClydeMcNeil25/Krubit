@@ -1,7 +1,7 @@
 # Krubit Phase 2 Callback Server Design
 
 **Date:** 2026-08-07 (revised twice same day after review)
-**Status:** Draft — revised per second review, pending re-approval
+**Status:** Approved for implementation planning
 **Scope:** Start the OAuth/push callback server from `krubit run`, wire Meta's and
 TikTok's OAuth authorization and Meta's deauthorization/data-deletion routes into
 it, and add the storage those routes need to persist a connector authorization
