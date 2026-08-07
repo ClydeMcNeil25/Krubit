@@ -25,7 +25,7 @@ never message content, audio, or DM ingestion.
 | 2 | Storage: `ledger_events`, `milestones`, `channel_exclusions`, `retention_policies`, `activity_receipts`, including `delete_member_ledger_data` |
 | 3 | Structural pre-storage exclusion: `extract_*` functions (pure, content-free) and `ActivityIngestionService` (the sole exclusion gate) |
 | 4 | Milestone materialization (`krubit.services.milestones`) |
-| 5 | Views: `newcomer_view`, `inactive_view`, `returning_member_view`, `milestone_view`, `community_pulse_view` |
+| 5 | Views: `newcomer_view`, `inactive_view`, `returning_member_view`, `milestone_view`, `recognition_candidates`, `community_pulse_view` |
 | 6 | Retention sweep, member deletion with a minimal receipt, member data export |
 | 7 | Live gateway wiring: `ActivityRuntime`, `phase_four_intents()`, `Settings` enforcement at every real call site |
 | 8 | Staff-only/staff-or-self `/fetch` command surface (`member`, `activity`, `newcomers`, `inactive`, `milestones`, `retention`, `community-pulse`) |
@@ -84,13 +84,14 @@ never message content, audio, or DM ingestion.
   on `docs/operations/phase-3-watchdog.md`'s structure and honesty standard —
   exact env var names, the three new non-privileged intents (and the
   `phase_four_intents()`-defined-but-not-called code-organization gap), shadow
-  mode, and seven documented known limitations, the two most significant given
+  mode, and eight documented known limitations, the three most significant given
   equal prominence to Phase 3's biggest gap: `returning_member_view` has zero
-  production callers, and deletion/export/channel-exclusion configuration have no
-  `/fetch` command surface at all.
+  production callers, `recognition_candidates` has the identical defect shape, and
+  deletion/export/channel-exclusion configuration have no `/fetch` command surface
+  at all.
 - `README.md`, `.env.example`, `docs/roadmaps/2026-08-03-krubit-phase-rollout.md`:
   updated to describe Phase 4 capabilities and link the new operations guide/
-  devlog, consistently reflecting the same seven known limitations across all four
+  devlog, consistently reflecting the same eight known limitations across all four
   documents (README, roadmap, operations guide, `.env.example`) rather than
   omitting them from any one.
 
@@ -102,15 +103,16 @@ voice-join/leave-duration, event RSVP, join, role change) for every guild with
 trend measures reproducing the design doc's own fixtures exactly; structurally
 guarantees an excluded channel's events never reach storage; structurally
 guarantees member deletion covers every table the live schema defines; exposes
-seven of the design doc's staff/self views through five `/fetch` commands (plus two
-staff-or-self commands).
+four of the design doc's six named views through five staff-only `/fetch` commands
+plus two staff-or-self commands.
 
 **Does not:** notify anyone proactively (every view in this phase is a pull, not a
 push — there is no autonomous-notification path at all in Phase 4, unlike Phase
 3's staff-notification flag); give staff any command to view a returning member,
-delete a member's data, export a member's data, or configure a channel exclusion
-(all four capabilities are fully implemented and tested at the service/storage
-layer, reachable only via direct database or Python access today); or apply the
+view a recognition-candidate shortlist, delete a member's data, export a member's
+data, or configure a channel exclusion (all five capabilities are fully implemented
+and tested at the service/storage layer, reachable only via direct database or
+Python access today); or apply the
 `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` env var to storage (parsed and
 validated, never seeded — a deliberate Task 7 decision, documented as Gap 3 in the
 operations guide).

@@ -315,9 +315,9 @@ point — message, reaction, voice, attendance — to storage) and
 `test_activity_ledger_tables_matches_the_live_schema_exactly` /
 `test_member_deletion_covers_every_table_the_schema_actually_defines` (member
 deletion covers every table the live schema actually defines, not an assumed list).
-Full detail, including all seven named build gaps, is in the
+Full detail, including all eight named build gaps, is in the
 [Phase 4 Activity Ledger operations guide](../operations/phase-4-activity-ledger.md);
-the two most important are summarized here so neither is ever mistaken for
+the three most important are summarized here so none is ever mistaken for
 resolved:
 
 - **`returning_member_view` has zero production callers.** It is fully built and
@@ -327,6 +327,11 @@ resolved:
   against this phase's "measure participation and activation" purpose statement,
   comparable in severity to Phase 3's "a lone `INCIDENT`-band join is never
   notified in real time" gap.
+- **`recognition_candidates` has the identical defect shape.** Also fully built
+  and fully unit-tested — a factual shortlist of members with notable, verifiable
+  activity, exactly the design doc's "Recognition-candidate view" — but likewise
+  has zero `/fetch` command anywhere in this plan. The design doc's Views section
+  names six views; only four are backed by a command today.
 - **Deletion, export, and channel-exclusion configuration have no `/fetch`
   command.** `delete_member`, `export_member_data`, and
   `save_exclusion_entry`/`list_exclusion_entries` are fully implemented and tested

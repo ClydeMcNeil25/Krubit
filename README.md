@@ -128,34 +128,37 @@ should read before enabling this phase.
 - Deterministic, fixture-reproducing activation/retention/trend calculation
   (`time_to_activation`, `cohort_membership`, `participation_trend`) — pure
   functions, never a black-box engagement score
-- Newcomer, inactive-member, returning-member, milestone, and community-pulse views
+- Newcomer, inactive-member, returning-member, milestone, recognition-candidate,
+  and community-pulse views (six total, matching the design doc's Views section)
 - Staff-only `/fetch member <member>`, `/fetch newcomers`, `/fetch inactive`,
   `/fetch retention`, `/fetch community-pulse`, plus staff-or-self
   `/fetch activity [member]` and `/fetch milestones [member]`, all ephemeral
 - Channel exclusion enforced structurally *before* storage (verified by
   `tests/test_activity_privacy_structural_safety.py`, not just behavioral coverage),
   a retention sweep, member deletion with a minimal content-free receipt, and
-  member data export — see the two gaps below for what is and is not reachable from
+  member data export — see the gaps below for what is and is not reachable from
   a command today
 - Activity-ledger capability facts (enabled/disabled, default retention window
   configured/unconfigured) surfaced through `/fetch server-health` and
   `/fetch integrations`
 
 `KRUBIT_ACTIVITY_LEDGER_ENABLED` defaults to `false` and is fully enforced at every
-real ingestion call site. **Two known gaps in this build, both given the same
+real ingestion call site. **Three known gaps in this build, all given the same
 prominence as Phase 3's biggest gap:** (1) `returning_member_view` is fully built
 and fully tested but has **zero** production caller — no `/fetch` command in this
 nine-task plan surfaces it, so a member who went inactive and then resumed activity
-is invisible to staff through any command; (2) member deletion, export, and
-channel-exclusion configuration are fully implemented and tested at the service/
-storage layer but likewise have **no** `/fetch` command — today they require direct
-database access. Five further, lower-severity gaps (stale-presence detection in
-`/fetch inactive` for high-volume guilds, no atomicity between deletion and its
-receipt, an uncapped export in a never-retention-configured guild, an unseeded
-env var for channel exclusion, and a pure calculation function's caller-contract
-windowing requirement) are documented in the
-[Phase 4 operations guide](docs/operations/phase-4-activity-ledger.md), which every
-operator should read before enabling this phase.
+is invisible to staff through any command; (2) `recognition_candidates` has the
+identical defect shape — a fully built, fully tested factual shortlist of
+notable-activity members with **zero** production caller either; (3) member
+deletion, export, and channel-exclusion configuration are fully implemented and
+tested at the service/storage layer but likewise have **no** `/fetch` command —
+today all three require direct database access. Five further, lower-severity gaps
+(stale-presence detection in `/fetch inactive` for high-volume guilds, no
+atomicity between deletion and its receipt, an uncapped export in a
+never-retention-configured guild, an unseeded env var for channel exclusion, and a
+pure calculation function's caller-contract windowing requirement) are documented
+in the [Phase 4 operations guide](docs/operations/phase-4-activity-ledger.md),
+which every operator should read before enabling this phase.
 
 ## Development
 

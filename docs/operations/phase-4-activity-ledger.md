@@ -11,13 +11,17 @@ privacy controls (channel exclusion, retention, deletion, export).
 > or had a role change — never message content, never audio) and calculates
 > deterministic, explainable measures from them. It never assigns a personality,
 > loyalty, mental-health, or guilt label, and it never compares one member's data to
-> another's in that member's own self-view. Two known gaps change what "enabled"
-> actually means for an operator; the most important is
-> [returning-member data is invisible to staff through any command](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap) —
-> a fully-built, fully-tested view with **zero** production caller anywhere in this
-> nine-task plan, and the second is
-> [deletion, export, and channel-exclusion configuration have no staff-facing command at all](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
-> — both are called out prominently below, not buried.
+> another's in that member's own self-view. Three known gaps change what "enabled"
+> actually means for an operator; the most important is that **two of the design
+> doc's six named views have zero production caller anywhere in this nine-task
+> plan** —
+> [returning-member data](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap)
+> and
+> [recognition-candidate data](#gap-2-recognition-candidate-data-is-invisible-to-staff-through-any-fetch-command--the-identical-defect-shape-as-gap-1)
+> are both fully built, fully tested, and invisible to staff through any command —
+> and the third is
+> [deletion, export, and channel-exclusion configuration have no staff-facing command at all](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
+> — all three are called out prominently below, not buried.
 
 ## What this build adds
 
@@ -33,10 +37,14 @@ privacy controls (channel exclusion, retention, deletion, export).
   and 30-day cohorts), `participation_trend` — reproducing the design doc's own
   worked fixtures exactly, with inclusive-both-ends day-boundary discipline
   (matching Phase 3's quiet-hours half-open-interval precedent).
-- **Views** (`krubit.services.activity_views`): `newcomer_view`, `inactive_view`,
-  `returning_member_view`, `milestone_view` (via `krubit.services.milestones`), and
-  `community_pulse_view` — see [Gap 1](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap)
-  for why one of these five has no command.
+- **Views**: `newcomer_view`, `inactive_view`, `returning_member_view`,
+  `milestone_view`, and `community_pulse_view` (`krubit.services.activity_views`),
+  plus `recognition_candidates` (`krubit.services.milestones`) — six views total,
+  matching the design doc's Views section exactly. See
+  [Gap 1](#gap-1-returning-member-data-is-invisible-to-staff-through-any-fetch-command-the-single-biggest-functional-gap)
+  and
+  [Gap 2](#gap-2-recognition-candidate-data-is-invisible-to-staff-through-any-fetch-command--the-identical-defect-shape-as-gap-1)
+  for why two of these six have no command.
 - **Staff-only and staff-or-self `/fetch` commands**: `/fetch member <member>`,
   `/fetch activity [member]`, `/fetch newcomers`, `/fetch inactive`,
   `/fetch milestones [member]`, `/fetch retention`, `/fetch community-pulse` — all
@@ -51,7 +59,7 @@ privacy controls (channel exclusion, retention, deletion, export).
   new `activity_ledger=` parameter
   (`src/krubit/services/health.py::ActivityLedgerHealthFacts`).
 - **Privacy controls, built and tested but not all reachable from a command** — see
-  [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only):
+  [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only):
   channel exclusion (`channel_exclusions`, enforced structurally before storage —
   see below), a retention sweep (`RetentionSweepService`, prunes only raw
   `ledger_events` rows older than a guild's configured window; materialized
@@ -87,7 +95,7 @@ to produce data in the first place, exactly matching Phase 3 Watchdog's
 | Variable | Required | Purpose |
 |---|---|---|
 | `KRUBIT_ACTIVITY_LEDGER_ENABLED` | Optional, default `false` | Master ingestion flag — message/reaction/voice/attendance/join/role-change ingestion and the retention sweep |
-| `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` | Optional, comma-separated positive snowflakes | **Parsed and validated only — see [Gap 3](#gap-3-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage) below; nothing in this build seeds it into the real, enforced exclusion table** |
+| `KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS` | Optional, comma-separated positive snowflakes | **Parsed and validated only — see [Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage) below; nothing in this build seeds it into the real, enforced exclusion table** |
 | `KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS` | Optional, positive integer | Seeds a guild's default `RetentionPolicy` the first time none is configured (never overrides a guild that already has one, staff-configured or previously seeded) |
 | `KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS` | Optional, positive integer | Read once at the Discord layer (`FetchCommands`) and passed as a plain argument to `/fetch inactive`/`/fetch activity` — deliberately never stored or seeded into any table (Task 7's design decision) |
 
@@ -160,7 +168,7 @@ runs.
 1. No new Discord permission scope is requested for the activity ledger itself —
    ingestion and views never require a mutation permission.
 2. No allow/block-list-style UI exists for channel exclusion (see
-   [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)) —
+   [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)) —
    `channel_exclusions` rows must be inserted directly against the SQLite database
    (via `SQLiteStore.save_exclusion_entry`) until a dedicated command exists, the
    same limitation Phase 3's guide documents for `guild_allow_block_lists`.
@@ -250,7 +258,39 @@ fully-functional piece of the system with zero path to a human. A future task mu
 add a `/fetch returning` command (or fold it into an existing view) before this
 capability has any operational value.
 
-### Gap 2: Deletion, export, and channel-exclusion configuration have no `/fetch` command — direct database access only
+### Gap 2: Recognition-candidate data is invisible to staff through any `/fetch` command — the identical defect shape as Gap 1
+
+`recognition_candidates` (`src/krubit/services/milestones.py:266`) is fully built
+and fully unit-tested (`tests/test_milestones.py`), and computes exactly what the
+design doc's Views section specifies for the "Recognition-candidate view": a
+factual shortlist of members with notable, verifiable activity (multiple milestones
+reached within a trailing window, high channel/event diversity, a "returning" flag)
+— each candidate's `reasons` a non-empty tuple of plain factual statements, never a
+numeric score, never generated recognition wording (Krubit surfaces facts only;
+deciding who deserves recognition and drafting the words is explicitly Zariya's
+role, per the rollout doc). **No task in this entire nine-task plan ever allocated a
+`/fetch` command to it, the same gap shape as Gap 1 above.** Confirmed by grep: no
+file under `src/krubit/discord` references `recognition_candidates` or
+`RecognitionCandidate` at all — the design doc's Views section names six views
+(newcomer, inactive, returning-member, milestone, recognition-candidate,
+community-pulse) and `activity_commands.py` (Task 8) backs commands with only four
+of them (newcomer/inactive/milestone/community-pulse); `returning_member_view` and
+`recognition_candidates` are the two views with no command anywhere in this plan.
+
+**Practical consequence:** a factual, code-verified shortlist of "which members
+reached multiple milestones recently, showed high channel diversity, or just
+returned from an inactivity gap" — exactly the kind of surfaced-facts input the
+design doc says Zariya needs to decide who deserves recognition — currently has no
+way to reach a human through any command. This was found during this task's own
+audit, using the same "check every design-doc-named view/capability against the
+actual `/fetch` command set" methodology that found Gap 1 — it should have been
+caught alongside Gap 1 in the first pass of this task, and is documented here with
+equivalent prominence rather than as an afterthought. A future task must add a
+`/fetch recognition-candidates` command (or fold it into an existing staff view)
+before this capability has any operational value, ideally alongside the Gap 1 fix
+since both are the same missing-command defect.
+
+### Gap 3: Deletion, export, and channel-exclusion configuration have no `/fetch` command — direct database access only
 
 `delete_member` and `export_member_data` (`src/krubit/services/activity_privacy.py`)
 and `SQLiteStore.save_exclusion_entry`/`list_exclusion_entries`
@@ -262,7 +302,7 @@ this nine-task plan.** Confirmed by grep: neither `delete_member(`,
 `export_member_data(`, nor `save_exclusion_entry(` is called from any file under
 `src/krubit/discord`, and there is no CLI script under `scripts/` that calls them
 either. This was a deliberate, documented Task 7 scope decision for the
-exclusion-ids setting specifically (see [Gap 3](#gap-3-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)),
+exclusion-ids setting specifically (see [Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)),
 and an artifact of the design doc's own Commands section never listing a
 deletion/export/exclusion command for Task 8 to build — not a bug introduced by any
 single task, but a real, confirmed plan-level gap all the same, exactly like
@@ -281,7 +321,7 @@ enforcement-detail configuration table. A future task must add staff-facing
 (deletion/exclusion) and member-facing (export, staff-on-behalf-of-a-member)
 command surfaces before these controls have any operational reach.
 
-### Gap 3: The excluded-channel-ids env var is parsed and validated, but never applied to storage
+### Gap 4: The excluded-channel-ids env var is parsed and validated, but never applied to storage
 
 `Settings.activity_ledger_excluded_channel_ids` (`KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS`)
 is parsed, validated (comma-separated positive snowflakes), and unit-tested, but
@@ -296,7 +336,7 @@ enforced — see below), setting this variable today has **zero observable effec
 Do not configure it expecting channel exclusion to happen automatically; channel
 exclusion is fully enforced (see the structural proof above) once a
 `channel_exclusions` row exists, but a row must be written directly against
-storage per [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
+storage per [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
 today.
 
 `KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS`, by contrast, **is** genuinely enforced:
@@ -307,7 +347,7 @@ never an override of an existing (staff-configured or previously-seeded) policy.
 (unlike `ExclusionEntry`'s `reason`), which is exactly why this setting was safe to
 auto-wire while the exclusion-ids setting was not.
 
-### Gap 4: `inactive_view`'s left-member detection can miss a member who left long ago in a high-volume guild
+### Gap 5: `inactive_view`'s left-member detection can miss a member who left long ago in a high-volume guild
 
 `inactive_view` (`src/krubit/services/activity_views.py`) determines whether a
 member has left by scanning only the 500 most-recent rows of the pre-existing,
@@ -318,7 +358,7 @@ incorrectly still appear in `/fetch inactive` as if still present. This is a rea
 low-probability accuracy gap in high-activity guilds, not a privacy issue — no
 excluded or left-member content is exposed, only a stale presence inference.
 
-### Gap 5: No atomicity between deleting a member's data and recording the deletion receipt
+### Gap 6: No atomicity between deleting a member's data and recording the deletion receipt
 
 `delete_member` (`src/krubit/services/activity_privacy.py`) calls
 `SQLiteStore.delete_member_ledger_data` and then, as a separate step, writes the
@@ -329,19 +369,19 @@ with no durable proof that the deletion occurred. This is a real, accepted
 trade-off in this build, not a silent data-loss bug — the deletion itself is never
 partial or reversed by the crash, only the audit trail of it having happened.
 
-### Gap 6: `export_member_data` has no upper bound on event volume
+### Gap 7: `export_member_data` has no upper bound on event volume
 
 `SQLiteStore.list_all_ledger_events_for_member` (used by export, deliberately
 uncapped so an export is never silently truncated the way the 500-row interactive
 view cap would truncate it) loads every one of a member's events into memory at
 once. A guild that never configures a retention policy (see
-[Gap 3](#gap-3-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)
+[Gap 4](#gap-4-the-excluded-channel-ids-env-var-is-parsed-and-validated-but-never-applied-to-storage)
 above — retention is opt-in, not a default cap) could accumulate years of
 unpruned events for one long-tenured member, and exporting that member loads all of
 them into process memory in a single call. A real, low-probability resource risk in
 a very old, very active, never-retention-configured guild — not a correctness bug.
 
-### Gap 7: `time_to_activation`/`participation_trend` require the caller to supply an already-windowed, now-anchored event list
+### Gap 8: `time_to_activation`/`participation_trend` require the caller to supply an already-windowed, now-anchored event list
 
 `participation_trend` (`src/krubit/domain/activity_ledger.py`) is a pure,
 clockless function: it anchors its "active days"/"returning" calculation to the
@@ -371,7 +411,7 @@ regression.
 4. If a specific channel must never be measured (a staff-only or NSFW channel, for
    example), write a `channel_exclusions` row for it directly against storage
    before enabling ingestion in that guild — see
-   [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only).
+   [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only).
    Exclusion is enforced before storage but is **not retroactive**: excluding a
    channel after events from it are already stored does not purge those events
    (explicit deletion is the tool for retroactive removal, per the design doc's
@@ -399,7 +439,7 @@ service layer):
 ```
 
 None of these commands can delete, export, or reconfigure anything — they are
-read/report surfaces only. See [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
+read/report surfaces only. See [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only)
 for the mutation-capable functions this build implements but does not expose
 through any command.
 
@@ -418,7 +458,7 @@ through any command.
 
 ## Data deletion
 
-Per [Gap 2](#gap-2-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only),
+Per [Gap 3](#gap-3-deletion-export-and-channel-exclusion-configuration-have-no-fetch-command--direct-database-access-only),
 there is no `/fetch` command for member deletion in this build. For a full
 data-deletion request (member request or Discord's own deletion requirement),
 follow the existing [Privacy Policy](../PRIVACY_POLICY.md) section 10 process: an
