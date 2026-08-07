@@ -1,7 +1,7 @@
 # Krubit Phase 2 Callback Server Design
 
-**Date:** 2026-08-07 (revised same day after review)
-**Status:** Draft — revised per review, pending re-approval
+**Date:** 2026-08-07 (revised twice same day after review)
+**Status:** Draft — revised per second review, pending re-approval
 **Scope:** Start the OAuth/push callback server from `krubit run`, wire Meta's and
 TikTok's OAuth authorization and Meta's deauthorization/data-deletion routes into
 it, and add the storage those routes need to persist a connector authorization
@@ -10,18 +10,35 @@ OAuth/push callback server is never started by `krubit run`").
 
 ## Revision Note
 
-This spec was reviewed before implementation began (no code was written against the
-first version). Seven blocking issues were found and are addressed below: TikTok's
+This spec was reviewed twice before implementation began (no code was written
+against either version). The first round found seven blocking issues: TikTok's
 callback context incompatibility, non-durable OAuth state, missing account binding,
 missing provider-identity verification, an incorrect Meta deauthorization protocol,
 incomplete HTTP resource ownership, and access-log token leakage. Confirmed against
-current code: `creator_accounts.external_id` (`sqlite.py:432`) already stores each
-account's resolved platform identifier, which provider-identity verification checks
-against. Confirmed against Meta's current documentation (fetched 2026-08-07): the
-data-deletion/deauthorization callback is a form-posted `signed_request` parameter
-(base64, HMAC-SHA256 over a JSON payload) — a different protocol from the
-`X-Hub-Signature-256` header the first draft assumed, which is Instagram/Facebook
-Graph API *content* webhooks' protocol, not this one.
+Meta's current documentation (fetched 2026-08-07): the data-deletion/deauthorization
+callback is a form-posted `signed_request` parameter (base64, HMAC-SHA256 over a
+JSON payload) — a different protocol from the `X-Hub-Signature-256` header the first
+draft assumed, which is Instagram/Facebook Graph API *content* webhooks' protocol,
+not this one.
+
+A second round found that the first revision's identity model was still wrong.
+Confirmed against current code: `creator_accounts.external_id` is **not** a
+platform-resolved stable identifier — `CreatorRegistry.add_account`
+(`services/creator_registry.py:101`) receives `resolved_external_id` from its
+caller, and the only production call site, `content_commands.py:213`, passes
+`recognized.handle` (the URL-parsed handle string) as that argument. Every
+connector defines a `resolve_account` method that *would* produce a true stable id
+(e.g. `InstagramConnector.resolve_account` at `meta.py:537` calls Graph `/me` and
+returns a numeric `id`; `TikTokConnector.resolve_account` at `tiktok.py:499`
+resolves `open_id`), but none of these are ever called from `add_account` — so
+`external_id` holds a handle, not a resource id, for every existing account today.
+Comparing a freshly-resolved provider id against `external_id` would therefore
+reject valid authorizations. This revision fixes that by resolving identity fresh
+at authorization time and comparing against `creator_accounts.handle` (the field
+that is actually trustworthy today), and by splitting "the resource being
+monitored" from "the user who granted access" into two separate columns, since for
+Facebook Pages, Instagram Business accounts, and Threads these are genuinely
+different ids.
 
 ## Purpose
 
@@ -65,9 +82,13 @@ GET /callbacks/{platform}/authorize?code=...&state=...      |
         |
    exchange_code(code, redirect_uri=<same static URI>)
         |
-   verify provider identity == creator_accounts.external_id
+   resolve_authorized_identity(access_token)  [capability-specific,
+   reuses each connector's existing resolve_account logic]
         |
-   seal grant + provider metadata -> connector_authorizations
+   resolved handle == creator_accounts.handle ?  (reject on mismatch)
+        |
+   seal grant + provider_resource_id + authorization_subject_id
+   -> connector_authorizations
 ```
 
 ```text
@@ -143,50 +164,98 @@ in the `oauth_attempts` row (not reconstructed) to guarantee the match.
 
 Because `account_id` now comes from the consumed `oauth_attempts` row (not the
 query string), `on_authorized(guild_id, member_id, account_id, platform,
-capability, grant, provider_subject_id)` always knows exactly which registered
-`creator_accounts` row the token belongs to — including when one member owns
-multiple accounts on the same platform.
+capability, grant, provider_resource_id, authorization_subject_id)` always knows
+exactly which registered `creator_accounts` row the token belongs to — including
+when one member owns multiple accounts on the same platform.
 
-### 4. Provider identity verification
+### 4. Provider identity verification (capability-specific, resolved fresh)
 
-After `exchange_code` succeeds, before any grant is sealed or saved, the route
-handler calls the platform's identity endpoint (Meta: `GET /me` on the Graph API
-with the new access token; TikTok: the userinfo endpoint) to resolve
-`provider_subject_id`. This is compared against `creator_accounts.external_id` for
-`(guild_id, account_id)`. A mismatch means the authorizing browser logged into a
-*different* account than the one Krubit's `/fetch creator add` originally
-resolved — the grant is discarded, nothing is saved, and the response is the same
-generic failure text as any other rejected authorization (no detail on *why*, to
-avoid leaking which check failed). `connector_authorizations` gains a
-`provider_subject_id` column (indexed) alongside the existing columns, storing this
-verified, non-secret identifier next to the sealed token — needed for deauthorization
-lookup (below) and to make a future audit/export capable of showing *which* account
-was authorized without unsealing anything.
+There is no generic identity check. Each connector capability already implements
+`resolve_account`, which — given an access token — calls the correct
+capability-specific endpoint and returns a `ConnectorAccount(external_id, handle,
+...)`:
 
-### 5. `connector_authorizations` store methods (new)
+| Capability          | Existing resolver                              | Resolved id            |
+|----------------------|------------------------------------------------|-------------------------|
+| Instagram Business   | `InstagramConnector.resolve_account` (`meta.py:537`) | Graph `/me` numeric id |
+| Facebook Page        | `FacebookPageConnector.resolve_account` (`meta.py:650`) | Page id |
+| Facebook Profile     | `FacebookProfileConnector.resolve_account` (`meta.py:793`) | Graph `/me` numeric id |
+| Threads               | `ThreadsConnector.resolve_account` (`meta.py:902`) | Threads user id |
+| TikTok                | `TikTokConnector.resolve_account` (`tiktok.py:499`) | `open_id` |
+
+The authorization route handler constructs the capability-appropriate connector
+with the *freshly exchanged* access token and calls its existing `resolve_account`
+— reusing exactly the code path `/fetch creator add`'s baseline check already
+exercises, rather than inventing a second, parallel identity-resolution mechanism.
+This directly satisfies "a platform-specific resolver contract, not a generic
+`/me`," using code that already exists and is already tested per capability.
+
+The result gives two distinct identifiers, stored as two distinct columns (see
+below), because they answer different questions:
+
+- **`provider_resource_id`** — `resolve_account`'s returned `external_id`: the
+  resource being monitored (an Instagram Business account, a Facebook Page, a
+  Threads profile, a TikTok account). This is what a future poller uses to know
+  *what* to fetch.
+- **`authorization_subject_id`** — the Meta/TikTok **user** who completed the OAuth
+  grant. For a Facebook Profile or a TikTok account these are the same id as
+  `provider_resource_id`. For an Instagram Business account or a Facebook Page they
+  are **not** — the authorizing human and the Page/IG account they administer are
+  different ids. Resolving this is a second, always-present call: Meta's Graph
+  `/me` with the just-granted user access token (independent of which capability
+  was authorized, since every Meta OAuth grant starts as a user-level token before
+  a Page/IG-scoped token is derived from it); TikTok's `authorization_subject_id`
+  equals its `provider_resource_id`, since TikTok's OAuth is inherently
+  user-scoped. This is the id Meta's deauthorization/data-deletion payload actually
+  contains, so it is the id deletion lookups must key on — using
+  `provider_resource_id` for that lookup would silently fail to find Page/IG rows
+  whose resource id differs from the authorizing user's id.
+
+**Identity check:** the resolved `handle` from `resolve_account` is compared,
+case-normalized, against `creator_accounts.handle` for `(guild_id, account_id)` —
+**not** against `external_id`, which (per the Revision Note) is not a trustworthy
+resolved id in the current codebase. A mismatch means the authorizing browser
+logged into a different account than the one `/fetch creator add` originally
+registered by handle; the grant is discarded, nothing is saved, and the response is
+the same generic failure text as any other rejected authorization.
+
+### 5. `connector_authorizations` and `oauth_attempts` store methods (new)
+
+`connector_authorizations` gains two columns replacing the single
+`provider_subject_id` the first revision proposed: `provider_resource_id` and
+`authorization_subject_id` (both indexed; `authorization_subject_id` is the one
+deauthorization lookups use).
 
 - `save_connector_authorization(guild_id, account_id, capability, secret_ref,
-  provider_subject_id, status, expires_at)` — upserts one row. `secret_ref` is
-  always `CredentialVault.seal_json(...)` output.
+  provider_resource_id, authorization_subject_id, status, expires_at)` — upserts
+  one row. `secret_ref` is always `CredentialVault.seal_json(...)` output.
 - `get_connector_authorization(guild_id, account_id, capability)` — returns the row
   or `None`.
-- `find_connector_authorizations_by_provider_subject(platform, provider_subject_id)`
-  — new lookup, since Meta's deauthorization/data-deletion payload identifies the
-  account only by the platform's own user id, never by `guild_id`/`account_id`.
-  Returns every matching row (a provider subject could in principle map to more
-  than one guild's registration).
+- `find_connector_authorizations_by_authorization_subject(platform,
+  authorization_subject_id)` — the lookup Meta's deauthorization/data-deletion
+  payload's `user_id` actually resolves through. Returns every matching row (one
+  Meta user can administer Pages/IG accounts registered by more than one guild).
 - `delete_connector_authorizations(rows)` — deletes a batch of matched rows inside
   one transaction, and writes one redacted receipt per deletion to the existing
   `creator_registry_receipts` table (action `"connector_deauthorized"`, detail JSON
-  containing only `platform`/`capability`/`account_id` — never the token or
-  `provider_subject_id`).
+  containing only `platform`/`capability`/`account_id` — never the token or either
+  identifier).
 - `list_connector_authorization_status(guild_id) -> tuple[ConnectorAuthorizationStatus,
-  ...]` — a new, deliberately narrow DTO (`platform`, `capability`, `status`,
-  `expires_at` only — no `secret_ref`, no `provider_subject_id`) for anything that
-  renders authorization state to staff. `/fetch integrations` is extended to call
-  this and show "authorized / expired / not authorized" per platform, which is what
-  makes the "safe rendering" security test non-vacuous (see Testing, below) —
-  otherwise there is no rendering call site to test against at all.
+  ...]` — a deliberately narrow DTO (`platform`, `capability`, `status`,
+  `expires_at` only — no `secret_ref`, no identifiers) for anything that renders
+  authorization state to staff. `/fetch integrations` is extended to call this and
+  show "authorized / expired / not authorized" per platform, which is what makes
+  the "safe rendering" security test non-vacuous — otherwise there is no rendering
+  call site to test against at all.
+- `purge_oauth_attempts(now, *, consumed_retention: timedelta,
+  unconsumed_grace: timedelta)` — deletes rows where either (a) `consumed_at` is
+  set and older than `consumed_retention` (default 30 days — long enough to
+  investigate a disputed authorization, short enough not to accumulate forever), or
+  (b) `consumed_at` is unset and `expires_at` is older than `now - unconsumed_grace`
+  (default 1 day past expiry). Wired into the existing Phase 4 `sweep_cycle`
+  isolation pattern (one table's purge failure never blocks another's) as one more
+  sweep target, run on the same schedule as the activity-ledger retention sweep —
+  not a new scheduler.
 
 ### 6. Meta deauthorization and data-deletion routes (redesigned)
 
@@ -203,29 +272,76 @@ app secret. This is a **different** verification shape than
 @dataclass(frozen=True, slots=True)
 class SignedFormRequest:
     verify_and_parse: Callable[[str], Mapping[str, object] | None]
-    handle_notification: Callable[[Mapping[str, object]], Awaitable[str]]
+    handle_notification: Callable[[Mapping[str, object]], Awaitable[web.StreamResponse]]
 
 def build_signed_form_route(*, path: str, field_name: str, webhook: SignedFormRequest) -> CallbackRoute:
     ...  # reads `field_name` from the POST form body; verify_and_parse returning
          # None -> 403 before handle_notification ever runs, matching every other
-         # verify-before-ingest route in this module; the returned string is the
-         # response body Meta expects (Deauthorize: none required; Data Deletion:
-         # a confirmation URL + confirmation_code JSON body per Meta's contract).
+         # verify-before-ingest route in this module.
 ```
 
 `verify_meta_signed_request(signed_request: str, app_secret: str) ->
 Mapping[str, object] | None` implements the split/decode/HMAC-compare/parse
-sequence. Both routes (`/callbacks/meta/deauthorize` and
-`/callbacks/meta/data-deletion`) use it; their `handle_notification` both resolve
-`user_id` from the parsed payload, call
-`find_connector_authorizations_by_provider_subject(Platform.META-ish-values,
-user_id)` (Meta's `user_id` here is app-scoped per app, not per-product, so this
-matches across Instagram/Facebook/Threads registrations that share the same Meta
-app), and call `delete_connector_authorizations` transactionally. Deletion, not a
-status flip — a revoked-but-retained sealed token is a needless retained secret
-once the platform says to forget the account.
+sequence, and additionally rejects an `issued_at` older than a bounded window
+(5 minutes) to reject a replayed-but-validly-signed old request.
 
-### 7. HTTP resource ownership and shutdown order
+**`/callbacks/meta/deauthorize`:** `handle_notification` resolves `user_id`,
+calls `find_connector_authorizations_by_authorization_subject(...)`, deletes the
+matches transactionally, and returns Meta's expected empty `200`. No response body
+content is required by Meta's contract for this endpoint.
+
+**`/callbacks/meta/data-deletion`:** a distinct, precisely specified contract,
+since Meta requires a specific JSON response and supports the user checking status
+later:
+
+- On a valid signed request, deletion runs immediately (deletion is naturally
+  idempotent — a repeat request for an already-deleted `authorization_subject_id`
+  deletes zero rows, not an error).
+- A `confirmation_code` is generated (`secrets.token_urlsafe(16)`) and persisted in
+  a new `data_deletion_requests` table (`confirmation_code TEXT PRIMARY KEY,
+  authorization_subject_id TEXT NOT NULL, platform TEXT NOT NULL, requested_at TEXT
+  NOT NULL, rows_deleted INTEGER NOT NULL`) — **not** keyed by guild, since Meta's
+  status-check request carries only the confirmation code.
+- The response body is exactly `{"url": "<callback_public_base_url>/callbacks/meta/data-deletion/status?id=<confirmation_code>", "confirmation_code": "<confirmation_code>"}`,
+  matching Meta's documented shape.
+- **Replay:** if `handle_notification` receives a second valid signed request for
+  the same `authorization_subject_id` within a short window (the same 5-minute
+  window `verify_meta_signed_request` already bounds `issued_at` to), it reuses the
+  existing pending `data_deletion_requests` row's `confirmation_code` rather than
+  minting a new one — Meta's own retry behavior on a slow response must not produce
+  two different confirmation codes for what is really one request.
+- **Status route:** `GET /callbacks/meta/data-deletion/status?id=<code>` (new,
+  unauthenticated by design — it exists so Meta's own systems and the user can
+  check status with only the confirmation code, matching the pattern Meta's docs
+  describe) looks up the row and returns `{"confirmation_code": ..., "status":
+  "complete"}` for a known code, `404` for an unknown one. Nothing is deleted or
+  re-deleted here — this route only reads `data_deletion_requests`.
+- **Malformed/expired signed_request:** any parse failure, HMAC mismatch, or
+  `issued_at` outside the freshness window is rejected with 403 before any
+  deletion, confirmation-code generation, or lookup ever runs.
+
+### 7. Route gating is capability-specific, not vault-gated as a whole
+
+The first revision gated every callback route behind `vault is not None`. That's
+wrong for deauthorization/data-deletion: those routes only need to *verify a
+signature* and *delete rows by an indexed column* — no decryption, so no vault
+dependency. Route registration in `build_callback_routes` is split accordingly:
+
+- **OAuth authorization routes** (`/callbacks/meta/authorize`,
+  `/callbacks/tiktok/authorize`) require: `creator_signals_enabled`, the callback
+  server's public base URL/port, the platform's app credentials, **and** the vault
+  (since sealing the grant needs it). Absent any of these, that platform's
+  authorization route is not registered.
+- **Meta deauthorization and data-deletion routes** require only:
+  `creator_signals_enabled`, the callback server's public base URL/port, and
+  `settings.meta_app_secret` (to verify `signed_request`). They register
+  independently of whether `credential_encryption_key`/the vault is configured —
+  Krubit must be able to honor a deletion request even if the encryption key was
+  never set or is temporarily unavailable, since refusing to process a legally
+  required data-deletion request because of an unrelated missing setting would be
+  the wrong failure mode.
+
+### 8. HTTP resource ownership and shutdown order
 
 A dedicated `aiohttp.ClientSession` (its own `TCPConnector`) is constructed in
 `_run_bot` specifically for OAuth code-exchange and provider-identity calls —
@@ -244,7 +360,7 @@ Shutdown order in `_run_bot`'s `finally` block is reordered to:
    `content_session`, ...) — `store` last, since every resource above may still
    need to write a receipt or authorization row during its own cleanup
 
-### 8. Bind host
+### 9. Bind host
 
 `CallbackServer` gains a `bind_host: str = "127.0.0.1"` constructor parameter
 (currently hardcoded `"0.0.0.0"`). A new optional setting,
@@ -272,19 +388,47 @@ reverse proxy sits in front and terminates TLS.
   issuing two attempts and consuming them (in either order) each land the grant on
   the correct `account_id` — never swapped, never both landing on one row.
 - **Provider identity mismatch is rejected:** a fake `exchange_code` succeeds but
-  the fake identity lookup returns a `provider_subject_id` that does not match
-  `creator_accounts.external_id`; assert nothing is written to
+  the fake `resolve_account` call returns a handle that does not match
+  `creator_accounts.handle`; assert nothing is written to
   `connector_authorizations` and the response is the same generic failure text as
-  any other rejected attempt.
-- **Meta signed-request verification:** a valid `signed_request` (correct HMAC) is
-  accepted; a tampered payload, a wrong-algorithm payload, and a request signed
-  with the wrong app secret are all rejected with 403 before
+  any other rejected attempt. A separate test asserts a Facebook Page authorization
+  correctly stores a `provider_resource_id` (the Page id) distinct from
+  `authorization_subject_id` (the administering user's id) — not the same value
+  written to both columns by accident.
+- **Meta signed-request verification:** a valid `signed_request` (correct HMAC,
+  fresh `issued_at`) is accepted; a tampered payload, a wrong-algorithm payload, a
+  request signed with the wrong app secret, and a validly-signed but stale
+  `issued_at` (outside the freshness window) are all rejected with 403 before
   `handle_notification`/deletion logic ever runs.
-- **Deauthorization/data-deletion removes exactly the matched rows:** save
-  authorizations for two different guilds sharing one `provider_subject_id`-style
-  fixture; a deletion request removes both (Meta's `user_id` is app-scoped, not
-  guild-scoped) and writes one redacted receipt per row, containing no token and no
-  `provider_subject_id`.
+- **Deauthorization removes exactly the matched rows, keyed correctly:** save a
+  Facebook Page authorization and an Instagram authorization administered by the
+  same person (same `authorization_subject_id`, different `provider_resource_id`,
+  possibly different guilds); a deauthorization request for that
+  `authorization_subject_id` removes both rows and writes one redacted receipt per
+  row containing no token and neither identifier. A second test proves the lookup
+  is genuinely keyed by `authorization_subject_id` and not `provider_resource_id`
+  by constructing a fixture where using the wrong column would find zero rows.
+- **Data-deletion contract:** a valid request returns the documented
+  `{"url": ..., "confirmation_code": ...}` body and persists a
+  `data_deletion_requests` row; the status route returns `"complete"` for that
+  code and `404` for an unknown one; a second valid signed request for the same
+  `authorization_subject_id` within the freshness window reuses the same
+  `confirmation_code` rather than minting a new one; deleting an
+  already-deleted (or never-existing) `authorization_subject_id` deletes zero rows
+  without error.
+- **`oauth_attempts` purge is bounded and safe:** a consumed row younger than
+  `consumed_retention` survives a purge call; one older is removed; an unconsumed,
+  unexpired row always survives regardless of age; an unconsumed row past
+  `expires_at + unconsumed_grace` is removed. A purge failure for this table (fault
+  injection) does not prevent the activity-ledger retention sweep, or any other
+  sweep target, from completing — exercising the existing per-target isolation
+  Phase 4 established.
+- **Route gating is capability-specific:** with `credential_encryption_key` unset
+  (no vault) but `meta_app_secret` set, `build_callback_routes` registers Meta's
+  deauthorization and data-deletion routes but **not** the Meta or TikTok
+  authorization routes. With the vault present but `meta_app_secret` unset, no Meta
+  routes register at all (not even deauthorization, which needs the secret to
+  verify signatures).
 - **Tokens never leak — response, logs, or access logs:** a failing `exchange_code`
   whose exception message embeds a fake token string produces a response body and
   application log record containing neither the token nor the exception's `str()`.
@@ -295,9 +439,10 @@ reverse proxy sits in front and terminates TLS.
   full request line, including the query string, to stdout).
 - **Safe rendering:** `/fetch integrations` output for a guild with a stored
   authorization is asserted to contain only platform/capability/status/expiry
-  substrings — never the sealed `secret_ref` value, never `provider_subject_id` —
-  driven through the actual command handler now that it calls
-  `list_connector_authorization_status`, not through a store method in isolation.
+  substrings — never the sealed `secret_ref` value, never `provider_resource_id` or
+  `authorization_subject_id` — driven through the actual command handler now that
+  it calls `list_connector_authorization_status`, not through a store method in
+  isolation.
 - **Idempotent startup:** a second `CallbackServer.start()` call on an
   already-started instance is a no-op (`_runner` identity unchanged, no second bind
   attempt) — both a direct unit test and a structural fact about `_run_bot` (the
@@ -311,26 +456,36 @@ reverse proxy sits in front and terminates TLS.
 
 ## Testing and Rollout
 
-Automated tests must cover every property above, plus: `oauth_attempts` and
-`connector_authorizations` store methods in isolation (round-trip, atomic
-consumption, sealed-value unreadable without the correct vault key,
-provider-subject lookup returning zero/one/many rows correctly);
-`build_callback_routes` returning the right route set for every combination of
-configured/unconfigured Meta and TikTok credentials; and that `_run_bot` starts and
-cleanly closes the callback server and its dedicated OAuth session exactly once per
-process lifetime, in the revised shutdown order, including across the
-`PrivilegedIntentsRequired` reconnect path and a simulated partial-bind failure.
+Automated tests must cover every property above, plus: `oauth_attempts`,
+`connector_authorizations`, and `data_deletion_requests` store methods in isolation
+(round-trip, atomic consumption, sealed-value unreadable without the correct vault
+key, `authorization_subject_id` lookup returning zero/one/many rows correctly);
+`resolve_account`-based identity resolution exercised for all five capabilities
+(Instagram, Facebook Page, Facebook Profile, Threads, TikTok), each with a matching
+and a mismatching fixture; `build_callback_routes` returning the right route set
+for every combination of configured/unconfigured Meta app id/secret, TikTok
+credentials, and vault presence (per the capability-specific gating in Component
+7); and that `_run_bot` starts and cleanly closes the callback server and its
+dedicated OAuth session exactly once per process lifetime, in the revised shutdown
+order, including across the `PrivilegedIntentsRequired` reconnect path and a
+simulated partial-bind failure.
 
 ## Completion Gate
 
 This spec is complete only when: `krubit run` starts a callback server bound to
 `127.0.0.1` (or the configured bind host) whenever configured; an OAuth attempt is
 durable across a process restart and single-use under concurrency; a completed
-authorization is bound to the exact account it was issued for and its provider
-identity is verified against `creator_accounts.external_id` before anything is
-saved; Meta deauthorization and data-deletion requests are verified via the correct
-`signed_request` protocol and remove every matching row transactionally with a
-redacted receipt; no token or query-string secret reaches an HTTP response, an
-application log, or the `aiohttp.access` log; `/fetch integrations` can safely
-render authorization status without exposing `secret_ref`; and every property above
-is verified by an automated test, not just asserted by design.
+authorization is bound to the exact account it was issued for and its identity is
+verified fresh, per capability, against `creator_accounts.handle` before anything
+is saved; `provider_resource_id` and `authorization_subject_id` are stored as
+distinct columns and deauthorization lookups key on the latter; Meta
+deauthorization and data-deletion requests are verified via the correct
+`signed_request` protocol (including freshness), data-deletion responses match
+Meta's documented contract and are replay-safe; expired/consumed `oauth_attempts`
+rows are purged on a bounded retention schedule without disrupting other sweep
+targets; route registration is gated per-capability so a missing vault never blocks
+Meta's deletion obligations from being honored; no token or query-string secret
+reaches an HTTP response, an application log, or the `aiohttp.access` log; `/fetch
+integrations` can safely render authorization status without exposing `secret_ref`
+or either identifier; and every property above is verified by an automated test,
+not just asserted by design.
