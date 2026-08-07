@@ -37,3 +37,24 @@ def test_launcher_allows_phase_two_completion_environment_names_without_requirin
     required_section = text.split("$requiredNames = @(")[1].split(")")[0]
     for name in optional_names:
         assert name not in required_section
+
+
+def test_launcher_allows_watchdog_and_ledger_environment_names_without_requiring_them() -> None:
+    text = Path("scripts/invoke-krubit.ps1").read_text(encoding="utf-8")
+
+    optional_names = (
+        "KRUBIT_WATCHDOG_ENABLED",
+        "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED",
+        "KRUBIT_WATCHDOG_WATCH_WINDOW_HOURS",
+        "KRUBIT_WATCHDOG_ZARIYA_BRIDGE_URL",
+        "KRUBIT_ACTIVITY_LEDGER_ENABLED",
+        "KRUBIT_ACTIVITY_LEDGER_EXCLUDED_CHANNEL_IDS",
+        "KRUBIT_ACTIVITY_LEDGER_RETENTION_DAYS",
+        "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS",
+    )
+    for name in optional_names:
+        assert f'"{name}"' in text
+
+    required_section = text.split("$requiredNames = @(")[1].split(")")[0]
+    for name in optional_names:
+        assert name not in required_section
