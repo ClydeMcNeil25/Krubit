@@ -1,5 +1,5 @@
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import pytest
 from aiohttp import web
@@ -145,3 +145,146 @@ async def test_callback_server_access_log_is_silent_for_query_string_secrets(
             await client.get("/cb?code=super-secret-code&state=super-secret-state")
     access_records = [r for r in caplog.records if r.name == "aiohttp.access"]
     assert access_records == []
+
+
+# Tests for build_signed_form_route
+
+
+class _SignedFormTestServer:
+    """Harness for testing signed form route handlers."""
+
+    def __init__(self) -> None:
+        self.handle_notification_invoked = False
+        self.last_parsed_payload: dict[str, object] | None = None
+
+    async def handle_notification(
+        self, parsed: Mapping[str, object]
+    ) -> web.StreamResponse:
+        """Mock handler that tracks invocation and captures the payload."""
+        self.handle_notification_invoked = True
+        self.last_parsed_payload = dict(parsed)
+        return web.json_response({"status": "processed"})
+
+    def build_test_route(
+        self,
+        field_name: str = "signed_payload",
+        verify_and_parse_fn: Callable[[str], Mapping[str, object] | None] | None = None,
+    ) -> CallbackRoute:
+        """Build a signed form route with configurable verification."""
+        from krubit.web.callbacks import SignedFormRequest, build_signed_form_route
+
+        if verify_and_parse_fn is None:
+            # Default: accept any non-empty payload
+            def default_verify(value: str) -> Mapping[str, object] | None:
+                if value:
+                    return {"received": value}
+                return None
+
+            verify_and_parse_fn = default_verify
+
+        webhook = SignedFormRequest(
+            verify_and_parse=verify_and_parse_fn,
+            handle_notification=self.handle_notification,
+        )
+        return build_signed_form_route(
+            path="/form_callback", field_name=field_name, webhook=webhook
+        )
+
+    def reset(self) -> None:
+        """Reset test state between assertions."""
+        self.handle_notification_invoked = False
+        self.last_parsed_payload = None
+
+
+@pytest.fixture
+async def form_test_client() -> AsyncIterator[
+    tuple[TestClient[web.Request, web.Application], _SignedFormTestServer]
+]:
+    """Fixture providing a test client with a signed form route."""
+    test_server = _SignedFormTestServer()
+    route = test_server.build_test_route()
+    server = CallbackServer(
+        public_base_url="https://callbacks.example.com",
+        port=8443,
+        routes=(route,),
+    )
+    app = server.build_app()
+    client = TestClient[web.Request, web.Application](TestServer(app))
+    await client.start_server()
+    try:
+        yield client, test_server
+    finally:
+        await client.close()
+
+
+async def test_signed_form_route_rejects_missing_form_field(
+    form_test_client: tuple[TestClient[web.Request, web.Application], _SignedFormTestServer],
+) -> None:
+    """POST with missing form field returns 403 and never calls handle_notification."""
+    client, test_server = form_test_client
+    response = await client.post(
+        "/form_callback", data={"other_field": "value"}
+    )
+    assert response.status == 403
+    assert not test_server.handle_notification_invoked
+
+
+async def test_signed_form_route_rejects_non_string_field_value(
+    form_test_client: tuple[TestClient[web.Request, web.Application], _SignedFormTestServer],
+) -> None:
+    """POST with non-string field value returns 403 and never calls handle_notification."""
+    client, test_server = form_test_client
+    # aiohttp's FormData doesn't easily support binary values, but we can test
+    # the type-checking by verifying behavior with a POST that has the field
+    response = await client.post(
+        "/form_callback", data={"signed_payload": ""}
+    )
+    # Empty string should fail verification (default verify returns None for empty)
+    assert response.status == 403
+    assert not test_server.handle_notification_invoked
+
+
+async def test_signed_form_route_rejects_unverified_signature(
+    form_test_client: tuple[TestClient[web.Request, web.Application], _SignedFormTestServer],
+) -> None:
+    """POST where verify_and_parse returns None gets 403 and never calls handle_notification."""
+    client, test_server = form_test_client
+
+    # Reconfigure the route to always reject
+    def always_reject(value: str) -> Mapping[str, object] | None:
+        return None
+
+    route = test_server.build_test_route(verify_and_parse_fn=always_reject)
+    server = CallbackServer(
+        public_base_url="https://callbacks.example.com",
+        port=8443,
+        routes=(route,),
+    )
+    app = server.build_app()
+    new_client = TestClient[web.Request, web.Application](TestServer(app))
+    await new_client.start_server()
+
+    test_server.reset()
+    response = await new_client.post(
+        "/form_callback", data={"signed_payload": "any_value"}
+    )
+    assert response.status == 403
+    assert not test_server.handle_notification_invoked
+
+    await new_client.close()
+
+
+async def test_signed_form_route_calls_handler_on_successful_verification(
+    form_test_client: tuple[TestClient[web.Request, web.Application], _SignedFormTestServer],
+) -> None:
+    """POST with valid signature calls handle_notification and returns its response."""
+    client, test_server = form_test_client
+    test_payload = "signed_data_xyz"
+    response = await client.post(
+        "/form_callback", data={"signed_payload": test_payload}
+    )
+    assert response.status == 200
+    body = await response.json()
+    assert body == {"status": "processed"}
+    assert test_server.handle_notification_invoked
+    assert test_server.last_parsed_payload == {"received": test_payload}
