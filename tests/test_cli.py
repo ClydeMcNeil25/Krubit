@@ -163,6 +163,60 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
         await store.close()
 
 
+def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
+    tmp_path: Path,
+) -> None:
+    """Structural completion check for the `/fetch` command-tree reorg (Tasks 1-3).
+
+    NOTE ON DEVIATION FROM THE TASK 3 BRIEF: the brief's Step 5 asks for this
+    test to assert exactly 9 direct children --
+    `{"sniff", "admin", "backup", "live", "creator", "notifications",
+    "activity", "milestones", "member-export"}` -- with `retention` and
+    `community-pulse` folded into `admin`, while `latest`/`schedule` (this
+    task's own subject) remain flat. Those two requirements are mutually
+    exclusive with the actual code Tasks 1-2 left behind: `retention` and
+    `community_pulse` are still `@app_commands.command` methods declared
+    directly on `FetchCommands` (`src/krubit/discord/bot.py`, ahead of
+    `BackupCommands` at line 416), never moved into `AdminCommands`. Task 2's
+    self-review claims this was handled; it was not, and Task 3's brief gives
+    no interface or instructions for moving `retention`/`community_pulse`
+    into `admin` here. Rather than silently perform that unscoped move (or
+    silently contradict the brief by leaving `latest`/`schedule` out of the
+    flat set), this test asserts the actual, verified-correct structure and
+    documents the gap for a follow-up task. See task-3-report.md for the full
+    writeup reported to the orchestrating agent.
+
+    The real completion claim this test *does* verify: `FetchCommands` has
+    exactly 7 flat direct commands (`latest`, `schedule`, `activity`,
+    `milestones`, `member-export`, `retention`, `community-pulse`) plus the 6
+    sub-groups Tasks 1-2 consolidated everything else into (`sniff`, `admin`,
+    `backup`, `live`, `creator`, `notifications`) -- 13 total, matching
+    `test_bot_registers_phase_one_fetch_commands` above.
+    """
+    store = asyncio.run(SQLiteStore.open(tmp_path / "krubit.db"))
+    try:
+        fetch_commands = FetchCommands(FoundationService(store))
+
+        assert len(fetch_commands.commands) == 13
+        assert {command.name for command in fetch_commands.commands} == {
+            "sniff",
+            "admin",
+            "backup",
+            "live",
+            "creator",
+            "notifications",
+            "activity",
+            "milestones",
+            "member-export",
+            "latest",
+            "schedule",
+            "retention",
+            "community-pulse",
+        }
+    finally:
+        asyncio.run(store.close())
+
+
 @pytest.mark.asyncio
 async def test_bot_resolves_configured_inactivity_threshold_for_fetch_commands(
     tmp_path: Path,

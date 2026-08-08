@@ -44,6 +44,11 @@ class FoundationService:
         await self._require_enabled(guild_id, action=action)
         await self._require_manager(guild_id, actor_id, can_manage_guild, action=action)
 
+    async def authorize_member(self, guild_id: int, *, action: str) -> None:
+        """Like `authorize_manager`, but for commands any guild member may use --
+        only checks the guild is enabled, never requires Manage Guild."""
+        await self._require_enabled(guild_id, action=action)
+
     async def record_action(
         self,
         guild_id: int,

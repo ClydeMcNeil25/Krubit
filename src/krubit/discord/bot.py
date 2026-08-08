@@ -168,6 +168,21 @@ class FetchCommands(app_commands.Group):
         await interaction.response.defer(ephemeral=True, thinking=True)
         return interaction.guild, user.id
 
+    async def authorize_public(
+        self, interaction: discord.Interaction, action: str
+    ) -> tuple[discord.Guild, int] | None:
+        if interaction.guild_id is None or interaction.guild is None:
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return None
+        user = interaction.user
+        try:
+            await self._service.authorize_member(interaction.guild_id, action=action)
+        except GuildDisabledError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        return interaction.guild, user.id
+
     async def capture(self, guild: discord.Guild) -> tuple[InventoryCapture, SnapshotRecord]:
         config = await self._service.store.get_live_signal_config(guild.id)
         inventory = await capture_inventory(
@@ -210,7 +225,7 @@ class FetchCommands(app_commands.Group):
     @app_commands.command(name="latest", description="Fetch the latest observed creator content")
     @app_commands.guild_only()
     async def latest(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_latest")
+        context = await self.authorize_public(interaction, "fetch_latest")
         if context is None:
             return
         guild, actor_id = context
@@ -231,7 +246,7 @@ class FetchCommands(app_commands.Group):
     @app_commands.command(name="schedule", description="Fetch Scheduled Event status")
     @app_commands.guild_only()
     async def schedule(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_schedule")
+        context = await self.authorize_public(interaction, "fetch_schedule")
         if context is None:
             return
         guild, actor_id = context
