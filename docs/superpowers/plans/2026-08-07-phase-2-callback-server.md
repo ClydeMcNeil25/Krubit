@@ -46,7 +46,7 @@ this server around the bot's own lifecycle.
 - Modify: `src/krubit/storage/sqlite.py` (schema in `initialize()`'s
   `executescript` block near `connector_authorizations`, ~line 456; new methods
   near `save_creator_account`, ~line 1742)
-- Test: `tests/storage/test_oauth_attempts.py` (new)
+- Test: `tests/test_oauth_attempts.py` (new)
 
 **Interfaces:**
 - Produces:
@@ -58,7 +58,7 @@ this server around the bot's own lifecycle.
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/storage/test_oauth_attempts.py
+# tests/test_oauth_attempts.py
 from __future__ import annotations
 
 import secrets
@@ -202,7 +202,7 @@ async def test_purge_oauth_attempts_removes_old_consumed_and_expired_unconsumed(
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/storage/test_oauth_attempts.py -v`
+Run: `uv run pytest tests/test_oauth_attempts.py -v`
 Expected: FAIL with `AttributeError: 'SQLiteStore' object has no attribute
 'issue_oauth_attempt'`
 
@@ -354,13 +354,13 @@ existing imports (`datetime`/`UTC`/`date` are already imported at the top;
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/storage/test_oauth_attempts.py -v`
+Run: `uv run pytest tests/test_oauth_attempts.py -v`
 Expected: PASS (all 6 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/krubit/storage/sqlite.py tests/storage/test_oauth_attempts.py
+git add src/krubit/storage/sqlite.py tests/test_oauth_attempts.py
 git commit -m "feat: add durable oauth_attempts table and store methods"
 ```
 
@@ -371,7 +371,7 @@ git commit -m "feat: add durable oauth_attempts table and store methods"
 **Files:**
 - Modify: `src/krubit/storage/sqlite.py` (schema ~line 456; new methods near
   Task 1's additions)
-- Test: `tests/storage/test_connector_authorizations.py` (new)
+- Test: `tests/test_connector_authorizations.py` (new)
 
 **Interfaces:**
 - Consumes: `CredentialVault.seal_json`/`open_json` (`src/krubit/security/credential_vault.py`)
@@ -387,7 +387,7 @@ git commit -m "feat: add durable oauth_attempts table and store methods"
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/storage/test_connector_authorizations.py
+# tests/test_connector_authorizations.py
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -523,7 +523,7 @@ async def test_list_connector_authorization_status_omits_secret_ref(tmp_path):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/storage/test_connector_authorizations.py -v`
+Run: `uv run pytest tests/test_connector_authorizations.py -v`
 Expected: FAIL with `AttributeError`
 
 - [ ] **Step 3: Update the schema**
@@ -737,13 +737,13 @@ the existing import if so instead of adding a duplicate).
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/storage/test_connector_authorizations.py -v`
+Run: `uv run pytest tests/test_connector_authorizations.py -v`
 Expected: PASS (all 7 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/krubit/storage/sqlite.py tests/storage/test_connector_authorizations.py
+git add src/krubit/storage/sqlite.py tests/test_connector_authorizations.py
 git commit -m "feat: split connector_authorizations identity into resource/subject columns"
 ```
 
@@ -753,7 +753,7 @@ git commit -m "feat: split connector_authorizations identity into resource/subje
 
 **Files:**
 - Modify: `src/krubit/storage/sqlite.py`
-- Test: `tests/storage/test_data_deletion_requests.py` (new)
+- Test: `tests/test_data_deletion_requests.py` (new)
 
 **Interfaces:**
 - Produces:
@@ -765,7 +765,7 @@ git commit -m "feat: split connector_authorizations identity into resource/subje
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/storage/test_data_deletion_requests.py
+# tests/test_data_deletion_requests.py
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -838,7 +838,7 @@ async def test_find_recent_data_deletion_request_outside_window_returns_none(tmp
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/storage/test_data_deletion_requests.py -v`
+Run: `uv run pytest tests/test_data_deletion_requests.py -v`
 Expected: FAIL with `AttributeError`
 
 - [ ] **Step 3: Add the schema**
@@ -943,13 +943,13 @@ def _row_to_data_deletion_request(row: object) -> DataDeletionRequest:
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/storage/test_data_deletion_requests.py -v`
+Run: `uv run pytest tests/test_data_deletion_requests.py -v`
 Expected: PASS (all 4 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/krubit/storage/sqlite.py tests/storage/test_data_deletion_requests.py
+git add src/krubit/storage/sqlite.py tests/test_data_deletion_requests.py
 git commit -m "feat: add data_deletion_requests table for Meta's deletion contract"
 ```
 
@@ -959,7 +959,7 @@ git commit -m "feat: add data_deletion_requests table for Meta's deletion contra
 
 **Files:**
 - Modify: `src/krubit/web/callbacks.py`
-- Test: `tests/web/test_callbacks.py` (extend existing file — check for it first;
+- Test: `tests/test_callback_ingress.py` (extend existing file — check for it first;
   create if absent)
 
 **Interfaces:**
@@ -970,7 +970,7 @@ git commit -m "feat: add data_deletion_requests table for Meta's deletion contra
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# add to tests/web/test_callbacks.py (or create the file if it does not exist)
+# add to tests/test_callback_ingress.py (or create the file if it does not exist)
 from __future__ import annotations
 
 import logging
@@ -1022,7 +1022,7 @@ async def test_callback_server_access_log_is_silent_for_query_string_secrets(cap
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/web/test_callbacks.py -v -k "bind_host or access_log"`
+Run: `uv run pytest tests/test_callback_ingress.py -v -k "bind_host or access_log"`
 Expected: FAIL — `bind_host` tests fail with `AttributeError` (no `_bind_host`);
 the access-log test fails because aiohttp's default `AppRunner` currently emits
 an `aiohttp.access` record for that request.
@@ -1068,13 +1068,13 @@ logger entirely — this is what stops the query string, which carries the OAuth
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `uv run pytest tests/web/test_callbacks.py -v`
+Run: `uv run pytest tests/test_callback_ingress.py -v`
 Expected: PASS, including all pre-existing tests in this file (no regressions)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/krubit/web/callbacks.py tests/web/test_callbacks.py
+git add src/krubit/web/callbacks.py tests/test_callback_ingress.py
 git commit -m "feat: bind callback server to loopback by default and silence access log"
 ```
 
@@ -1085,7 +1085,7 @@ git commit -m "feat: bind callback server to loopback by default and silence acc
 **Files:**
 - Modify: `src/krubit/web/callbacks.py` (new scaffold)
 - Modify: `src/krubit/integrations/meta.py` (new `verify_meta_signed_request`)
-- Test: `tests/web/test_callbacks.py`, `tests/integrations/test_meta_signed_request.py` (new)
+- Test: `tests/test_callback_ingress.py`, `tests/test_meta_signed_request.py` (new)
 
 **Interfaces:**
 - Produces (`callbacks.py`):
@@ -1097,7 +1097,7 @@ git commit -m "feat: bind callback server to loopback by default and silence acc
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/integrations/test_meta_signed_request.py
+# tests/test_meta_signed_request.py
 from __future__ import annotations
 
 import base64
@@ -1162,7 +1162,7 @@ def test_verify_meta_signed_request_rejects_malformed_input():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/integrations/test_meta_signed_request.py -v`
+Run: `uv run pytest tests/test_meta_signed_request.py -v`
 Expected: FAIL with `ImportError: cannot import name 'verify_meta_signed_request'`
 
 - [ ] **Step 3: Add `SignedFormRequest`/`build_signed_form_route` to `callbacks.py`**
@@ -1269,14 +1269,14 @@ already imported for the existing `X-Hub-Signature-256` webhook verification).
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/integrations/test_meta_signed_request.py tests/web/test_callbacks.py -v`
+Run: `uv run pytest tests/test_meta_signed_request.py tests/test_callback_ingress.py -v`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/krubit/web/callbacks.py src/krubit/integrations/meta.py \
-    tests/integrations/test_meta_signed_request.py
+    tests/test_meta_signed_request.py
 git commit -m "feat: add signed-form-request scaffold and Meta signed_request verification"
 ```
 
@@ -1286,7 +1286,7 @@ git commit -m "feat: add signed-form-request scaffold and Meta signed_request ve
 
 **Files:**
 - Modify: `src/krubit/integrations/tiktok.py`
-- Test: `tests/integrations/test_tiktok_identity.py` (new)
+- Test: `tests/test_tiktok_identity.py` (new)
 
 **Rationale:** `TikTokConnector.resolve_account` (`tiktok.py:499`) only requests
 `open_id,display_name` from TikTok's userinfo endpoint and echoes back whatever
@@ -1305,7 +1305,7 @@ keep their current, tested behavior).
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/integrations/test_tiktok_identity.py
+# tests/test_tiktok_identity.py
 from __future__ import annotations
 
 import pytest
@@ -1356,13 +1356,13 @@ async def test_fetch_authorized_identity_raises_on_missing_open_id():
 ```
 
 (This test's exact fake-session shape should match whatever pattern
-`tests/integrations/test_tiktok.py` already uses for `_post` — check that file
+`tests/test_tiktok_connector.py` already uses for `_post` — check that file
 first and adapt the fake to match its existing conventions rather than
 introducing a second, inconsistent fake-session style in the test suite.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/integrations/test_tiktok_identity.py -v`
+Run: `uv run pytest tests/test_tiktok_identity.py -v`
 Expected: FAIL with `AttributeError: 'TikTokConnector' object has no attribute
 'fetch_authorized_identity'`
 
@@ -1406,13 +1406,13 @@ class TikTokConnector:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/integrations/test_tiktok_identity.py -v`
+Run: `uv run pytest tests/test_tiktok_identity.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/krubit/integrations/tiktok.py tests/integrations/test_tiktok_identity.py
+git add src/krubit/integrations/tiktok.py tests/test_tiktok_identity.py
 git commit -m "feat: add TikTok identity resolution independent of resolve_account's echo"
 ```
 
@@ -1422,7 +1422,7 @@ git commit -m "feat: add TikTok identity resolution independent of resolve_accou
 
 **Files:**
 - Create: `src/krubit/web/wiring.py`
-- Test: `tests/web/test_wiring_oauth.py` (new)
+- Test: `tests/test_wiring_oauth.py` (new)
 
 **Interfaces:**
 - Consumes: `SQLiteStore.issue_oauth_attempt`/`consume_oauth_attempt` (Task 1),
@@ -1439,7 +1439,7 @@ git commit -m "feat: add TikTok identity resolution independent of resolve_accou
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/web/test_wiring_oauth.py
+# tests/test_wiring_oauth.py
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -1591,7 +1591,7 @@ async def test_authorize_route_never_redirects_regardless_of_query(tmp_path):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/web/test_wiring_oauth.py -v`
+Run: `uv run pytest tests/test_wiring_oauth.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'krubit.web.wiring'`
 
 - [ ] **Step 3: Implement `build_callback_routes` (OAuth authorization half)**
@@ -1808,14 +1808,14 @@ method if genuinely nothing already provides this lookup.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `uv run pytest tests/web/test_wiring_oauth.py -v`
+Run: `uv run pytest tests/test_wiring_oauth.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/krubit/web/wiring.py src/krubit/integrations/meta.py \
-    tests/web/test_wiring_oauth.py
+    tests/test_wiring_oauth.py
 git commit -m "feat: wire durable, account-bound OAuth authorization routes"
 ```
 
@@ -1825,7 +1825,7 @@ git commit -m "feat: wire durable, account-bound OAuth authorization routes"
 
 **Files:**
 - Modify: `src/krubit/web/wiring.py`
-- Test: `tests/web/test_wiring_deauthorization.py` (new)
+- Test: `tests/test_wiring_deauthorization.py` (new)
 
 **Interfaces:**
 - Consumes: `verify_meta_signed_request` (Task 5),
@@ -1840,7 +1840,7 @@ git commit -m "feat: wire durable, account-bound OAuth authorization routes"
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/web/test_wiring_deauthorization.py
+# tests/test_wiring_deauthorization.py
 from __future__ import annotations
 
 import base64
@@ -1995,7 +1995,7 @@ async def test_data_deletion_on_already_deleted_subject_deletes_zero_rows_withou
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/web/test_wiring_deauthorization.py -v`
+Run: `uv run pytest tests/test_wiring_deauthorization.py -v`
 Expected: FAIL — the deauthorize/data-deletion routes don't exist yet
 
 - [ ] **Step 3: Implement the routes in `wiring.py`**
@@ -2141,13 +2141,13 @@ import block.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `uv run pytest tests/web/test_wiring_deauthorization.py -v`
+Run: `uv run pytest tests/test_wiring_deauthorization.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/krubit/web/wiring.py tests/web/test_wiring_deauthorization.py
+git add src/krubit/web/wiring.py tests/test_wiring_deauthorization.py
 git commit -m "feat: wire Meta deauthorization and data-deletion routes"
 ```
 
@@ -2410,64 +2410,189 @@ git commit -m "feat: start and cleanly shut down the callback server from krubit
 
 ## Task 10: `/fetch integrations` renders authorization status safely
 
+**Correction from the original plan draft:** `/fetch integrations`
+(`src/krubit/discord/bot.py:318`) does not build its own text/embed directly — it
+calls `self._health.integration_health(snapshot, watchdog=..., activity_ledger=...)`
+(`src/krubit/services/health.py:329`), which returns a `HealthReport` built from
+`HealthFinding` objects, then renders that report via `render_health_card`. Phase
+3 and Phase 4 both already extended this exact method the same way: a small
+`XHealthFacts` frozen dataclass, an optional keyword parameter defaulting to
+`None` (so every existing caller is unaffected), and a `_x_findings(facts) ->
+list[HealthFinding]` helper mirroring `_watchdog_findings`
+(`health.py:108`)/`_activity_ledger_findings` (`health.py:67`) exactly. This task
+follows that same shape rather than editing `bot.py`'s rendering directly.
+
 **Files:**
-- Modify: `src/krubit/discord/bot.py` (the `integrations` command, ~line 318)
-- Test: `tests/discord/test_integrations_command.py` (extend existing file if
-  present; check first)
+- Modify: `src/krubit/services/health.py` (new `ConnectorAuthorizationFacts` type,
+  new `_connector_authorization_findings` helper, new keyword parameter on
+  `integration_health`)
+- Modify: `src/krubit/discord/bot.py` (the `integrations` command, ~line 318 —
+  pass the new facts through)
+- Test: `tests/test_health_service.py` (extend existing file)
 
 **Interfaces:**
 - Consumes: `SQLiteStore.list_connector_authorization_status` (Task 2)
+- Produces: `integration_health(snapshot, *, watchdog=None, activity_ledger=None,
+  connector_authorizations: tuple[ConnectorAuthorizationStatus, ...] | None = None)`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Read the existing pattern first**
+
+Read `src/krubit/services/health.py` in full, focusing on
+`ActivityLedgerHealthFacts` (~line 52), `_activity_ledger_findings` (~line 67),
+and where `integration_health` (~line 329) calls both. Read
+`tests/test_health_service.py` for the existing test style covering
+`activity_ledger`/`watchdog` findings — match that style exactly, including
+however it constructs a `SnapshotRecord` fixture.
+
+- [ ] **Step 2: Write the failing test**
 
 ```python
-# add to tests/discord/test_integrations_command.py
-async def test_integrations_command_shows_authorization_status_without_secret():
-    # Arrange: seed one connector_authorization row with a distinctive secret_ref
-    # and a distinctive provider_resource_id/authorization_subject_id, matching
-    # this test file's existing fixture/interaction-mocking conventions (check
-    # the file's existing tests for the exact bot/interaction fixture helpers
-    # already in use, and reuse them rather than introducing new ones).
-    ...
-    # Act: invoke the integrations command as a staff member.
-    ...
-    # Assert: the rendered output contains "active" (the status), and does NOT
-    # contain the seeded secret_ref value or either identifier substring.
-    rendered = "".join(str(call) for call in interaction.response.send_message.call_args_list)
-    assert "super-secret-sealed-value" not in rendered
-    assert "resource-id-marker" not in rendered
-    assert "subject-id-marker" not in rendered
+# add to tests/test_health_service.py, matching its existing fixture style
+def test_integration_health_reports_connector_authorization_status():
+    from krubit.storage.sqlite import ConnectorAuthorizationStatus
+    from krubit.services.health import HealthService  # match existing import style
+
+    authorizations = (
+        ConnectorAuthorizationStatus(
+            platform="tiktok", capability="account", status="active", expires_at=None
+        ),
+    )
+    service = HealthService()  # match however this file already constructs it
+    report = service.integration_health(
+        _some_snapshot_fixture(),  # reuse this file's existing snapshot fixture helper
+        connector_authorizations=authorizations,
+    )
+    codes = {f.code for f in report.findings}
+    assert "connector_authorization_tiktok_account_active" in codes
+    rendered_messages = " ".join(f.message for f in report.findings)
+    assert "active" in rendered_messages
+
+
+def test_integration_health_flags_expired_connector_authorization():
+    from datetime import UTC, datetime, timedelta
+    from krubit.storage.sqlite import ConnectorAuthorizationStatus
+    from krubit.services.health import HealthService
+
+    authorizations = (
+        ConnectorAuthorizationStatus(
+            platform="meta", capability="content", status="expired",
+            expires_at=datetime.now(UTC) - timedelta(days=1),
+        ),
+    )
+    service = HealthService()
+    report = service.integration_health(
+        _some_snapshot_fixture(), connector_authorizations=authorizations
+    )
+    matching = [f for f in report.findings if f.code == "connector_authorization_meta_content_expired"]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+
+
+def test_integration_health_omits_connector_authorization_findings_when_none_supplied():
+    from krubit.services.health import HealthService
+
+    service = HealthService()
+    report = service.integration_health(_some_snapshot_fixture())
+    assert not any(f.code.startswith("connector_authorization_") for f in report.findings)
 ```
 
-This test's exact shape must match `tests/discord/test_integrations_command.py`'s
-existing interaction-mocking fixtures — read that file first (it already tests
-the pre-Phase-2-callback-server `integrations` command) and extend it in the same
-style rather than writing a parallel, inconsistent test harness.
+(`_some_snapshot_fixture()` is a placeholder name — replace it with whatever
+`tests/test_health_service.py` already uses to build a `SnapshotRecord` for its
+existing `integration_health` tests; do not invent a new fixture.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run tests to verify they fail**
 
-Run: `uv run pytest tests/discord/test_integrations_command.py -v -k authorization_status`
-Expected: FAIL — the command does not yet render authorization status
+Run: `uv run pytest tests/test_health_service.py -v -k connector_authorization`
+Expected: FAIL — `connector_authorizations` is not yet a parameter
 
-- [ ] **Step 3: Extend the `integrations` command**
+- [ ] **Step 4: Implement the facts type, helper, and parameter**
 
-In `src/krubit/discord/bot.py`, find the `integrations` command handler (~line
-318) and add a call to `store.list_connector_authorization_status(guild_id)`,
-appending one line per row to the existing response embed/text in the same
-format the command already uses for other capability facts (match the file's
-existing formatting helpers rather than introducing a new rendering style) —
-render only `platform`, `capability`, `status`, and `expires_at`; never
-`secret_ref`, `provider_resource_id`, or `authorization_subject_id`.
+Add to `src/krubit/services/health.py`, near `ActivityLedgerHealthFacts` and
+`_activity_ledger_findings`:
 
-- [ ] **Step 4: Run test to verify it passes**
+```python
+def _connector_authorization_findings(
+    authorizations: tuple[ConnectorAuthorizationStatus, ...] | None,
+) -> list[HealthFinding]:
+    """Factual per-platform authorization status — never the sealed secret or
+    either identifier column, only what `ConnectorAuthorizationStatus` (the
+    deliberately narrow DTO from `SQLiteStore.list_connector_authorization_status`)
+    already exposes: platform, capability, status, expiry."""
+    if not authorizations:
+        return []
+    findings: list[HealthFinding] = []
+    for auth in authorizations:
+        severity = "healthy" if auth.status == "active" else "warning"
+        expiry_text = f", expires {auth.expires_at.isoformat()}" if auth.expires_at else ""
+        findings.append(
+            HealthFinding(
+                f"connector_authorization_{auth.platform}_{auth.capability}_{auth.status}",
+                severity,
+                f"{auth.platform} {auth.capability} authorization is {auth.status}{expiry_text}.",
+            )
+        )
+    return findings
+```
 
-Run: `uv run pytest tests/discord/test_integrations_command.py -v`
-Expected: PASS
+Add `from krubit.storage.sqlite import ConnectorAuthorizationStatus` to this
+file's imports (check first whether this creates a circular import — `sqlite.py`
+must not import from `health.py`; if it does, move `ConnectorAuthorizationStatus`
+to `krubit.domain.creator_signals` or another domain module both files already
+import from, following whatever pattern `WatchdogHealthFacts`/
+`ActivityLedgerHealthFacts` already use to avoid the same problem).
 
-- [ ] **Step 5: Commit**
+Modify `integration_health` (~line 329):
+
+```python
+    def integration_health(
+        self,
+        snapshot: SnapshotRecord,
+        *,
+        watchdog: WatchdogHealthFacts | None = None,
+        activity_ledger: ActivityLedgerHealthFacts | None = None,
+        connector_authorizations: tuple[ConnectorAuthorizationStatus, ...] | None = None,
+    ) -> HealthReport:
+        findings = _integration_findings(snapshot)
+        findings.extend(_watchdog_findings(watchdog))
+        findings.extend(_activity_ledger_findings(activity_ledger))
+        findings.extend(_connector_authorization_findings(connector_authorizations))
+        return _report(findings, snapshot.captured_at)
+```
+
+- [ ] **Step 5: Wire it through the `/fetch integrations` command**
+
+In `src/krubit/discord/bot.py`'s `integrations` command handler (~line 321-329),
+add one call before `self._health.integration_health(...)`:
+
+```python
+        connector_authorizations = await self._foundation.store.list_connector_authorization_status(
+            guild.id
+        )
+```
+
+(Match whichever existing attribute already exposes the store to this command
+class — check how `snapshot`/`self.capture(guild)` accesses storage a few lines
+above, and use the same access path rather than assuming `self._foundation.store`
+verbatim.) Then pass it through:
+
+```python
+        report = self._health.integration_health(
+            snapshot,
+            watchdog=self._watchdog_facts,
+            activity_ledger=self._activity_ledger_facts,
+            connector_authorizations=connector_authorizations,
+        )
+```
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `uv run pytest tests/test_health_service.py tests/test_phase_one_commands.py -v`
+Expected: PASS, including every pre-existing test in both files (no regressions)
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/krubit/discord/bot.py tests/discord/test_integrations_command.py
+git add src/krubit/services/health.py src/krubit/discord/bot.py tests/test_health_service.py
 git commit -m "feat: render connector authorization status in /fetch integrations"
 ```
 
@@ -2475,60 +2600,136 @@ git commit -m "feat: render connector authorization status in /fetch integration
 
 ## Task 11: Wire `oauth_attempts` purge into the existing sweep cycle
 
+**Confirmed location:** `ActivityRuntime.sweep_cycle` in
+`src/krubit/discord/activity_runtime.py:477`. It prunes stale voice-join cache
+entries, then loops over every guild running `_seed_default_exclusions`,
+`_seed_default_retention_policy`, and `self._retention_sweep.sweep(guild_id,
+now)` inside a per-guild `try/except Exception` that logs and continues —
+"one guild's failure must never block another's." `oauth_attempts` is **not**
+guild-scoped the way that per-guild loop's targets are (an OAuth attempt's
+`guild_id` column exists, but the purge itself operates globally across every
+guild's rows in one call), so it does not belong inside the per-guild loop —
+it belongs once per `sweep_cycle()` invocation, in its own isolated
+`try/except`, exactly mirroring the per-guild isolation's *shape* (log and
+continue) applied at the whole-table level instead.
+
 **Files:**
-- Modify: whichever module owns Phase 4's `sweep_cycle` (search for
-  `sweep_cycle` first — likely `src/krubit/services/activity_ledger.py` or
-  similar; confirm the exact file before editing)
-- Test: extend that module's existing sweep test file
+- Modify: `src/krubit/discord/activity_runtime.py` (`sweep_cycle`, ~line 477)
+- Test: `tests/test_activity_runtime.py` (extend existing file)
 
 **Interfaces:**
 - Consumes: `SQLiteStore.purge_oauth_attempts` (Task 1)
 
-- [ ] **Step 1: Locate the existing sweep cycle**
+- [ ] **Step 1: Read the existing pattern first**
 
-Run: `grep -rn "sweep_cycle" src/krubit/` to find the exact function and its
-per-target isolation pattern (the Phase 4 spec's "one table's sweep failure must
-never block another's" discipline). Read that function fully before editing —
-this task must match its existing shape exactly, not invent a parallel scheduler.
+Read `ActivityRuntime.sweep_cycle` (`src/krubit/discord/activity_runtime.py:477-497`)
+and `tests/test_activity_runtime.py`'s existing `sweep_cycle` tests in full —
+match their store/fixture setup conventions exactly (how a `SQLiteStore` and
+`ActivityRuntime` instance are constructed in that file's existing tests).
 
 - [ ] **Step 2: Write the failing test**
 
 ```python
-# extend the sweep cycle's existing test file with:
-async def test_sweep_cycle_purges_oauth_attempts_without_blocking_other_sweeps():
-    # Arrange: seed one long-expired, unconsumed oauth_attempts row and one
-    # long-ago-consumed row, matching this test file's existing store/fixture
-    # setup conventions.
-    ...
-    # Act: run the sweep cycle.
-    ...
-    # Assert: both rows are gone, and every other sweep target's existing
-    # assertions in this file still pass unmodified (no regression).
+# add to tests/test_activity_runtime.py, matching its existing fixture style
+async def test_sweep_cycle_purges_oauth_attempts_without_blocking_guild_sweeps():
+    from datetime import UTC, datetime, timedelta
+    # Reuse this file's existing store/runtime construction helper here.
+    store = ...  # this file's existing SQLiteStore fixture
+    runtime = ...  # this file's existing ActivityRuntime fixture
+
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    old_consumed = await store.issue_oauth_attempt(
+        guild_id=1, member_id=2, account_id="a", platform="tiktok",
+        capability="account", redirect_uri="https://x.test/cb",
+        now=now - timedelta(days=40), ttl=timedelta(minutes=10),
+    )
+    await store.consume_oauth_attempt(old_consumed, now=now - timedelta(days=40))
+
+    await runtime.sweep_cycle(now)
+
+    assert await store.consume_oauth_attempt(old_consumed, now=now) is None
+    # Assert this file's existing guild-sweep assertions still pass unmodified —
+    # do not remove or alter any pre-existing assertion in this file.
+
+
+async def test_sweep_cycle_continues_guild_sweeps_when_oauth_purge_fails(monkeypatch):
+    # Reuse this file's existing store/runtime construction helper here.
+    store = ...
+    runtime = ...
+
+    async def failing_purge(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("simulated purge failure")
+
+    monkeypatch.setattr(store, "purge_oauth_attempts", failing_purge)
+
+    from datetime import UTC, datetime
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    await runtime.sweep_cycle(now)  # must not raise
+    # Assert this file's existing guild-sweep assertions (e.g. that
+    # _seed_default_retention_policy/_retention_sweep.sweep still ran for every
+    # guild) still pass — the failing purge must not have blocked them.
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 3: Run tests to verify they fail**
 
-Run: `uv run pytest <sweep test file> -v -k oauth_attempts`
-Expected: FAIL — the sweep cycle does not yet call `purge_oauth_attempts`
+Run: `uv run pytest tests/test_activity_runtime.py -v -k oauth_attempts`
+Expected: FAIL — `sweep_cycle` does not yet call `purge_oauth_attempts`
 
 - [ ] **Step 4: Add the purge call as one more isolated sweep target**
 
-Add a call to `store.purge_oauth_attempts(now, consumed_retention=timedelta(days=30),
-unconsumed_grace=timedelta(days=1))` inside the sweep cycle's existing
-per-target try/except isolation block, following the exact pattern its other
-targets already use (a failure here must be caught and logged the same way a
-retention-sweep failure for any other table already is, never propagating to
-block a sibling sweep target).
+In `src/krubit/discord/activity_runtime.py`, modify `sweep_cycle` (~line
+477-497):
 
-- [ ] **Step 5: Run test to verify it passes**
+```python
+    async def sweep_cycle(self, now: datetime) -> None:
+        """Prune stale voice-join cache entries, purge expired OAuth attempts, and
+        run the retention sweep for every guild, isolating each target's failure
+        from every other's -- mirroring `WatchdogRuntime.sweep_cycle`'s and
+        `RetentionSweepService.sweep_all_guilds`'s own per-guild isolation
+        discipline, applied here at the whole-table level for `oauth_attempts`
+        since that purge is not guild-scoped the way the per-guild loop below is.
+        """
+        if not self._activity_ledger_enabled:
+            return
+        _require_aware("now", now)
+        self._prune_stale_voice_joins(now)
+        try:
+            await self._store.purge_oauth_attempts(
+                now, consumed_retention=timedelta(days=30), unconsumed_grace=timedelta(days=1)
+            )
+        except Exception:
+            _logger.exception(
+                "ActivityRuntime.sweep_cycle: oauth_attempts purge failed; "
+                "continuing with guild sweeps"
+            )
+        for guild_id in self._guild_ids():
+            try:
+                await self._seed_default_exclusions(guild_id, now)
+                await self._seed_default_retention_policy(guild_id, now)
+                await self._retention_sweep.sweep(guild_id, now)
+            except Exception:
+                _logger.exception(
+                    "ActivityRuntime.sweep_cycle: sweep failed for guild %s; "
+                    "continuing with the next guild",
+                    guild_id,
+                )
+```
 
-Run: `uv run pytest <sweep test file> -v`
+(Check whether `ActivityRuntime` already holds a `self._store`/`self._sqlite`
+attribute referencing the `SQLiteStore` — it must, since `_seed_default_exclusions`
+and friends already write to storage; use that exact existing attribute name
+rather than assuming `self._store`. `timedelta` is very likely already imported
+in this file given its use of `datetime`; add the import only if it is missing.)
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `uv run pytest tests/test_activity_runtime.py -v`
 Expected: PASS, including every pre-existing test in the file (no regressions)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add <sweep cycle file and its test file>
+git add src/krubit/discord/activity_runtime.py tests/test_activity_runtime.py
 git commit -m "feat: purge expired oauth_attempts on the existing sweep schedule"
 ```
 
@@ -2537,7 +2738,7 @@ git commit -m "feat: purge expired oauth_attempts on the existing sweep schedule
 ## Task 12: Full-suite verification and cross-cutting security tests
 
 **Files:**
-- Test: `tests/web/test_wiring_security.py` (new — the tests that don't belong to
+- Test: `tests/test_wiring_security.py` (new — the tests that don't belong to
   any single earlier task because they exercise the whole assembled route set)
 
 **Interfaces:**
@@ -2546,7 +2747,7 @@ git commit -m "feat: purge expired oauth_attempts on the existing sweep schedule
 - [ ] **Step 1: Write the cross-cutting tests**
 
 ```python
-# tests/web/test_wiring_security.py
+# tests/test_wiring_security.py
 from __future__ import annotations
 
 import logging
@@ -2656,7 +2857,7 @@ async def test_partial_bind_failure_leaves_runner_unset(tmp_path):
 
 - [ ] **Step 2: Run tests to verify they fail (or pass, confirming prior tasks)**
 
-Run: `uv run pytest tests/web/test_wiring_security.py -v`
+Run: `uv run pytest tests/test_wiring_security.py -v`
 Expected: These should already PASS if Tasks 1–9 are correctly implemented —
 this task is verification, not new production code. If any fail, that indicates
 a real gap in an earlier task; fix the earlier task's code, not this test.
@@ -2674,7 +2875,7 @@ Expected: all green, zero regressions anywhere in the suite.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/web/test_wiring_security.py
+git add tests/test_wiring_security.py
 git commit -m "test: add cross-cutting security coverage for callback server wiring"
 ```
 
