@@ -505,6 +505,31 @@ async def exchange_authorization_code(
     raise fail(ConnectorFailure.invalid_response())
 
 
+async def fetch_authorizing_user_id(session: object, access_token: str) -> str:
+    """Resolve the Meta user ID of whoever just granted `access_token`.
+
+    No existing connector's `resolve_account` answers this independent of which
+    capability was authorized (Instagram/Threads resolve an IG/Threads-scoped user
+    ID, the Facebook connectors a Page or profile ID) — this always calls the plain
+    `GRAPH_BASE`/me` endpoint with no extra fields, using the same injectable
+    `_graph_get` call shape every other Graph API read in this module uses, so a
+    caller can bind `authorization_subject_id` to "the human who authorized this
+    token" regardless of which resource-scoped capability was granted.
+    """
+    session_obj = cast(_Session, session)
+
+    def fail(failure: ConnectorFailure) -> MetaConnectorError:
+        return MetaConnectorError(failure)
+
+    payload = await _graph_get(
+        session_obj, f"{GRAPH_BASE}/me", {"fields": "id"}, access_token, fail=fail
+    )
+    user_id = payload.get("id")
+    if not isinstance(user_id, str) or not user_id:
+        raise fail(ConnectorFailure.invalid_response())
+    return user_id
+
+
 # --------------------------------------------------------------------------------
 # Instagram
 # --------------------------------------------------------------------------------
