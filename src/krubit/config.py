@@ -52,6 +52,7 @@ class Settings:
     credential_encryption_key: str | None = field(default=None, repr=False)
     callback_public_base_url: str | None = None
     callback_port: int | None = None
+    callback_bind_host: str = "127.0.0.1"
     watchdog_enabled: bool = False
     watchdog_notifications_enabled: bool = False
     watchdog_watch_window_hours: int | None = None
@@ -124,6 +125,7 @@ class Settings:
         raw_credential_encryption_key = values.get("KRUBIT_CREDENTIAL_ENCRYPTION_KEY", "").strip()
         raw_callback_public_base_url = values.get("KRUBIT_CALLBACK_PUBLIC_BASE_URL", "").strip()
         raw_callback_port = values.get("KRUBIT_CALLBACK_PORT", "").strip()
+        raw_callback_bind_host = values.get("KRUBIT_CALLBACK_BIND_HOST", "").strip()
         raw_watchdog_enabled = values.get("KRUBIT_WATCHDOG_ENABLED", "false").strip()
         raw_watchdog_notifications_enabled = values.get(
             "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED", "false"
@@ -247,6 +249,7 @@ class Settings:
             credential_encryption_key=raw_credential_encryption_key or None,
             callback_public_base_url=raw_callback_public_base_url or None,
             callback_port=callback_port,
+            callback_bind_host=raw_callback_bind_host or "127.0.0.1",
             watchdog_enabled=watchdog_enabled,
             watchdog_notifications_enabled=watchdog_notifications_enabled,
             watchdog_watch_window_hours=watchdog_watch_window_hours,

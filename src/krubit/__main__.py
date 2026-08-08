@@ -22,10 +22,13 @@ from krubit.integrations.bluesky import BlueskyConnector
 from krubit.integrations.twitch import TwitchHelixClient
 from krubit.integrations.x import XConnector
 from krubit.integrations.youtube import YouTubeConnector
+from krubit.security.credential_vault import CredentialVault
 from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
 from krubit.services.live_signals import migrate_all_twitch_content
 from krubit.storage.sqlite import SQLiteStore
+from krubit.web.callbacks import CallbackServer
+from krubit.web.wiring import build_callback_routes
 
 _logger = logging.getLogger(__name__)
 
@@ -119,6 +122,9 @@ async def _run_bot(settings: Settings) -> int:
     connector: aiohttp.TCPConnector | None = None
     content_session: aiohttp.ClientSession | None = None
     content_tcp_connector: aiohttp.TCPConnector | None = None
+    oauth_session: aiohttp.ClientSession | None = None
+    oauth_tcp_connector: aiohttp.TCPConnector | None = None
+    callback_server: CallbackServer | None = None
     store: SQLiteStore | None = None
     bot: KrubitBot | None = None
     twitch = None
@@ -142,6 +148,23 @@ async def _run_bot(settings: Settings) -> int:
             if settings.creator_signals_enabled
             else {}
         )
+
+        vault = (
+            CredentialVault.from_env_key(settings.credential_encryption_key)
+            if settings.credential_encryption_key is not None
+            else None
+        )
+        oauth_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+        oauth_session = aiohttp.ClientSession(connector=oauth_tcp_connector)
+        callback_routes = build_callback_routes(settings, store, vault, oauth_session)
+        callback_server = CallbackServer(
+            public_base_url=settings.callback_public_base_url,
+            port=settings.callback_port,
+            routes=callback_routes,
+            bind_host=settings.callback_bind_host,
+        )
+        await callback_server.start()
+
         connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         bot = KrubitBot(
             settings,
@@ -193,6 +216,9 @@ async def _run_bot(settings: Settings) -> int:
     finally:
         cleanup_error: BaseException | None = None
         for resource in (
+            callback_server,
+            oauth_session,
+            oauth_tcp_connector,
             bot,
             store,
             connector,

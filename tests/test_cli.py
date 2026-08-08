@@ -367,7 +367,12 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
     with pytest.raises(RuntimeError, match="start failure"):
         await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
 
-    assert closed == ["bot", "store", "connector", "session", "connector"]
+    # The dedicated OAuth session/connector are constructed and started before
+    # `bot.start()` is ever called (see `_run_bot`'s ordering requirements), so
+    # they close first in the `finally` block, ahead of `bot`/`store`/the bot's
+    # own connector; `callback_server` itself is a real `CallbackServer` here
+    # (not faked) and its `close()` is a no-op since it was never enabled/started.
+    assert closed == ["session", "connector", "bot", "store", "connector", "session", "connector"]
 
 
 @pytest.mark.asyncio
