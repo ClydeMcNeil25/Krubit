@@ -14,6 +14,57 @@ on `FetchCommands` (`src/krubit/discord/bot.py`) wiring them to Discord.
 
 **Tech Stack:** Python 3.13, discord.py 2.7.1, aiosqlite, pytest.
 
+## Addendum: `ActivityAdminCommands` subgroup (Discord's 25-child cap)
+
+**Found during Task 1 implementation, confirmed and resolved — see
+`docs/superpowers/specs/2026-08-08-phase-4-command-surface-gaps-design.md`'s
+own addendum for full reasoning.** `FetchCommands` already has 24 direct
+children; Discord enforces a hard 25-child-per-group limit. All six
+commands in this plan (Tasks 1-4) now nest under one new subgroup instead of
+being flat `/fetch <name>` commands, adding exactly one new child to
+`FetchCommands` (25/25 total, not over). No existing command's path changes.
+
+**Task 1 must add this class** to `src/krubit/discord/bot.py`, matching
+`BackupCommands`' exact delegation shape (`src/krubit/discord/bot.py:712`):
+
+```python
+class ActivityAdminCommands(app_commands.Group):
+    """`/fetch activity-admin` -- Phase 4 activity-ledger maintenance commands
+    (returning members, recognition candidates, member deletion/export,
+    channel-exclusion configuration) that don't fit as flat `/fetch <name>`
+    commands due to Discord's 25-child-per-group cap on `FetchCommands`
+    itself."""
+
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(
+            name="activity-admin", description="Activity-ledger maintenance commands"
+        )
+        self._parent = parent
+```
+
+Register it once in `FetchCommands.__init__`, alongside the existing
+`self.add_command(BackupCommands(self))` etc. calls:
+```python
+self.add_command(ActivityAdminCommands(self))
+```
+
+**Every command method in this plan (Tasks 1-4) is a method on
+`ActivityAdminCommands`, not `FetchCommands`.** Every reference to `self.X`
+in this plan's original wiring snippets (`self.authorize`, `self.finish`,
+`self._activity_commands`, `self._inactivity_threshold`) must be
+`self._parent.X` instead, matching `BackupCommands.status`'s exact delegation
+pattern (`self._parent.authorize(...)`, `self._parent.snapshots`). The one
+exception is `_present_result` (Task 2) — that's a module-level function
+imported into `bot.py`, not a `FetchCommands` method, so it's called directly
+as `_present_result(...)`, no `self._parent.` prefix, from within
+`ActivityAdminCommands` methods too (same module, same import).
+
+Command *names* (`name="returning"`, `name="member-delete"`, etc.) are
+unchanged from every snippet below — only the class they're methods on, and
+the `self.` → `self._parent.` prefix on delegated calls, change. Full
+invocation becomes `/fetch activity-admin returning`,
+`/fetch activity-admin member-delete`, etc.
+
 ## Global Constraints
 
 - Every staff-only command checks `actor.is_staff` (or, for `member delete`'s
