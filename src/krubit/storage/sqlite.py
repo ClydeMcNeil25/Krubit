@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -149,6 +150,16 @@ class ContentReceipt:
     action: str
     detail: dict[str, JSONValue]
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthAttempt:
+    guild_id: int
+    member_id: int
+    account_id: str
+    platform: str
+    capability: str
+    redirect_uri: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,6 +476,22 @@ class SQLiteStore:
                 FOREIGN KEY (guild_id, account_id)
                     REFERENCES creator_accounts (guild_id, account_id)
             );
+
+            CREATE TABLE IF NOT EXISTS oauth_attempts (
+                state_hash TEXT NOT NULL PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_oauth_attempts_expiry
+                ON oauth_attempts (consumed_at, expires_at);
 
             CREATE TABLE IF NOT EXISTS creator_registry_receipts (
                 guild_id INTEGER NOT NULL,
@@ -2091,6 +2118,103 @@ class SQLiteStore:
             detail=_json_object(json.loads(str(row["detail_json"]))),
             created_at=datetime.fromisoformat(str(row["created_at"])),
         )
+
+    async def issue_oauth_attempt(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        account_id: str,
+        platform: str,
+        capability: str,
+        redirect_uri: str,
+        now: datetime,
+        ttl: timedelta,
+    ) -> str:
+        """Mint a durable, single-use OAuth attempt and return its plaintext state token.
+
+        Only the SHA-256 hash of the token is stored; the token itself is never
+        persisted, matching the same "the row is the source of truth, not a
+        signature" property the design spec calls for.
+        """
+        _require_guild_id(guild_id)
+        token = secrets.token_urlsafe(32)
+        state_hash = sha256(token.encode("utf-8")).hexdigest()
+        expires_at = now + ttl
+        async with self._write_transaction(immediate=True):
+            await self._connection.execute(
+                """
+                INSERT INTO oauth_attempts (
+                    state_hash, guild_id, member_id, account_id, platform,
+                    capability, redirect_uri, created_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    state_hash, guild_id, member_id, account_id, platform,
+                    capability, redirect_uri, now.isoformat(), expires_at.isoformat(),
+                ),
+            )
+        return token
+
+    async def consume_oauth_attempt(
+        self, state_token: str, *, now: datetime
+    ) -> OAuthAttempt | None:
+        """Atomically consume a state token, or return None for reuse/expiry/unknown.
+
+        All three failure cases return the same `None` — distinguishing them would
+        let an attacker probe the CSRF-prevention mechanism itself.
+        """
+        state_hash = sha256(state_token.encode("utf-8")).hexdigest()
+        async with self._write_transaction(immediate=True):
+            cursor = await self._connection.execute(
+                """
+                SELECT guild_id, member_id, account_id, platform, capability, redirect_uri
+                FROM oauth_attempts
+                WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (state_hash, now.isoformat()),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            result = await self._connection.execute(
+                """
+                UPDATE oauth_attempts SET consumed_at = ?
+                WHERE state_hash = ? AND consumed_at IS NULL
+                """,
+                (now.isoformat(), state_hash),
+            )
+            if result.rowcount != 1:
+                return None
+            return OAuthAttempt(
+                guild_id=int(row["guild_id"]),
+                member_id=int(row["member_id"]),
+                account_id=str(row["account_id"]),
+                platform=str(row["platform"]),
+                capability=str(row["capability"]),
+                redirect_uri=str(row["redirect_uri"]),
+            )
+
+    async def purge_oauth_attempts(
+        self,
+        now: datetime,
+        *,
+        consumed_retention: timedelta,
+        unconsumed_grace: timedelta,
+    ) -> int:
+        """Delete old consumed rows and long-expired unconsumed rows; return count."""
+        consumed_cutoff = (now - consumed_retention).isoformat()
+        unconsumed_cutoff = (now - unconsumed_grace).isoformat()
+        async with self._write_transaction(immediate=True):
+            result = await self._connection.execute(
+                """
+                DELETE FROM oauth_attempts
+                WHERE (consumed_at IS NOT NULL AND consumed_at < ?)
+                   OR (consumed_at IS NULL AND expires_at < ?)
+                """,
+                (consumed_cutoff, unconsumed_cutoff),
+            )
+            return result.rowcount
 
     async def get_content_cursor(self, guild_id: int, account_id: str) -> ContentCursor | None:
         _require_guild_id(guild_id)
