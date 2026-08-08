@@ -81,6 +81,7 @@ from krubit.services.activity_privacy import delete_member as delete_member_fn
 from krubit.services.activity_privacy import export_member_data as export_member_data_fn
 from krubit.services.activity_views import community_pulse as _community_pulse_view
 from krubit.services.activity_views import inactive_view, newcomer_view, returning_member_view
+from krubit.services.activity_views import leaderboard as _leaderboard_view
 from krubit.services.milestones import recognition_candidates as recognition_candidates_fn
 
 if TYPE_CHECKING:
@@ -774,4 +775,42 @@ class ActivityCommandService:
         )
         return CommandResult(
             CommandStatus.SUCCEEDED, card=card, detail={"count": len(entries)}
+        )
+
+    # -- leaderboard: staff-only guild-wide meaningful-action ranking ------------
+
+    async def leaderboard(
+        self, *, actor: ActivityActorContext, year: int
+    ) -> CommandResult:
+        """Top members by meaningful-action count for one calendar year.
+
+        See `krubit.services.activity_views.leaderboard`'s docstring for the
+        half-open year-boundary and retention-caveat semantics this wraps.
+        """
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        result = await _leaderboard_view(self._store, actor.guild_id, year=year, now=now)
+        lines = [f"<@{e.member_id}> — {e.count} actions" for e in result.entries]
+        description = "\n".join(lines) or "No activity recorded for this year."
+        if result.retention_caveat:
+            description += (
+                "\n\n⚠️ This guild's retention policy is shorter than this "
+                "year's elapsed span — early-year activity may already be "
+                "pruned, so this count could be incomplete."
+            )
+        card = Card(
+            kind="fetched",
+            title=f"Fetched: Leaderboard {year}",
+            description=description,
+            fields=(CardField("Count", str(len(result.entries)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED,
+            card=card,
+            detail={
+                "year": year,
+                "count": len(result.entries),
+                "retention_caveat": result.retention_caveat,
+            },
         )
