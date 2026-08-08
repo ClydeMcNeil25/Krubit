@@ -99,10 +99,6 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "latest",
             "schedule",
             "sniff",
-            "sniff-report",
-            "incident",
-            "evidence",
-            "watchlist",
             "member",
             "activity",
             "newcomers",
@@ -111,6 +107,17 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "retention",
             "community-pulse",
             "activity-admin",
+        }
+        sniff = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "sniff"),
+        )
+        assert {command.name for command in sniff.commands} == {
+            "member",
+            "report",
+            "incident",
+            "evidence",
+            "watchlist",
         }
         backup = cast(
             app_commands.Group,
