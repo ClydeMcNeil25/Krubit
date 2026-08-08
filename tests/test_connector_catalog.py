@@ -50,6 +50,12 @@ def test_recognized_url_carries_a_stable_https_canonical_url() -> None:
     assert result.canonical_url == "https://www.youtube.com/@KrucialStudios"
 
 
+def test_catalog_recognizes_youtube_channel_id_urls() -> None:
+    result = recognize_account_url("https://www.youtube.com/channel/UCR62aTrI0rITJBZPg1Y7lkA")
+    assert (result.platform, result.handle) == (Platform.YOUTUBE, "UCR62aTrI0rITJBZPg1Y7lkA")
+    assert result.canonical_url == "https://www.youtube.com/channel/UCR62aTrI0rITJBZPg1Y7lkA"
+
+
 @pytest.mark.parametrize(
     "url",
     [

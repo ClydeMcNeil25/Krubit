@@ -89,6 +89,7 @@ _THREADS_HANDLE = r"[A-Za-z0-9_.]{1,30}"
 _BLUESKY_HANDLE = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,61}[A-Za-z0-9])?"
 _TIKTOK_HANDLE = r"[A-Za-z0-9_.]{1,24}"
 _FANBASE_HANDLE = r"[A-Za-z0-9_.-]{1,60}"
+_YOUTUBE_CHANNEL_ID = r"UC[A-Za-z0-9_-]{22}"
 
 # Ordered: the first entry whose host and path both match wins. Facebook Page's
 # explicit `/pages/<name>/<id>` permalink is checked before the generic Facebook
@@ -118,6 +119,28 @@ _CATALOG_ENTRIES: tuple[_PlatformEntry, ...] = (
         hosts=frozenset({"youtube.com", "www.youtube.com"}),
         path_pattern=_handle_pattern(_YOUTUBE_HANDLE, prefix="@"),
         canonical="https://www.youtube.com/@{handle}",
+        capabilities=(
+            CapabilityFact(Capability.ACCOUNT, CapabilityState.READY, "Public channel URL"),
+            CapabilityFact(
+                Capability.SOCIAL, CapabilityState.UNCONFIGURED, "Requires a YouTube API key"
+            ),
+            CapabilityFact(
+                Capability.LIVE,
+                CapabilityState.UNCONFIGURED,
+                "Requires API push/poll configuration",
+            ),
+        ),
+    ),
+    # A channel's numeric-style `/channel/UC...` id is more permanent than its
+    # `@handle` (the handle can be changed by the owner; the channel id never
+    # changes), so it is recognized as a second, independent URL shape for the
+    # same platform -- matching the precedent `Platform.FACEBOOK_PAGE`'s
+    # `/pages/<name>/<id>` entry already set for an id-based alternate URL.
+    _PlatformEntry(
+        platform=Platform.YOUTUBE,
+        hosts=frozenset({"youtube.com", "www.youtube.com"}),
+        path_pattern=_handle_pattern(_YOUTUBE_CHANNEL_ID, prefix="channel/"),
+        canonical="https://www.youtube.com/channel/{handle}",
         capabilities=(
             CapabilityFact(Capability.ACCOUNT, CapabilityState.READY, "Public channel URL"),
             CapabilityFact(
