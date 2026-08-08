@@ -86,12 +86,6 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
         )
 
         assert {command.name for command in fetch.commands} == {
-            "status",
-            "test-card",
-            "server-health",
-            "changes",
-            "permissions",
-            "integrations",
             "backup",
             "live",
             "creator",
@@ -99,14 +93,12 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "latest",
             "schedule",
             "sniff",
-            "member",
             "activity",
-            "newcomers",
-            "inactive",
             "milestones",
             "retention",
             "community-pulse",
-            "activity-admin",
+            "admin",
+            "member-export",
         }
         sniff = cast(
             app_commands.Group,
@@ -118,6 +110,26 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "incident",
             "evidence",
             "watchlist",
+        }
+        admin = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "admin"),
+        )
+        assert {command.name for command in admin.commands} == {
+            "status",
+            "test-card",
+            "server-health",
+            "changes",
+            "permissions",
+            "integrations",
+            "member",
+            "newcomers",
+            "inactive",
+            "returning",
+            "recognition-candidates",
+            "member-delete",
+            "exclude-channel",
+            "exclusions",
         }
         backup = cast(
             app_commands.Group,

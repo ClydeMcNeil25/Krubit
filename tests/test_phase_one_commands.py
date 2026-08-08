@@ -47,7 +47,8 @@ async def test_fetch_status_is_staff_only_and_receipts_the_requesting_actor(
     await store.initialize()
     await store.set_guild_enabled(111, True)
     commands = FetchCommands(FoundationService(store))
-    status = next(command for command in commands.commands if command.name == "status")
+    admin = next(command for command in commands.commands if command.name == "admin")
+    status = next(command for command in admin.commands if command.name == "status")  # type: ignore[attr-defined]
     monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
 
     try:
@@ -55,7 +56,7 @@ async def test_fetch_status_is_staff_only_and_receipts_the_requesting_actor(
         assert status.default_permissions.manage_guild is True
 
         denied = _FakeInteraction(_FakeMember(42, can_manage_guild=False))
-        await status.callback(commands, denied)  # type: ignore[arg-type]
+        await status.callback(admin, denied)  # type: ignore[arg-type]
 
         assert denied.response.sent is not None
         assert denied.response.sent["ephemeral"] is True
@@ -63,7 +64,7 @@ async def test_fetch_status_is_staff_only_and_receipts_the_requesting_actor(
         assert denied.edited_embed is None
 
         allowed = _FakeInteraction(_FakeMember(7, can_manage_guild=True))
-        await status.callback(commands, allowed)  # type: ignore[arg-type]
+        await status.callback(admin, allowed)  # type: ignore[arg-type]
 
         assert allowed.response.deferred == {"ephemeral": True, "thinking": True}
         assert allowed.response.sent is None
