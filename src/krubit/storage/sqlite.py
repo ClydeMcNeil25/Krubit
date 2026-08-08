@@ -487,7 +487,9 @@ class SQLiteStore:
                 redirect_uri TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                consumed_at TEXT
+                consumed_at TEXT,
+                FOREIGN KEY (guild_id, account_id)
+                    REFERENCES creator_accounts (guild_id, account_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_oauth_attempts_expiry

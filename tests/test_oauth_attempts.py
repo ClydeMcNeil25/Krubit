@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.storage.sqlite import SQLiteStore
 
 pytestmark = pytest.mark.asyncio
@@ -19,6 +20,14 @@ async def _store(tmp_path) -> SQLiteStore:
 async def test_issue_and_consume_oauth_attempt_round_trips(tmp_path):
     store = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.TIKTOK, handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle", paused=False, created_at=now, updated_at=now,
+        )
+    )
     token = await store.issue_oauth_attempt(
         guild_id=1,
         member_id=2,
@@ -43,6 +52,14 @@ async def test_issue_and_consume_oauth_attempt_round_trips(tmp_path):
 async def test_consume_oauth_attempt_is_single_use(tmp_path):
     store = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.TIKTOK, handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle", paused=False, created_at=now, updated_at=now,
+        )
+    )
     token = await store.issue_oauth_attempt(
         guild_id=1, member_id=2, account_id="acct-1", platform="tiktok",
         capability="account", redirect_uri="https://x.test/cb", now=now,
@@ -58,6 +75,14 @@ async def test_consume_oauth_attempt_is_single_use(tmp_path):
 async def test_consume_oauth_attempt_rejects_expired(tmp_path):
     store = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.TIKTOK, handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle", paused=False, created_at=now, updated_at=now,
+        )
+    )
     token = await store.issue_oauth_attempt(
         guild_id=1, member_id=2, account_id="acct-1", platform="tiktok",
         capability="account", redirect_uri="https://x.test/cb", now=now,
@@ -81,6 +106,14 @@ async def test_consume_oauth_attempt_survives_a_new_store_handle(tmp_path):
     file must still enforce single-use and expiry."""
     store_a = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store_a.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.TIKTOK, handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle", paused=False, created_at=now, updated_at=now,
+        )
+    )
     token = await store_a.issue_oauth_attempt(
         guild_id=1, member_id=2, account_id="acct-1", platform="tiktok",
         capability="account", redirect_uri="https://x.test/cb", now=now,
@@ -100,6 +133,16 @@ async def test_consume_oauth_attempt_survives_a_new_store_handle(tmp_path):
 async def test_purge_oauth_attempts_removes_old_consumed_and_expired_unconsumed(tmp_path):
     store = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
+
+    for account_id in ["a", "b", "c", "d"]:
+        await store.save_creator_account(
+            CreatorAccount(
+                guild_id=1, account_id=account_id, owner_member_id=2,
+                platform=Platform.TIKTOK, handle=f"handle_{account_id}",
+                canonical_url=f"https://tiktok.com/@handle_{account_id}",
+                external_id=f"handle_{account_id}", paused=False, created_at=now, updated_at=now,
+            )
+        )
 
     old_consumed = await store.issue_oauth_attempt(
         guild_id=1, member_id=2, account_id="a", platform="tiktok",
