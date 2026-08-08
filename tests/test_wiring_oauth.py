@@ -558,14 +558,16 @@ async def test_meta_authorize_route_threads_rejects_username_mismatch(tmp_path, 
     await store.close()
 
 
-async def test_meta_authorize_route_facebook_page_rejects_external_id_mismatch(
+async def test_meta_authorize_route_facebook_page_rejects_before_exchange(
     tmp_path, monkeypatch
 ):
-    """CRITICAL FIX #2: FacebookPageConnector.resolve_account unconditionally
-    echoes the input handle, so the handle can never distinguish a mismatch for
-    this capability. The genuinely Graph-confirmed `external_id` (the Page's own
-    numeric id) must be compared against the account's registered external_id
-    instead, and a mismatch there must be rejected."""
+    """Facebook Page OAuth authorization is a deliberate, documented gap (see
+    docs/superpowers/specs/2026-08-07-phase-2-callback-server-design.md's
+    Explicit Exclusions section): there is no reliable Graph-resolved identity
+    to bind against without a proper Page-token exchange. The route must reject
+    every Facebook Page authorization attempt, and must do so BEFORE calling
+    `exchange_authorization_code` -- no point burning a real API call against
+    Meta for a platform we already know we're rejecting."""
     store = await _store(tmp_path)
     vault = CredentialVault.from_env_key("a" * 32)
 
@@ -584,26 +586,15 @@ async def test_meta_authorize_route_facebook_page_rejects_external_id_mismatch(
         platform="facebook_page", now=now,
     )
 
+    exchange_called = False
+
     async def fake_exchange(*args: object, **kwargs: object) -> object:
+        nonlocal exchange_called
+        exchange_called = True
         from krubit.integrations.meta import MetaOAuthGrant
         return MetaOAuthGrant(access_token="tok", refresh_token=None, expires_at=None)
 
     monkeypatch.setattr("krubit.integrations.meta.exchange_authorization_code", fake_exchange)
-
-    async def fake_resolve_account(self: object, recognized: object) -> object:
-        from krubit.integrations.base import ConnectorAccount
-        # A DIFFERENT Page id than what was registered -- the handle it echoes
-        # back still matches, proving the handle alone is a vacuous check.
-        return ConnectorAccount(
-            platform=Platform.FACEBOOK_PAGE,
-            external_id="a-completely-different-page-id",
-            handle=recognized.handle,
-            canonical_url=recognized.canonical_url,
-        )
-
-    monkeypatch.setattr(
-        "krubit.integrations.meta.FacebookPageConnector.resolve_account", fake_resolve_account
-    )
 
     routes = build_callback_routes(
         _settings(meta_app_id="app-id", meta_app_secret="app-secret"), store, vault, object()
@@ -616,18 +607,19 @@ async def test_meta_authorize_route_facebook_page_rejects_external_id_mismatch(
         )
         assert response.status == 400
 
+    assert exchange_called is False
     assert (
         await store.get_connector_authorization(1, "facebook_page:acct-1", "account") is None
     )
     await store.close()
 
 
-async def test_meta_authorize_route_facebook_profile_rejects_external_id_mismatch(
+async def test_meta_authorize_route_facebook_profile_rejects_before_exchange(
     tmp_path, monkeypatch
 ):
-    """CRITICAL FIX #2: same reasoning as the Facebook Page case, for a personal
-    profile -- the only Graph-confirmable field is the numeric id, so that is what
-    gets compared against the account's registered external_id."""
+    """Same deliberate gap as the Facebook Page case, for a personal profile: a
+    personal Profile's `/me` has no comparable field at all to bind against, so
+    the route rejects before ever calling `exchange_authorization_code`."""
     store = await _store(tmp_path)
     vault = CredentialVault.from_env_key("a" * 32)
 
@@ -646,25 +638,15 @@ async def test_meta_authorize_route_facebook_profile_rejects_external_id_mismatc
         platform="facebook", now=now,
     )
 
+    exchange_called = False
+
     async def fake_exchange(*args: object, **kwargs: object) -> object:
+        nonlocal exchange_called
+        exchange_called = True
         from krubit.integrations.meta import MetaOAuthGrant
         return MetaOAuthGrant(access_token="tok", refresh_token=None, expires_at=None)
 
     monkeypatch.setattr("krubit.integrations.meta.exchange_authorization_code", fake_exchange)
-
-    async def fake_resolve_account(self: object, recognized: object) -> object:
-        from krubit.integrations.base import ConnectorAccount
-        return ConnectorAccount(
-            platform=Platform.FACEBOOK,
-            external_id="a-completely-different-profile-id",
-            handle=recognized.handle,
-            canonical_url=recognized.canonical_url,
-        )
-
-    monkeypatch.setattr(
-        "krubit.integrations.meta.FacebookProfileConnector.resolve_account",
-        fake_resolve_account,
-    )
 
     routes = build_callback_routes(
         _settings(meta_app_id="app-id", meta_app_secret="app-secret"), store, vault, object()
@@ -677,6 +659,7 @@ async def test_meta_authorize_route_facebook_profile_rejects_external_id_mismatc
         )
         assert response.status == 400
 
+    assert exchange_called is False
     assert await store.get_connector_authorization(1, "facebook:acct-1", "account") is None
     await store.close()
 

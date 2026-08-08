@@ -61,6 +61,16 @@ attempt record rather than the original stateless-signed-token approach.
   follow-up work, tracked as Phase 2 gap #1.
 - **Per-account content polling** using a saved grant — separate follow-up (gap #1).
 - **Generalized event scheduling** — assigned to Phase 4, not touched here.
+- **Facebook Page / Facebook Profile OAuth authorization** — the authorize route
+  rejects every attempt for these two platforms before exchanging the code.
+  Neither has a reliable Graph-resolved identity to bind against: Page
+  authorization would need a proper `/me/accounts` Page-token exchange (never
+  implemented) to resolve a genuine Page identity, and a personal Profile's
+  `/me` has no comparable field at all. Instagram, Threads, and TikTok
+  authorization are unaffected. Deauthorization/data-deletion for these two
+  platforms still works, so any pre-existing rows can still be cleaned up.
+  Deliberate, documented gap — revisit if/when a proper Page-token exchange is
+  implemented.
 
 ## Architecture
 

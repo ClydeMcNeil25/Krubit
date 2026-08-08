@@ -294,6 +294,18 @@ def _build_meta_authorize_route(
         if resolver_class is None:
             raise ValueError("authorization request could not be completed")
 
+        # Facebook Page / Facebook Profile OAuth authorization is not yet
+        # supported: there is no reliable Graph-resolved identity to bind
+        # against for either -- `FacebookPageConnector.resolve_account` never
+        # performs the `/me/accounts` Page-token exchange needed to resolve a
+        # genuine Page identity, and a personal Profile's `/me` has no
+        # comparable field at all. Reject before spending a real call against
+        # `meta.exchange_authorization_code` on a platform we already know
+        # we're rejecting. This is a deliberate, documented gap, not an
+        # oversight -- see the design spec's Explicit Exclusions section.
+        if platform in (Platform.FACEBOOK_PAGE, Platform.FACEBOOK):
+            raise ValueError("authorization request could not be completed")
+
         assert settings.meta_app_id is not None
         assert settings.meta_app_secret is not None
         grant = await meta.exchange_authorization_code(
@@ -319,39 +331,19 @@ def _build_meta_authorize_route(
             )
         )
 
-        # `resolved.handle` is not a trustworthy verification signal for any of
-        # these four connectors: `FacebookPageConnector`/`FacebookProfileConnector`
-        # unconditionally echo the `RecognizedAccountUrl.handle` they were given
-        # (so comparing it back to that same handle is structurally `x == x`), and
-        # `InstagramConnector`/`ThreadsConnector` only sometimes fetch a real
-        # `username` from Graph, silently falling back to the same echo when Graph
-        # doesn't return one. Verify against a signal each connector genuinely
-        # confirms independently instead, per capability:
-        if isinstance(connector, (meta.InstagramConnector, meta.ThreadsConnector)):
-            # `fetch_authorized_identity` never echoes the input handle -- its
-            # `username` is `None`, not a fallback, when Graph did not return one
-            # (e.g. missing scope). Treat that as a hard rejection, not a skip.
-            identity = await connector.fetch_authorized_identity()
-            if (
-                identity.username is None
-                or identity.username.lower() != account.handle.lower()
-            ):
-                raise ValueError("authorization request could not be completed")
-        else:
-            # FacebookPageConnector / FacebookProfileConnector: both connectors
-            # already fetch `id` genuinely and independently from Graph's `/me`
-            # (never echoed) -- `resolved.external_id` is trustworthy where
-            # `resolved.handle` is not. Compare it against the external_id
-            # recorded when this account was originally registered. For
-            # FacebookProfileConnector specifically, this is the only
-            # Graph-confirmable field for a personal profile (no handle/username
-            # is available for `/me` on a personal profile), so this binding is
-            # inherently weaker than a username comparison -- it authenticates
-            # "the same numeric Facebook user", not a human-readable identity --
-            # but it is a real, independently-confirmed check, not an
-            # always-passing placeholder.
-            if resolved.external_id != account.external_id:
-                raise ValueError("authorization request could not be completed")
+        # `resolved.handle` is not a trustworthy verification signal here:
+        # `InstagramConnector`/`ThreadsConnector` (the only connectors that reach
+        # this point -- Facebook Page/Profile are rejected above) only sometimes
+        # fetch a real `username` from Graph, silently falling back to echoing
+        # the input handle when Graph doesn't return one. Verify against
+        # `fetch_authorized_identity` instead, which never echoes the input
+        # handle -- its `username` is `None`, not a fallback, when Graph did not
+        # return one (e.g. missing scope). Treat that as a hard rejection, not a
+        # skip.
+        assert isinstance(connector, (meta.InstagramConnector, meta.ThreadsConnector))
+        identity = await connector.fetch_authorized_identity()
+        if identity.username is None or identity.username.lower() != account.handle.lower():
+            raise ValueError("authorization request could not be completed")
 
         authorization_subject_id = await meta.fetch_authorizing_user_id(
             oauth_session, grant.access_token
