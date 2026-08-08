@@ -183,6 +183,15 @@ class ConnectorAuthorizationStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class DataDeletionRequest:
+    confirmation_code: str
+    authorization_subject_id: str
+    platform: str
+    requested_at: datetime
+    rows_deleted: int
+
+
+@dataclass(frozen=True, slots=True)
 class MentionBudgetReceipt:
     """A guild-scoped, redacted audit record of one mention-budget outcome.
 
@@ -519,6 +528,17 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_oauth_attempts_expiry
                 ON oauth_attempts (consumed_at, expires_at);
+
+            CREATE TABLE IF NOT EXISTS data_deletion_requests (
+                confirmation_code TEXT NOT NULL PRIMARY KEY,
+                authorization_subject_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                rows_deleted INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_data_deletion_requests_subject
+                ON data_deletion_requests (authorization_subject_id, platform, requested_at);
 
             CREATE TABLE IF NOT EXISTS creator_registry_receipts (
                 guild_id INTEGER NOT NULL,
@@ -4122,6 +4142,73 @@ class SQLiteStore:
                 "DELETE FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
                 (guild_id, member_id),
             )
+
+    async def save_data_deletion_request(
+        self,
+        *,
+        confirmation_code: str,
+        authorization_subject_id: str,
+        platform: str,
+        requested_at: datetime,
+        rows_deleted: int,
+    ) -> None:
+        async with self._write_transaction(immediate=True):
+            await self._connection.execute(
+                """
+                INSERT INTO data_deletion_requests (
+                    confirmation_code, authorization_subject_id, platform,
+                    requested_at, rows_deleted
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    confirmation_code, authorization_subject_id, platform,
+                    requested_at.isoformat(), rows_deleted,
+                ),
+            )
+
+    async def get_data_deletion_request(
+        self, confirmation_code: str
+    ) -> DataDeletionRequest | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT confirmation_code, authorization_subject_id, platform,
+                   requested_at, rows_deleted
+            FROM data_deletion_requests WHERE confirmation_code = ?
+            """,
+            (confirmation_code,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_data_deletion_request(row)
+
+    async def find_recent_data_deletion_request(
+        self, authorization_subject_id: str, platform: str, *, since: datetime
+    ) -> DataDeletionRequest | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT confirmation_code, authorization_subject_id, platform,
+                   requested_at, rows_deleted
+            FROM data_deletion_requests
+            WHERE authorization_subject_id = ? AND platform = ? AND requested_at >= ?
+            ORDER BY requested_at DESC LIMIT 1
+            """,
+            (authorization_subject_id, platform, since.isoformat()),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_data_deletion_request(row)
+
+
+def _row_to_data_deletion_request(row: object) -> DataDeletionRequest:
+    return DataDeletionRequest(
+        confirmation_code=str(row["confirmation_code"]),
+        authorization_subject_id=str(row["authorization_subject_id"]),
+        platform=str(row["platform"]),
+        requested_at=datetime.fromisoformat(row["requested_at"]),
+        rows_deleted=int(row["rows_deleted"]),
+    )
 
 
 def _row_to_connector_authorization(row: aiosqlite.Row) -> ConnectorAuthorization:

@@ -131,6 +131,7 @@ _NON_ACTIVITY_LEDGER_TABLES: frozenset[str] = frozenset(
         "creator_routes",
         "connector_authorizations",
         "oauth_attempts",
+        "data_deletion_requests",
         "creator_registry_receipts",
         "content_events",
         "content_cursors",
