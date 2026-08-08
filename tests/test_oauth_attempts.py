@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -179,4 +180,34 @@ async def test_purge_oauth_attempts_removes_old_consumed_and_expired_unconsumed(
     # purged tokens still correctly returns None (never present, never resurrected).
     assert await store.consume_oauth_attempt(old_consumed, now=now) is None
     assert await store.consume_oauth_attempt(old_unconsumed_expired, now=now) is None
+    await store.close()
+
+
+async def test_consume_oauth_attempt_concurrent_double_consume_only_one_wins(tmp_path):
+    """Finding #5: a genuine race, not a sequential double-call -- two concurrent
+    `consume_oauth_attempt` calls for the same token must never both succeed."""
+    store = await _store(tmp_path)
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.TIKTOK, handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle", paused=False, created_at=now, updated_at=now,
+        )
+    )
+    token = await store.issue_oauth_attempt(
+        guild_id=1, member_id=2, account_id="acct-1", platform="tiktok",
+        capability="account", redirect_uri="https://x.test/cb", now=now,
+        ttl=timedelta(minutes=10),
+    )
+
+    results = await asyncio.gather(
+        store.consume_oauth_attempt(token, now=now),
+        store.consume_oauth_attempt(token, now=now),
+    )
+    successes = [result for result in results if result is not None]
+    failures = [result for result in results if result is None]
+    assert len(successes) == 1
+    assert len(failures) == 1
     await store.close()

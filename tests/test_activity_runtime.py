@@ -906,3 +906,38 @@ async def test_sweep_cycle_continues_guild_sweeps_when_oauth_purge_fails(
 
     # The guild sweep must still have run and pruned the old event
     assert await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID) == ()
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_purges_oauth_attempts_even_when_ledger_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IMPORTANT FIX #4: oauth_attempts are produced whenever creator_signals_enabled
+    is on, independent of activity_ledger_enabled. A deployment with creator signals
+    on and the activity ledger off must still purge this table -- the purge call
+    must run before (not after) the `activity_ledger_enabled` early-return.
+
+    Spies on `store.purge_oauth_attempts` directly (rather than inferring from
+    downstream row visibility) so the assertion isolates exactly what changed:
+    whether the purge call happens at all when the ledger is disabled.
+    """
+    disabled_runtime = build_runtime(store, activity_ledger_enabled=False)
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+
+    calls: list[datetime] = []
+    original_purge = store.purge_oauth_attempts
+
+    async def spying_purge(
+        purge_now: datetime, *, consumed_retention: timedelta, unconsumed_grace: timedelta
+    ) -> int:
+        calls.append(purge_now)
+        return await original_purge(
+            purge_now, consumed_retention=consumed_retention, unconsumed_grace=unconsumed_grace
+        )
+
+    monkeypatch.setattr(store, "purge_oauth_attempts", spying_purge)
+
+    await disabled_runtime.sweep_cycle(now)
+
+    # The purge must have run even though the activity ledger itself is disabled.
+    assert len(calls) == 1

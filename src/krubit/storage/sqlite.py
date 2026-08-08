@@ -508,9 +508,6 @@ class SQLiteStore:
                     REFERENCES creator_accounts (guild_id, account_id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_connector_authorizations_subject
-                ON connector_authorizations (authorization_subject_id);
-
             CREATE TABLE IF NOT EXISTS oauth_attempts (
                 state_hash TEXT NOT NULL PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
@@ -860,6 +857,39 @@ class SQLiteStore:
                 )
             """,
             (LiveSignalStatus.ENDED.value,),
+        )
+        # `connector_authorizations` shipped in a pre-this-branch release with 7
+        # columns (no `provider_resource_id`/`authorization_subject_id`), so the
+        # `CREATE TABLE IF NOT EXISTS` above is a no-op against any already-deployed
+        # database that already has this table. Backfill the two additive columns
+        # here, mirroring the `live_signal_deliveries` migration just above. This
+        # must run (and the two columns must exist) before the index below is
+        # created, since that index is defined over `authorization_subject_id`.
+        connector_authorizations_columns_cursor = await self._connection.execute(
+            "PRAGMA table_info(connector_authorizations)"
+        )
+        connector_authorizations_columns = {
+            str(row["name"]) for row in await connector_authorizations_columns_cursor.fetchall()
+        }
+        if "provider_resource_id" not in connector_authorizations_columns:
+            await self._connection.execute(
+                """
+                ALTER TABLE connector_authorizations
+                ADD COLUMN provider_resource_id TEXT
+                """
+            )
+        if "authorization_subject_id" not in connector_authorizations_columns:
+            await self._connection.execute(
+                """
+                ALTER TABLE connector_authorizations
+                ADD COLUMN authorization_subject_id TEXT
+                """
+            )
+        await self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_connector_authorizations_subject
+                ON connector_authorizations (authorization_subject_id)
+            """
         )
 
     async def close(self) -> None:

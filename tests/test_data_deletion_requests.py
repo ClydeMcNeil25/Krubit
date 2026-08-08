@@ -54,7 +54,9 @@ async def test_find_recent_data_deletion_request_within_window(tmp_path: Path) -
     await store.close()
 
 
-async def test_find_recent_data_deletion_request_outside_window_returns_none(tmp_path: Path) -> None:
+async def test_find_recent_data_deletion_request_outside_window_returns_none(
+    tmp_path: Path,
+) -> None:
     store = await _store(tmp_path)
     now = datetime(2026, 8, 7, tzinfo=UTC)
     await store.save_data_deletion_request(

@@ -475,17 +475,23 @@ class ActivityRuntime:
     # -- retention sweep --------------------------------------------------------------
 
     async def sweep_cycle(self, now: datetime) -> None:
-        """Prune stale voice-join cache entries, purge expired OAuth attempts, and
-        run the retention sweep for every guild, isolating each target's failure
-        from every other's -- mirroring `WatchdogRuntime.sweep_cycle`'s and
-        `RetentionSweepService.sweep_all_guilds`'s own per-guild isolation
-        discipline, applied here at the whole-table level for `oauth_attempts`
-        since that purge is not guild-scoped the way the per-guild loop below is.
+        """Purge expired OAuth attempts, then -- only if the activity ledger is
+        enabled -- prune stale voice-join cache entries and run the retention sweep
+        for every guild, isolating each target's failure from every other's --
+        mirroring `WatchdogRuntime.sweep_cycle`'s and `RetentionSweepService.
+        sweep_all_guilds`'s own per-guild isolation discipline, applied here at the
+        whole-table level for `oauth_attempts` since that purge is not guild-scoped
+        the way the per-guild loop below is.
+
+        The `oauth_attempts` purge runs unconditionally, before the `activity_ledger_
+        enabled` gate below, because `oauth_attempts` rows are produced whenever
+        `creator_signals_enabled` is on -- a setting entirely independent of the
+        activity ledger flag. Gating this purge on `activity_ledger_enabled` (as
+        every other method on this class correctly does for activity-ledger state)
+        would mean a deployment with creator signals on and the activity ledger off
+        never purges this table at all.
         """
-        if not self._activity_ledger_enabled:
-            return
         _require_aware("now", now)
-        self._prune_stale_voice_joins(now)
         try:
             await self._store.purge_oauth_attempts(
                 now, consumed_retention=timedelta(days=30), unconsumed_grace=timedelta(days=1)
@@ -495,6 +501,9 @@ class ActivityRuntime:
                 "ActivityRuntime.sweep_cycle: oauth_attempts purge failed; "
                 "continuing with guild sweeps"
             )
+        if not self._activity_ledger_enabled:
+            return
+        self._prune_stale_voice_joins(now)
         for guild_id in self._guild_ids():
             try:
                 await self._seed_default_exclusions(guild_id, now)

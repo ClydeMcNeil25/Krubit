@@ -530,6 +530,23 @@ async def fetch_authorizing_user_id(session: object, access_token: str) -> str:
     return user_id
 
 
+@dataclass(frozen=True, slots=True)
+class MetaIdentity:
+    """The authorizing account's independently-confirmed identity, for capabilities
+    (Instagram, Threads) where `resolve_account`'s own `handle` is not a trustworthy
+    verification signal -- it falls back to echoing the caller-supplied
+    `RecognizedAccountUrl.handle` whenever Graph does not return a `username` (e.g.
+    a missing scope). `fetch_authorized_identity` on `InstagramConnector`/
+    `ThreadsConnector` returns this instead: `username` is `None`, never an echoed
+    fallback, when Graph did not return one, so a caller verifying an authorization
+    can treat that as a hard rejection rather than silently trusting the value it is
+    trying to verify. Mirrors `krubit.integrations.tiktok.TikTokIdentity`.
+    """
+
+    external_id: str
+    username: str | None
+
+
 # --------------------------------------------------------------------------------
 # Instagram
 # --------------------------------------------------------------------------------
@@ -573,6 +590,22 @@ class InstagramConnector:
             handle=username if isinstance(username, str) and username else recognized.handle,
             canonical_url=recognized.canonical_url,
             display_name=name if isinstance(name, str) and name.strip() else None,
+        )
+
+    async def fetch_authorized_identity(self) -> MetaIdentity:
+        """Independently confirm the authorizing account's `username`, never
+        falling back to any caller-supplied handle -- see `MetaIdentity`'s
+        docstring for why `resolve_account`'s own `handle` cannot be used for
+        verification.
+        """
+        payload = await self._get(f"{GRAPH_BASE}/me", {"fields": "id,username"})
+        external_id = payload.get("id")
+        if not isinstance(external_id, str) or not external_id:
+            raise self._fail(ConnectorFailure.invalid_response())
+        username = payload.get("username")
+        return MetaIdentity(
+            external_id=external_id,
+            username=username if isinstance(username, str) and username.strip() else None,
         )
 
     async def fetch_page(self, account: CreatorAccount, *, cursor: str | None) -> ConnectorPage:
@@ -955,6 +988,22 @@ class ThreadsConnector:
             external_id=external_id,
             handle=username if isinstance(username, str) and username else recognized.handle,
             canonical_url=recognized.canonical_url,
+        )
+
+    async def fetch_authorized_identity(self) -> MetaIdentity:
+        """Independently confirm the authorizing account's `username`, never
+        falling back to any caller-supplied handle -- see `MetaIdentity`'s
+        docstring for why `resolve_account`'s own `handle` cannot be used for
+        verification.
+        """
+        payload = await self._get(f"{THREADS_BASE}/me", {"fields": "id,username"})
+        external_id = payload.get("id")
+        if not isinstance(external_id, str) or not external_id:
+            raise self._fail(ConnectorFailure.invalid_response())
+        username = payload.get("username")
+        return MetaIdentity(
+            external_id=external_id,
+            username=username if isinstance(username, str) and username.strip() else None,
         )
 
     async def fetch_page(self, account: CreatorAccount, *, cursor: str | None) -> ConnectorPage:

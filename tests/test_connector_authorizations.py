@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -153,6 +155,80 @@ async def test_delete_connector_authorizations_removes_rows_and_writes_receipts(
     )
     await store.delete_connector_authorizations(rows, now=now)
     assert await store.get_connector_authorization(1, "acct-1", "content") is None
+
+    # Finding #5: the written receipt itself must be redacted -- neither the sealed
+    # secret nor either identifier may appear in it, only capability/account_id, as
+    # the implementation already claims to do.
+    receipts = await store.list_creator_registry_receipts(1, "acct-1")
+    deauthorized = next(r for r in receipts if r.action == "connector_deauthorized")
+    assert deauthorized.detail["account_id"] == "acct-1"
+    assert deauthorized.detail["platform_capability"] == "content"
+    detail_json = json.dumps(deauthorized.detail, sort_keys=True)
+    assert "v1:x" not in detail_json
+    assert "r-1" not in detail_json
+    assert "subj-1" not in detail_json
+    assert "secret_ref" not in deauthorized.detail
+    assert "provider_resource_id" not in deauthorized.detail
+    assert "authorization_subject_id" not in deauthorized.detail
+    await store.close()
+
+
+async def test_initialize_migrates_a_pre_existing_seven_column_connector_authorizations_table(
+    tmp_path,
+):
+    """CRITICAL FIX #1 regression test: `connector_authorizations` shipped in a
+    pre-this-branch release with 7 columns (no `provider_resource_id`/
+    `authorization_subject_id`). `CREATE TABLE IF NOT EXISTS` is a no-op against an
+    already-deployed database with that shape, so `initialize()` must explicitly
+    backfill the two new columns via `ALTER TABLE` -- proven here against a database
+    seeded with exactly the old 7-column shape, not the fresh-database path every
+    other test in this file exercises.
+    """
+    db_path = tmp_path / "pre_existing.db"
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(
+            """
+            CREATE TABLE connector_authorizations (
+                guild_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                secret_ref TEXT,
+                status TEXT NOT NULL,
+                expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, account_id, capability)
+            )
+            """
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    store = await SQLiteStore.open(db_path)
+    await store.initialize()
+
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="acct-1", owner_member_id=2,
+            platform=Platform.FACEBOOK_PAGE, handle="test_page",
+            canonical_url="https://facebook.com/test_page",
+            external_id="test_page", paused=False, created_at=now, updated_at=now,
+        )
+    )
+    await store.save_connector_authorization(
+        guild_id=1, account_id="acct-1", capability="content",
+        secret_ref="v1:sealed-token", provider_resource_id="ig-12345",
+        authorization_subject_id="fb-user-999", status="active",
+        expires_at=now + timedelta(days=60), now=now,
+    )
+    row = await store.get_connector_authorization(1, "acct-1", "content")
+    assert row is not None
+    assert row.secret_ref == "v1:sealed-token"
+    assert row.provider_resource_id == "ig-12345"
+    assert row.authorization_subject_id == "fb-user-999"
+    assert row.status == "active"
     await store.close()
 
 

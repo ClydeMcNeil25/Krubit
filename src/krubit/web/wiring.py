@@ -211,8 +211,6 @@ def _build_meta_data_deletion_routes(
 def _build_tiktok_authorize_route(
     settings: Settings, store: SQLiteStore, vault: CredentialVault, oauth_session: object
 ) -> CallbackRoute:
-    redirect_uri = f"{settings.callback_public_base_url}/callbacks/tiktok/authorize"
-
     async def handle_redirect(query: Mapping[str, str]) -> str:
         code = query.get("code")
         state = query.get("state")
@@ -230,15 +228,23 @@ def _build_tiktok_authorize_route(
             code=code,
             client_key=settings.tiktok_client_key,
             client_secret=settings.tiktok_client_secret,
-            redirect_uri=redirect_uri,
+            # Read from the consumed attempt row, not recomputed from current
+            # settings -- a mid-flight change to KRUBIT_CALLBACK_PUBLIC_BASE_URL
+            # must not break an in-flight authorization.
+            redirect_uri=attempt.redirect_uri,
         )
         connector = tiktok.TikTokConnector(oauth_session, grant.access_token)
         identity = await connector.fetch_authorized_identity()
 
         account = await store.get_creator_account(attempt.guild_id, attempt.account_id)
-        if account is None or (
-            identity.username is not None
-            and identity.username.lower() != account.handle.lower()
+        # `identity.username is None` (no `user.info.profile` scope granted) is a
+        # REJECTION, not a skip -- treating it as "nothing to check" would undo the
+        # entire point of `fetch_authorized_identity` sourcing an independently
+        # confirmed username instead of trusting an echoed value.
+        if (
+            account is None
+            or identity.username is None
+            or identity.username.lower() != account.handle.lower()
         ):
             raise ValueError("authorization request could not be completed")
 
@@ -269,8 +275,6 @@ def _build_tiktok_authorize_route(
 def _build_meta_authorize_route(
     settings: Settings, store: SQLiteStore, vault: CredentialVault, oauth_session: object
 ) -> CallbackRoute:
-    redirect_uri = f"{settings.callback_public_base_url}/callbacks/meta/authorize"
-
     async def handle_redirect(query: Mapping[str, str]) -> str:
         code = query.get("code")
         state = query.get("state")
@@ -298,7 +302,10 @@ def _build_meta_authorize_route(
             code=code,
             client_id=settings.meta_app_id,
             client_secret=settings.meta_app_secret,
-            redirect_uri=redirect_uri,
+            # Read from the consumed attempt row, not recomputed from current
+            # settings -- a mid-flight change to KRUBIT_CALLBACK_PUBLIC_BASE_URL
+            # must not break an in-flight authorization.
+            redirect_uri=attempt.redirect_uri,
         )
 
         account = await store.get_creator_account(attempt.guild_id, attempt.account_id)
@@ -311,8 +318,40 @@ def _build_meta_authorize_route(
                 platform=platform, handle=account.handle, canonical_url=account.canonical_url
             )
         )
-        if resolved.handle.lower() != account.handle.lower():
-            raise ValueError("authorization request could not be completed")
+
+        # `resolved.handle` is not a trustworthy verification signal for any of
+        # these four connectors: `FacebookPageConnector`/`FacebookProfileConnector`
+        # unconditionally echo the `RecognizedAccountUrl.handle` they were given
+        # (so comparing it back to that same handle is structurally `x == x`), and
+        # `InstagramConnector`/`ThreadsConnector` only sometimes fetch a real
+        # `username` from Graph, silently falling back to the same echo when Graph
+        # doesn't return one. Verify against a signal each connector genuinely
+        # confirms independently instead, per capability:
+        if isinstance(connector, (meta.InstagramConnector, meta.ThreadsConnector)):
+            # `fetch_authorized_identity` never echoes the input handle -- its
+            # `username` is `None`, not a fallback, when Graph did not return one
+            # (e.g. missing scope). Treat that as a hard rejection, not a skip.
+            identity = await connector.fetch_authorized_identity()
+            if (
+                identity.username is None
+                or identity.username.lower() != account.handle.lower()
+            ):
+                raise ValueError("authorization request could not be completed")
+        else:
+            # FacebookPageConnector / FacebookProfileConnector: both connectors
+            # already fetch `id` genuinely and independently from Graph's `/me`
+            # (never echoed) -- `resolved.external_id` is trustworthy where
+            # `resolved.handle` is not. Compare it against the external_id
+            # recorded when this account was originally registered. For
+            # FacebookProfileConnector specifically, this is the only
+            # Graph-confirmable field for a personal profile (no handle/username
+            # is available for `/me` on a personal profile), so this binding is
+            # inherently weaker than a username comparison -- it authenticates
+            # "the same numeric Facebook user", not a human-readable identity --
+            # but it is a real, independently-confirmed check, not an
+            # always-passing placeholder.
+            if resolved.external_id != account.external_id:
+                raise ValueError("authorization request could not be completed")
 
         authorization_subject_id = await meta.fetch_authorizing_user_id(
             oauth_session, grant.access_token
