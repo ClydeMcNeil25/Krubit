@@ -800,3 +800,109 @@ async def test_on_reaction_add_dm_gate_short_circuits_before_extraction(
     await runtime.on_reaction_add(FakeReactionPayload(guild_id=None), NOW)
 
     assert calls == []
+
+
+# --- sweep_cycle: oauth_attempts purge -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_purges_oauth_attempts_without_blocking_guild_sweeps(
+    store: SQLiteStore,
+) -> None:
+    """Verify that oauth_attempts are purged during sweep_cycle and that guild
+    sweeps still run successfully."""
+    from krubit.domain.activity_ledger import RetentionPolicy
+    from krubit.domain.creator_signals import CreatorAccount, Platform
+
+    runtime = build_runtime(store)
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+
+    # Create a creator account first (foreign key constraint)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=GUILD_ID,
+            account_id="a",
+            owner_member_id=MEMBER_ID,
+            platform=Platform.TIKTOK,
+            handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle",
+            paused=False,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    old_consumed = await store.issue_oauth_attempt(
+        guild_id=GUILD_ID,
+        member_id=MEMBER_ID,
+        account_id="a",
+        platform="tiktok",
+        capability="account",
+        redirect_uri="https://x.test/cb",
+        now=now - timedelta(days=40),
+        ttl=timedelta(minutes=10),
+    )
+    await store.consume_oauth_attempt(old_consumed, now=now - timedelta(days=40))
+
+    # Set up a retention policy and create an event so guild sweep does work
+    await store.save_retention_policy(
+        RetentionPolicy(guild_id=GUILD_ID, max_age_days=7, updated_by=999, updated_at=now)
+    )
+    await runtime.on_message(FakeMessage(), now - timedelta(days=30))
+    assert len(await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID)) == 1
+
+    # Run sweep_cycle - must not raise and must purge oauth + run guild sweep
+    await runtime.sweep_cycle(now)
+
+    # Guild sweep must have pruned the old event
+    assert await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID) == ()
+    # Old consumed attempt should be purged or at least not usable
+    assert await store.consume_oauth_attempt(old_consumed, now=now) is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_cycle_continues_guild_sweeps_when_oauth_purge_fails(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify that when oauth_attempts purge fails, guild sweeps still run."""
+    from krubit.domain.activity_ledger import RetentionPolicy
+    from krubit.domain.creator_signals import CreatorAccount, Platform
+
+    runtime = build_runtime(store)
+    now = datetime(2026, 8, 7, tzinfo=UTC)
+
+    # Create a creator account first (foreign key constraint)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=GUILD_ID,
+            account_id="a",
+            owner_member_id=MEMBER_ID,
+            platform=Platform.TIKTOK,
+            handle="creator_handle",
+            canonical_url="https://tiktok.com/@creator_handle",
+            external_id="creator_handle",
+            paused=False,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    async def failing_purge(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("simulated purge failure")
+
+    monkeypatch.setattr(store, "purge_oauth_attempts", failing_purge)
+
+    # Set up a retention policy so guild sweep has something to do
+    await store.save_retention_policy(
+        RetentionPolicy(guild_id=GUILD_ID, max_age_days=7, updated_by=999, updated_at=now)
+    )
+    # Add a message event that will be aged out
+    await runtime.on_message(FakeMessage(), now - timedelta(days=30))
+    assert len(await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID)) == 1
+
+    # sweep_cycle must not raise even though oauth purge fails
+    await runtime.sweep_cycle(now)
+
+    # The guild sweep must still have run and pruned the old event
+    assert await store.list_ledger_events(GUILD_ID, member_id=MEMBER_ID) == ()

@@ -475,15 +475,26 @@ class ActivityRuntime:
     # -- retention sweep --------------------------------------------------------------
 
     async def sweep_cycle(self, now: datetime) -> None:
-        """Prune stale voice-join cache entries and run the retention sweep for every
-        guild, isolating one guild's failure from another's -- mirroring
-        `WatchdogRuntime.sweep_cycle`'s and `RetentionSweepService.sweep_all_guilds`'s
-        own per-guild isolation discipline.
+        """Prune stale voice-join cache entries, purge expired OAuth attempts, and
+        run the retention sweep for every guild, isolating each target's failure
+        from every other's -- mirroring `WatchdogRuntime.sweep_cycle`'s and
+        `RetentionSweepService.sweep_all_guilds`'s own per-guild isolation
+        discipline, applied here at the whole-table level for `oauth_attempts`
+        since that purge is not guild-scoped the way the per-guild loop below is.
         """
         if not self._activity_ledger_enabled:
             return
         _require_aware("now", now)
         self._prune_stale_voice_joins(now)
+        try:
+            await self._store.purge_oauth_attempts(
+                now, consumed_retention=timedelta(days=30), unconsumed_grace=timedelta(days=1)
+            )
+        except Exception:
+            _logger.exception(
+                "ActivityRuntime.sweep_cycle: oauth_attempts purge failed; "
+                "continuing with guild sweeps"
+            )
         for guild_id in self._guild_ids():
             try:
                 await self._seed_default_exclusions(guild_id, now)
