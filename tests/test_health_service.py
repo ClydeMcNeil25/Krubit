@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from krubit.domain.companion import CoverageIssue, SnapshotRecord
 from krubit.domain.models import JSONValue
 from krubit.services.health import ActivityLedgerHealthFacts, HealthService, WatchdogHealthFacts
+from krubit.storage.sqlite import ConnectorAuthorizationStatus
 
 
 def snapshot_with(
@@ -367,3 +368,53 @@ def test_server_health_reports_missing_snapshot_still_reports_activity_ledger_fa
 
     assert "activity_ledger_disabled" in [finding.code for finding in report.findings]
     assert "snapshot_missing" in [finding.code for finding in report.findings]
+
+
+def test_integration_health_reports_connector_authorization_status() -> None:
+    authorizations = (
+        ConnectorAuthorizationStatus(
+            platform="tiktok", capability="account", status="active", expires_at=None
+        ),
+    )
+    report = HealthService().integration_health(
+        snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC)),
+        connector_authorizations=authorizations,
+    )
+
+    codes = {finding.code for finding in report.findings}
+    assert "connector_authorization_tiktok_account_active" in codes
+    rendered_messages = " ".join(finding.detail for finding in report.findings)
+    assert "active" in rendered_messages
+
+
+def test_integration_health_flags_expired_connector_authorization() -> None:
+    authorizations = (
+        ConnectorAuthorizationStatus(
+            platform="meta",
+            capability="content",
+            status="expired",
+            expires_at=datetime(2026, 8, 5, tzinfo=UTC),
+        ),
+    )
+    report = HealthService().integration_health(
+        snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC)),
+        connector_authorizations=authorizations,
+    )
+
+    matching = [
+        finding
+        for finding in report.findings
+        if finding.code == "connector_authorization_meta_content_expired"
+    ]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+
+
+def test_integration_health_omits_connector_authorization_findings_when_none_supplied() -> None:
+    report = HealthService().integration_health(
+        snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC))
+    )
+
+    assert not any(
+        finding.code.startswith("connector_authorization_") for finding in report.findings
+    )

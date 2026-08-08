@@ -324,8 +324,14 @@ class FetchCommands(app_commands.Group):
             return
         guild, actor_id = context
         _, snapshot = await self.capture(guild)
+        connector_authorizations = await self._service.store.list_connector_authorization_status(
+            guild.id
+        )
         report = self._health.integration_health(
-            snapshot, watchdog=self._watchdog_facts, activity_ledger=self._activity_ledger_facts
+            snapshot,
+            watchdog=self._watchdog_facts,
+            activity_ledger=self._activity_ledger_facts,
+            connector_authorizations=connector_authorizations,
         )
         await self.finish(
             interaction,

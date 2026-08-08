@@ -12,6 +12,7 @@ from krubit.domain.creator_signals import CapabilityState, ContentCursor
 from krubit.domain.models import JSONValue
 from krubit.integrations.base import ConnectorHealth
 from krubit.services.creator_analytics import DeliveryCounts
+from krubit.storage.sqlite import ConnectorAuthorizationStatus
 
 _SEVERITY = {"healthy": 0, "limited": 1, "warning": 2, "critical": 3}
 
@@ -137,6 +138,32 @@ def _watchdog_findings(facts: WatchdogHealthFacts | None) -> list[HealthFinding]
                 "running in join-signal-only mode -- no message-based signal "
                 "(mass mentions, malicious-link shape, repeated messages, spam-wave "
                 "correlation, or watch-window message inspection) can be observed.",
+            )
+        )
+    return findings
+
+
+def _connector_authorization_findings(
+    authorizations: tuple[ConnectorAuthorizationStatus, ...] | None,
+) -> list[HealthFinding]:
+    """Factual per-platform authorization status -- never the sealed secret or
+    either identifier column, only what `ConnectorAuthorizationStatus` (the
+    deliberately narrow DTO from `SQLiteStore.list_connector_authorization_status`)
+    already exposes: platform, capability, status, expiry. Passing `None` (the
+    default) skips connector-authorization findings entirely, preserving every
+    caller that predates this task, mirroring `_watchdog_findings`/
+    `_activity_ledger_findings`'s own `None`-means-"don't report" contract."""
+    if not authorizations:
+        return []
+    findings: list[HealthFinding] = []
+    for auth in authorizations:
+        severity = "healthy" if auth.status == "active" else "warning"
+        expiry_text = f", expires {auth.expires_at.isoformat()}" if auth.expires_at else ""
+        findings.append(
+            HealthFinding(
+                f"connector_authorization_{auth.platform}_{auth.capability}_{auth.status}",
+                severity,
+                f"{auth.platform} {auth.capability} authorization is {auth.status}{expiry_text}.",
             )
         )
     return findings
@@ -332,10 +359,12 @@ class HealthService:
         *,
         watchdog: WatchdogHealthFacts | None = None,
         activity_ledger: ActivityLedgerHealthFacts | None = None,
+        connector_authorizations: tuple[ConnectorAuthorizationStatus, ...] | None = None,
     ) -> HealthReport:
         findings = _integration_findings(snapshot)
         findings.extend(_watchdog_findings(watchdog))
         findings.extend(_activity_ledger_findings(activity_ledger))
+        findings.extend(_connector_authorization_findings(connector_authorizations))
         return _report(findings, snapshot.captured_at)
 
     def creator_health(
