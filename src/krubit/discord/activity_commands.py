@@ -74,7 +74,8 @@ from krubit.services.activation_retention import (
     time_to_activation,
 )
 from krubit.services.activity_views import community_pulse as _community_pulse_view
-from krubit.services.activity_views import inactive_view, newcomer_view
+from krubit.services.activity_views import inactive_view, newcomer_view, returning_member_view
+from krubit.services.milestones import recognition_candidates as recognition_candidates_fn
 
 if TYPE_CHECKING:
     from krubit.storage.sqlite import SQLiteStore
@@ -105,6 +106,26 @@ _RETENTION_WINDOWS: tuple[CohortWindow, ...] = (CohortWindow.SEVEN_DAY, CohortWi
 # `/fetch community-pulse`'s window. No command parameter exists for this
 # either, so a fixed 30-day window is used, matching `_ACTIVITY_TREND_WINDOW`.
 _COMMUNITY_PULSE_WINDOW = CohortWindow.THIRTY_DAY
+
+# `/fetch recognition-candidates`'s window. No command parameter exists for
+# this either, so a fixed 30-day window is used, matching
+# `_ACTIVITY_TREND_WINDOW`/`_COMMUNITY_PULSE_WINDOW`.
+_RECOGNITION_WINDOW = CohortWindow.THIRTY_DAY
+
+# Every list-rendering `/fetch` command caps its rendered entries at this many
+# lines and appends a "...and N more." summary line rather than risk exceeding
+# Discord's 4096-character embed description limit for large guilds. This is
+# new, deliberately defensive behavior -- no existing `/fetch` command guards
+# this today.
+_MAX_LIST_ENTRIES = 40
+
+
+def _render_capped_lines(lines: list[str], total: int) -> str:
+    if not lines:
+        return "None found."
+    if total > len(lines):
+        lines = [*lines[:_MAX_LIST_ENTRIES], f"...and {total - _MAX_LIST_ENTRIES} more."]
+    return "\n".join(lines)
 
 
 def _trailing_window_events(
@@ -466,4 +487,61 @@ class ActivityCommandService:
                 "active_member_count": pulse.active_member_count,
                 "retention_pct": round(pulse.cohort.retention_rate * 100),
             },
+        )
+
+    # -- returning: staff-only guild-wide returning-member view -------------------
+
+    async def returning(
+        self, *, actor: ActivityActorContext, inactivity_threshold: timedelta
+    ) -> CommandResult:
+        """Members who had a gap exceeding `inactivity_threshold` and then
+        resumed activity, per `returning_member_view`."""
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        entries = await returning_member_view(
+            self._store, actor.guild_id, inactivity_threshold, now
+        )
+        lines = [
+            f"<@{e.member_id}> — {e.trend.active_day_count} active days, "
+            f"{e.trend.channel_diversity} channels (trailing "
+            f"{cohort_window_days(e.trend.window)} days)"
+            for e in entries[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(entries))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Returning Members",
+            description=description,
+            fields=(CardField("Count", str(len(entries)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(entries)}
+        )
+
+    # -- recognition-candidates: staff-only guild-wide recognition shortlist ------
+
+    async def recognition_candidates(self, *, actor: ActivityActorContext) -> CommandResult:
+        """A factual shortlist of members with notable, verifiable activity,
+        per `recognition_candidates_fn` -- never a numeric score."""
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        events = await self._store.list_ledger_events_for_guild(actor.guild_id)
+        candidates = recognition_candidates_fn(
+            actor.guild_id, events, _RECOGNITION_WINDOW, now
+        )
+        lines = [
+            f"<@{c.member_id}> — {', '.join(c.reasons)}"
+            for c in candidates[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(candidates))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Recognition Candidates",
+            description=description,
+            fields=(CardField("Count", str(len(candidates)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(candidates)}
         )

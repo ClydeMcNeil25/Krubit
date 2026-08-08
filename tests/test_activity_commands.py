@@ -414,3 +414,111 @@ async def test_community_pulse_succeeds_for_staff(
     result = await commands.community_pulse(actor=staff_member())
     assert result.status is CommandStatus.SUCCEEDED
     assert result.detail["active_member_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# returning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_returning_denies_non_staff(commands: ActivityCommandService) -> None:
+    result = await commands.returning(
+        actor=regular_member(), inactivity_threshold=_DEFAULT_INACTIVITY_THRESHOLD
+    )
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_returning_renders_real_entries(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    # Matches tests/test_activity_views.py's own returning_member_view fixture
+    # shape: join, active period, a gap longer than the threshold, then active
+    # again -- all within the fixed 30-day trend window.
+    await store.record_ledger_event(
+        JoinEvent(guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=60))
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=20),
+            channel_id=900,
+        )
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=1),
+            channel_id=900,
+        )
+    )
+    result = await commands.returning(
+        actor=staff_member(), inactivity_threshold=_DEFAULT_INACTIVITY_THRESHOLD
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert f"<@{TARGET_ID}>" in result.card.description
+
+
+@pytest.mark.asyncio
+async def test_returning_truncates_past_entry_cap(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    # Seed more than the _MAX_LIST_ENTRIES (40) cap of members who each show a
+    # genuine returning gap-then-resume within the trend window.
+    for member_id in range(1, 45):
+        await store.record_ledger_event(
+            JoinEvent(guild_id=GUILD_ID, member_id=member_id, occurred_at=NOW - timedelta(days=60))
+        )
+        await store.record_ledger_event(
+            MessageEvent(
+                guild_id=GUILD_ID, member_id=member_id, occurred_at=NOW - timedelta(days=20),
+                channel_id=900,
+            )
+        )
+        await store.record_ledger_event(
+            MessageEvent(
+                guild_id=GUILD_ID, member_id=member_id, occurred_at=NOW - timedelta(days=1),
+                channel_id=900,
+            )
+        )
+    result = await commands.returning(
+        actor=staff_member(), inactivity_threshold=_DEFAULT_INACTIVITY_THRESHOLD
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert "...and" in result.card.description
+    assert result.detail["count"] == 44
+
+
+# ---------------------------------------------------------------------------
+# recognition-candidates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recognition_candidates_denies_non_staff(
+    commands: ActivityCommandService,
+) -> None:
+    result = await commands.recognition_candidates(actor=regular_member())
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_recognition_candidates_renders_reasons(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    # Matches tests/test_milestones.py's FIXTURE_EVENTS seeding: 100 messages in
+    # a single day is well past the message-count notability threshold.
+    for i in range(100):
+        await store.record_ledger_event(
+            MessageEvent(
+                guild_id=GUILD_ID,
+                member_id=TARGET_ID,
+                occurred_at=NOW - timedelta(days=1, minutes=-i),
+                channel_id=900,
+            )
+        )
+    result = await commands.recognition_candidates(actor=staff_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert f"<@{TARGET_ID}>" in result.card.description
