@@ -4,6 +4,42 @@ Krubit is Zariya's non-conversational Discord pet and operational companion. He 
 functional system results, records auditable events, and provides a safe foundation for later
 creator notifications, server monitoring, Entry Sniffing, and member activity measurement.
 
+## Capabilities reference for moderation support
+
+This section is written for Zariya (or any AI employee using Krubit for moderation support) to
+read once and use as a working reference. It summarizes what Krubit can tell you, how to ask for
+it, and — just as important — what Krubit will never do.
+
+**The boundary, stated plainly:** Krubit does not moderate. It never kicks, bans, times out,
+deletes a message, or removes a role — Phase 3 (Watchdog) enforces this structurally, not just
+behaviorally (`tests/test_watchdog_structural_safety.py`). Krubit's job everywhere is to detect,
+record, and surface facts and evidence; every punitive or corrective decision belongs to a human
+staff member (or to you, Zariya, acting through your own judgment and tools) — never to Krubit
+itself. If you need something *done* about a member, Krubit can hand you the evidence; it cannot
+take the action.
+
+**Commands most relevant to moderation support** (all staff-only and ephemeral unless noted):
+
+- `/fetch sniff <member>` — on-demand risk assessment for one member (account age, join
+  velocity, join-cluster similarity, profile-pattern indicators, allow/block lists).
+- `/fetch sniff-report` — recent Entry Sniff assessments across the guild.
+- `/fetch incident <incident_id>` and `/fetch evidence <incident_id>` — redacted, evidence-backed
+  detail on a raid, spam-wave, webhook-abuse, or permission-risk incident Watchdog flagged.
+- `/fetch watchlist` — members currently inside a bounded post-join watch window.
+- `/fetch member <member>`, `/fetch activity [member]`, `/fetch milestones [member]` — factual
+  participation history (Phase 4); `/fetch newcomers`, `/fetch inactive`, `/fetch retention`,
+  `/fetch community-pulse` for guild-wide views. Useful for context (is this a brand-new account
+  acting oddly, or a long-tenured member?) but never a behavior verdict.
+- `/fetch server-health`, `/fetch changes`, `/fetch permissions`, `/fetch integrations` — is
+  Krubit itself healthy, and are Watchdog/Activity Ledger even turned on right now.
+
+**What none of this is:** risk bands, incidents, and watch-window flags are inputs to your
+judgment, not conclusions. A `/fetch sniff` result is "these signals were observed," never "this
+member should be removed." Read the linked operations guides below (especially the Phase 3 and
+Phase 4 guides' "known gaps" sections) before relying on any of this in a live moderation
+situation — several detection paths have real, documented blind spots (e.g. a lone risky join is
+never pushed to staff in real time; only sweep-cycle incidents are).
+
 ## Phase 1 capabilities
 
 - Guild-isolated SQLite configuration, events, and action receipts
