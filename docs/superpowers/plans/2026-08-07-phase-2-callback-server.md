@@ -1458,7 +1458,7 @@ pytestmark = pytest.mark.asyncio
 
 def _settings(**overrides: object) -> Settings:
     base = dict(
-        application_id="1", bot_token="t", database_path=":memory:",
+        application_id=1, bot_token="t", database_path=Path("unused.db"),
         creator_signals_enabled=True,
         callback_public_base_url="https://example.test",
         callback_port=8080,
@@ -1872,7 +1872,7 @@ def _sign(payload: dict[str, object]) -> str:
 def _settings(**overrides: object):
     from krubit.config import Settings
     base = dict(
-        application_id="1", bot_token="t", database_path=":memory:",
+        application_id=1, bot_token="t", database_path=Path("unused.db"),
         creator_signals_enabled=True,
         callback_public_base_url="https://example.test", callback_port=8080,
         credential_encryption_key=None,
@@ -2183,7 +2183,7 @@ pytestmark = pytest.mark.asyncio
 
 def _settings(**overrides: object) -> Settings:
     base = dict(
-        application_id="1", bot_token="t", database_path=":memory:",
+        application_id=1, bot_token="t", database_path=Path("unused.db"),
         creator_signals_enabled=True,
         callback_public_base_url="https://example.test", callback_port=8080,
         credential_encryption_key="a" * 32,
@@ -2767,7 +2767,7 @@ pytestmark = pytest.mark.asyncio
 def _settings(**overrides: object):
     from krubit.config import Settings
     base = dict(
-        application_id="1", bot_token="t", database_path=":memory:",
+        application_id=1, bot_token="t", database_path=Path("unused.db"),
         creator_signals_enabled=True,
         callback_public_base_url="https://example.test", callback_port=8080,
         credential_encryption_key="a" * 32,
