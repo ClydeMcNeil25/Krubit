@@ -917,6 +917,56 @@ class ActivityAdminCommands(app_commands.Group):
         file = discord.File(io.BytesIO(payload), filename=f"krubit-export-{target.member_id}.json")
         await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
+    @app_commands.command(
+        name="exclude-channel", description="Exclude a channel from activity-ledger tracking"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def exclude_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel, reason: str
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_exclude_channel")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.exclude_channel(
+            actor=actor, channel_id=channel.id, reason=reason
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_exclude_channel",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="exclusions", description="Fetch guild-wide activity-ledger channel exclusions"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def exclusions(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_exclusions")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.exclusions(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_exclusions",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
 
 class KrubitBot(discord.Client):
     """Discord transport; community judgment remains outside this class."""

@@ -64,6 +64,7 @@ from uuid import uuid4
 from krubit.discord.content_commands import CommandResult, CommandStatus, _confirmation
 from krubit.domain.activity_ledger import (
     CohortWindow,
+    ExclusionEntry,
     JoinEvent,
     LedgerEvent,
     ModerationReceiptEvent,
@@ -670,4 +671,60 @@ class ActivityCommandService:
                 detail={"self_view": self_view, "event_count": len(package.events)},
             ),
             payload,
+        )
+
+    # -- exclude-channel: staff-only, records the real invoking staff member ------
+
+    async def exclude_channel(
+        self, *, actor: ActivityActorContext, channel_id: int, reason: str
+    ) -> CommandResult:
+        """Exclude `channel_id` from activity-ledger ingestion.
+
+        Records `excluded_by=actor.member_id` -- the real invoking staff
+        member's Discord ID. This is the first real caller of
+        `store.save_exclusion_entry`: the only prior caller,
+        `ActivityRuntime`'s default-exclusion seeding, always writes the bot's
+        own application ID, never an actual staff member.
+        """
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        entry = ExclusionEntry(
+            guild_id=actor.guild_id,
+            channel_id=channel_id,
+            excluded_by=actor.member_id,
+            reason=reason,
+            excluded_at=now,
+        )
+        saved = await self._store.save_exclusion_entry(entry)
+        card = Card(
+            kind="fetched",
+            title="Fetched: Channel Excluded",
+            description=f"<#{saved.channel_id}> excluded: {saved.reason}",
+            fields=(CardField("Excluded By", f"<@{saved.excluded_by}>", True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"channel_id": channel_id}
+        )
+
+    # -- exclusions: staff-only, read-only companion to exclude-channel -----------
+
+    async def exclusions(self, *, actor: ActivityActorContext) -> CommandResult:
+        if not actor.is_staff:
+            return _denied()
+        entries = await self._store.list_exclusion_entries(actor.guild_id)
+        lines = [
+            f"<#{e.channel_id}> — {e.reason} (excluded by <@{e.excluded_by}> "
+            f"at {e.excluded_at.isoformat()})"
+            for e in entries[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(entries))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Channel Exclusions",
+            description=description,
+            fields=(CardField("Count", str(len(entries)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(entries)}
         )

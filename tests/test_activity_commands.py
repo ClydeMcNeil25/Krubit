@@ -657,3 +657,50 @@ async def test_export_member_json_never_includes_another_members_data(
     decoded = json.loads(payload)
     serialized = json.dumps(decoded)
     assert str(other_target_id) not in serialized
+
+
+# ---------------------------------------------------------------------------
+# exclude-channel / exclusions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exclude_channel_denies_non_staff(commands: ActivityCommandService) -> None:
+    result = await commands.exclude_channel(
+        actor=regular_member(), channel_id=555, reason="mod-only"
+    )
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_exclude_channel_records_real_staff_member_not_bot_id(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    result = await commands.exclude_channel(
+        actor=staff_member(), channel_id=555, reason="mod-only"
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    entries = await store.list_exclusion_entries(GUILD_ID)
+    assert entries[0].excluded_by == STAFF_ID
+
+
+@pytest.mark.asyncio
+async def test_exclusions_denies_non_staff(commands: ActivityCommandService) -> None:
+    result = await commands.exclusions(actor=regular_member())
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_exclusions_renders_empty_and_populated_state(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    empty_result = await commands.exclusions(actor=staff_member())
+    assert empty_result.status is CommandStatus.SUCCEEDED
+    assert empty_result.card is not None
+    assert "none" in empty_result.card.description.lower()
+
+    await commands.exclude_channel(actor=staff_member(), channel_id=555, reason="mod-only")
+    populated = await commands.exclusions(actor=staff_member())
+    assert populated.card is not None
+    assert "555" in populated.card.description
+    assert "mod-only" in populated.card.description
