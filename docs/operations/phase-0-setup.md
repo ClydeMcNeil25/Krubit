@@ -71,14 +71,14 @@ Then start the gateway:
 uv run python -m krubit run
 ```
 
-Krubit globally synchronizes `/fetch status` and `/fetch test-card` during startup. Discord may
-take time to propagate global application-command changes. `/fetch test-card` is both declared
-with Manage Server defaults and checked again by the application service.
+Krubit globally synchronizes `/fetch admin status` and `/fetch admin test-card` during startup.
+Discord may take time to propagate global application-command changes. `/fetch admin test-card`
+is both declared with Manage Server defaults and checked again by the application service.
 
 ## Smoke checks
 
-1. `/fetch status` returns an ephemeral functional card scoped to the current server.
-2. A member without Manage Server cannot run `/fetch test-card` successfully.
+1. `/fetch admin status` returns an ephemeral functional card scoped to the current server.
+2. A member without Manage Server cannot run `/fetch admin test-card` successfully.
 3. An administrator receives the Phase 0 test card.
 4. Restarting Krubit does not create duplicate records for the same submitted event ID.
 5. Disabling a guild with `enable-guild <guild-id> --disable` makes ingestion fail closed.

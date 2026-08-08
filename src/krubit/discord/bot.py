@@ -177,7 +177,7 @@ class FetchCommands(app_commands.Group):
         user = interaction.user
         try:
             await self._service.authorize_member(interaction.guild_id, action=action)
-        except GuildDisabledError as exc:
+        except (AuthorizationError, GuildDisabledError) as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return None
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -229,8 +229,12 @@ class FetchCommands(app_commands.Group):
         if context is None:
             return
         guild, actor_id = context
+        user = interaction.user
+        is_admin = isinstance(user, discord.Member) and (
+            user.guild_permissions.manage_guild or user.guild_permissions.administrator
+        )
         actor = ActorContext(
-            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+            guild_id=guild.id, member_id=actor_id, is_admin=is_admin, has_creator_role=False
         )
         result = await self._content_commands.latest(actor=actor)
         assert result.card is not None
@@ -250,8 +254,12 @@ class FetchCommands(app_commands.Group):
         if context is None:
             return
         guild, actor_id = context
+        user = interaction.user
+        is_admin = isinstance(user, discord.Member) and (
+            user.guild_permissions.manage_guild or user.guild_permissions.administrator
+        )
         actor = ActorContext(
-            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+            guild_id=guild.id, member_id=actor_id, is_admin=is_admin, has_creator_role=False
         )
         result = await self._content_commands.schedule_status(actor=actor)
         assert result.card is not None
@@ -264,25 +272,9 @@ class FetchCommands(app_commands.Group):
             detail={"count": int(count) if isinstance(count, (int, float)) else 0},
         )
 
-    # -- Phase 3 Watchdog: staff-only evidentiary reads --------------------------
+    # -- Phase 4 Activity Ledger: staff-or-self reads -----------------------------
     #
-    # Every one of these five delegates its actual authority check and query to
-    # `WatchdogCommandService`, but `self.authorize(...)` below is still the first
-    # thing each handler calls -- matching every other staff-only `/fetch` command
-    # in this class (`server_health`, `permissions`, `integrations`, ...) and
-    # `live_commands.py`/`content_commands.py`'s own established "denied before any
-    # query or render" convention. A member who fails `self.authorize` never reaches
-    # `WatchdogCommandService` at all; a member who passes it is still re-checked by
-    # `WatchdogCommandService` itself (`actor.is_staff`), since that service is also
-    # unit-tested directly, independent of this Discord-layer gate.
-
-    # -- Phase 4 Activity Ledger: staff-only and staff-or-self reads -------------
-    #
-    # `member`, `newcomers`, `inactive`, `retention`, and `community_pulse` are
-    # staff-only, exactly like the five Watchdog commands immediately above --
-    # `self.authorize(...)` denies a non-staff caller before this handler ever
-    # constructs an `ActivityActorContext` or touches storage. `activity` and
-    # `milestones` additionally accept a self-view: they deliberately do NOT use
+    # `activity` and `milestones` accept a self-view: they deliberately do NOT use
     # `self.authorize` (which unconditionally requires Manage Guild), matching
     # `content_commands.py`'s `_actor_context` precedent for staff-or-self
     # authority instead. The Discord-layer `member` parameter defaults to the

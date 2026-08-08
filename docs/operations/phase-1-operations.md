@@ -51,19 +51,19 @@ Never delete `data/krubit.db`, its WAL, or its SHM file during a migration or ro
 
 Run these commands in Krucial Town as a member with Manage Guild:
 
-- `/fetch status`
-- `/fetch test-card`
-- `/fetch server-health`
-- `/fetch changes`
-- `/fetch permissions`
-- `/fetch integrations`
+- `/fetch admin status`
+- `/fetch admin test-card`
+- `/fetch admin server-health`
+- `/fetch admin changes`
+- `/fetch admin permissions`
+- `/fetch admin integrations`
 - `/fetch backup status`
 - `/fetch backup create`
 - `/fetch backup preview`
 
 All responses are ephemeral. Restore preview may report additions, removals, or modifications, but it must make no Discord change. A successful command creates one action receipt; inventory collection may additionally create a new snapshot version when configuration changed.
 
-All `/fetch` commands, including `/fetch status` and `/fetch test-card`, require Manage Server authority in Phase 1.
+All `/fetch` commands, including `/fetch admin status` and `/fetch admin test-card`, require Manage Server authority in Phase 1.
 
 ## Zariya comparison
 
