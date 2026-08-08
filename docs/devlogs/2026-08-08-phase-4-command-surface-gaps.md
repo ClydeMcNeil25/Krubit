@@ -1,3 +1,13 @@
+> **Superseded, 2026-08-08:** The `ActivityAdminCommands` subgroup and its
+> `/fetch activity-admin <name>` paths described below no longer exist. A
+> same-day follow-up ([`/fetch` command reorg
+> devlog](2026-08-08-fetch-command-reorg.md)) retired this subgroup entirely
+> and redistributed its six commands into a new `/fetch admin` group
+> alongside nine other general-operational commands, resolving the
+> "needs explicit owner sign-off" and "no cheap next step" concerns raised
+> below. This devlog is kept as the historical record of the original
+> decision and the blocker that caused it.
+
 # Krubit Development Log: Phase 4 Command Surface Gaps
 
 **Date:** August 8, 2026
