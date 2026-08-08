@@ -381,52 +381,6 @@ class FetchCommands(app_commands.Group):
         file = discord.File(io.BytesIO(payload), filename=f"krubit-export-{target.member_id}.json")
         await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
-    @app_commands.command(
-        name="retention", description="Fetch guild-wide cohort retention (7-day and 30-day)"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def retention(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_retention")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.retention(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_retention",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="community-pulse", description="Fetch a guild-wide factual activity summary"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def community_pulse(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_community_pulse")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.community_pulse(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_community_pulse",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
 
 class BackupCommands(app_commands.Group):
     def __init__(self, parent: FetchCommands) -> None:
@@ -864,6 +818,52 @@ class AdminCommands(app_commands.Group):
         await self._parent.finish(
             interaction,
             action="fetch_activity_admin_exclusions",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="retention", description="Fetch guild-wide cohort retention (7-day and 30-day)"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def retention(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_retention")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.retention(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_retention",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="community-pulse", description="Fetch a guild-wide factual activity summary"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def community_pulse(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_community_pulse")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.community_pulse(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_community_pulse",
             actor_id=actor_id,
             embed=embed,
             detail=_receipt_detail(result.detail),

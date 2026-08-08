@@ -12,7 +12,7 @@ from discord import app_commands
 import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
-from krubit.discord.bot import FetchCommands, KrubitBot
+from krubit.discord.bot import AdminCommands, FetchCommands, KrubitBot
 from krubit.discord.content_commands import NotificationCommands
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
@@ -95,8 +95,6 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "sniff",
             "activity",
             "milestones",
-            "retention",
-            "community-pulse",
             "admin",
             "member-export",
         }
@@ -130,6 +128,8 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "member-delete",
             "exclude-channel",
             "exclusions",
+            "retention",
+            "community-pulse",
         }
         backup = cast(
             app_commands.Group,
@@ -166,38 +166,22 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
 def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
     tmp_path: Path,
 ) -> None:
-    """Structural completion check for the `/fetch` command-tree reorg (Tasks 1-3).
+    """Structural completion check for the `/fetch` command-tree reorg (Tasks 1-3
+    plus the Fix Round 1 follow-up that resolved the `retention`/
+    `community-pulse` placement gap).
 
-    NOTE ON DEVIATION FROM THE TASK 3 BRIEF: the brief's Step 5 asks for this
-    test to assert exactly 9 direct children --
-    `{"sniff", "admin", "backup", "live", "creator", "notifications",
-    "activity", "milestones", "member-export"}` -- with `retention` and
-    `community-pulse` folded into `admin`, while `latest`/`schedule` (this
-    task's own subject) remain flat. Those two requirements are mutually
-    exclusive with the actual code Tasks 1-2 left behind: `retention` and
-    `community_pulse` are still `@app_commands.command` methods declared
-    directly on `FetchCommands` (`src/krubit/discord/bot.py`, ahead of
-    `BackupCommands` at line 416), never moved into `AdminCommands`. Task 2's
-    self-review claims this was handled; it was not, and Task 3's brief gives
-    no interface or instructions for moving `retention`/`community_pulse`
-    into `admin` here. Rather than silently perform that unscoped move (or
-    silently contradict the brief by leaving `latest`/`schedule` out of the
-    flat set), this test asserts the actual, verified-correct structure and
-    documents the gap for a follow-up task. See task-3-report.md for the full
-    writeup reported to the orchestrating agent.
-
-    The real completion claim this test *does* verify: `FetchCommands` has
-    exactly 7 flat direct commands (`latest`, `schedule`, `activity`,
-    `milestones`, `member-export`, `retention`, `community-pulse`) plus the 6
-    sub-groups Tasks 1-2 consolidated everything else into (`sniff`, `admin`,
-    `backup`, `live`, `creator`, `notifications`) -- 13 total, matching
-    `test_bot_registers_phase_one_fetch_commands` above.
+    `retention` and `community-pulse` are folded into `/fetch admin`, exactly
+    like the other 14 staff-facing commands consolidated there in Task 2.
+    `FetchCommands` ends at 11 direct children: the 6 sub-groups (`sniff`,
+    `admin`, `backup`, `live`, `creator`, `notifications`) plus 5 flat
+    commands (`activity`, `milestones`, `member-export`, `latest`,
+    `schedule`). `AdminCommands` grows from 14 to 16 children.
     """
     store = asyncio.run(SQLiteStore.open(tmp_path / "krubit.db"))
     try:
         fetch_commands = FetchCommands(FoundationService(store))
 
-        assert len(fetch_commands.commands) == 13
+        assert len(fetch_commands.commands) == 11
         assert {command.name for command in fetch_commands.commands} == {
             "sniff",
             "admin",
@@ -210,6 +194,25 @@ def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
             "member-export",
             "latest",
             "schedule",
+        }
+
+        admin_commands = AdminCommands(fetch_commands)
+        assert len(admin_commands.commands) == 16
+        assert {command.name for command in admin_commands.commands} == {
+            "status",
+            "test-card",
+            "server-health",
+            "changes",
+            "permissions",
+            "integrations",
+            "member",
+            "newcomers",
+            "inactive",
+            "returning",
+            "recognition-candidates",
+            "member-delete",
+            "exclude-channel",
+            "exclusions",
             "retention",
             "community-pulse",
         }
