@@ -110,6 +110,7 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "milestones",
             "retention",
             "community-pulse",
+            "activity-admin",
         }
         backup = cast(
             app_commands.Group,

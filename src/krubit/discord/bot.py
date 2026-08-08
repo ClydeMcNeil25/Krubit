@@ -128,6 +128,7 @@ class FetchCommands(app_commands.Group):
             else _DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS
         )
         self.add_command(BackupCommands(self))
+        self.add_command(ActivityAdminCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
         self.add_command(NotificationCommands(self, self._content_commands))
@@ -798,6 +799,68 @@ class BackupCommands(app_commands.Group):
             actor_id=actor_id,
             embed=render_diff_card(diff, title="Fetched: Restore Preview"),
             detail={"change_count": len(diff.items), "mutated": False},
+        )
+
+
+class ActivityAdminCommands(app_commands.Group):
+    """`/fetch activity-admin` -- Phase 4 activity-ledger maintenance commands
+    (returning members, recognition candidates, member deletion/export,
+    channel-exclusion configuration) that don't fit as flat `/fetch <name>`
+    commands due to Discord's 25-child-per-group cap on `FetchCommands`
+    itself."""
+
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(
+            name="activity-admin", description="Activity-ledger maintenance commands"
+        )
+        self._parent = parent
+
+    @app_commands.command(name="returning", description="Fetch members returning from inactivity")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def returning(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_returning")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.returning(
+            actor=actor, inactivity_threshold=self._parent._inactivity_threshold
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_returning",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="recognition-candidates", description="Fetch a factual recognition shortlist"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def recognition_candidates(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(
+            interaction, "fetch_activity_admin_recognition_candidates"
+        )
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.recognition_candidates(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_recognition_candidates",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
         )
 
 
