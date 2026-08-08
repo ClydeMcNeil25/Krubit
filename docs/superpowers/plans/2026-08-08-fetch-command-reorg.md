@@ -479,3 +479,15 @@ git commit -m "feat: open /fetch latest and /fetch schedule to all guild members
   `tuple[discord.Guild, int]` on success), so `latest`/`schedule`'s
   existing `if context is None: return` handling needs no changes beyond
   the one line swapping which method is called.
+
+## Addendum: `retention`/`community-pulse` (found during Task 3)
+
+The original plan never resolved these two -- the design spec's own
+conversation history called them "borderline, undecided," and the plan's
+command mapping tables never listed them at all. Task 3 correctly caught
+this gap rather than guessing. **Resolution, confirmed with the user:** fold
+both into `/fetch admin`, exactly like the other 14 staff-facing commands --
+`AdminCommands` grows to 16 children, `FetchCommands` ends at **11** direct
+children (`sniff`, `admin`, `backup`, `live`, `creator`, `notifications`,
+`activity`, `milestones`, `member-export`, `latest`, `schedule`), not the
+originally-stated 9.
