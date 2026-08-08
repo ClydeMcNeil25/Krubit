@@ -220,6 +220,20 @@ class TikTokOAuthGrant:
             raise ValueError("access_token must not be blank")
 
 
+@dataclass(frozen=True, slots=True)
+class TikTokIdentity:
+    """The authorizing TikTok account's independently-confirmed identity.
+
+    Unlike `resolve_account`'s `handle` (which is merely echoed back from its
+    caller, never confirmed against TikTok's own data), `username` here comes
+    straight from TikTok's userinfo response — the only field this codebase can
+    use to genuinely verify which account authorized a token.
+    """
+
+    open_id: str
+    username: str | None
+
+
 def seal_oauth_grant(vault: CredentialVault, grant: TikTokOAuthGrant) -> str:
     """Seal an OAuth grant for storage; the caller never persists `grant` itself."""
     payload: dict[str, JSONValue] = {"access_token": grant.access_token}
@@ -513,6 +527,20 @@ class TikTokConnector:
             display_name=(
                 display_name if isinstance(display_name, str) and display_name.strip() else None
             ),
+        )
+
+    async def fetch_authorized_identity(self) -> TikTokIdentity:
+        data = await self._post(f"{USER_INFO_URL}?fields=open_id,username", {})
+        user = _mapping(data.get("user"))
+        if user is None:
+            raise self._fail(ConnectorFailure.invalid_response())
+        open_id = user.get("open_id")
+        if not isinstance(open_id, str) or not open_id:
+            raise self._fail(ConnectorFailure.invalid_response())
+        username = user.get("username")
+        return TikTokIdentity(
+            open_id=open_id,
+            username=username if isinstance(username, str) and username.strip() else None,
         )
 
     async def fetch_page(self, account: CreatorAccount, *, cursor: str | None) -> ConnectorPage:

@@ -489,3 +489,84 @@ async def test_oauth_redirect_route_exchanges_code_only_for_a_valid_state() -> N
         assert len(authorized) == 1
     finally:
         await client.close()
+
+
+# --------------------------------------------------------------------------------
+# TikTok identity resolution: independently-confirmed username
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_authorized_identity_returns_open_id_and_username() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": {"user": {"open_id": "open-123", "username": "creator_handle"}},
+                    "error": {"code": "ok", "message": "", "log_id": "log-identity-1"},
+                },
+            )
+        ]
+    )
+    connector = TikTokConnector(session, "tiktok-access-token", now=lambda: NOW)
+    identity = await connector.fetch_authorized_identity()
+    assert identity.open_id == "open-123"
+    assert identity.username == "creator_handle"
+
+
+@pytest.mark.asyncio
+async def test_fetch_authorized_identity_raises_on_missing_open_id() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": {"user": {"username": "creator_handle"}},
+                    "error": {"code": "ok", "message": "", "log_id": "log-identity-2"},
+                },
+            )
+        ]
+    )
+    connector = TikTokConnector(session, "tiktok-access-token", now=lambda: NOW)
+    with pytest.raises(TikTokConnectorError) as excinfo:
+        await connector.fetch_authorized_identity()
+    assert excinfo.value.failure.kind is ConnectorFailureKind.INVALID_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_fetch_authorized_identity_handles_missing_username() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": {"user": {"open_id": "open-123"}},
+                    "error": {"code": "ok", "message": "", "log_id": "log-identity-3"},
+                },
+            )
+        ]
+    )
+    connector = TikTokConnector(session, "tiktok-access-token", now=lambda: NOW)
+    identity = await connector.fetch_authorized_identity()
+    assert identity.open_id == "open-123"
+    assert identity.username is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_authorized_identity_nullifies_blank_username() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": {"user": {"open_id": "open-123", "username": "   "}},
+                    "error": {"code": "ok", "message": "", "log_id": "log-identity-4"},
+                },
+            )
+        ]
+    )
+    connector = TikTokConnector(session, "tiktok-access-token", now=lambda: NOW)
+    identity = await connector.fetch_authorized_identity()
+    assert identity.open_id == "open-123"
+    assert identity.username is None
