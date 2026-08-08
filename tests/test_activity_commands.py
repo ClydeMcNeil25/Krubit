@@ -522,3 +522,62 @@ async def test_recognition_candidates_renders_reasons(
     assert result.status is CommandStatus.SUCCEEDED
     assert result.card is not None
     assert f"<@{TARGET_ID}>" in result.card.description
+
+
+# ---------------------------------------------------------------------------
+# member-delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_member_denies_non_staff(
+    commands: ActivityCommandService,
+) -> None:
+    result = await commands.delete_member(actor=regular_member(), target=other_member())
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_delete_member_first_call_requires_confirmation(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    await store.record_ledger_event(
+        JoinEvent(guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=5))
+    )
+    result = await commands.delete_member(actor=staff_member(), target=other_member())
+    assert result.status is CommandStatus.CONFIRMATION_REQUIRED
+    # nothing deleted yet
+    events = await store.list_ledger_events(GUILD_ID, member_id=TARGET_ID)
+    assert events != ()
+
+
+@pytest.mark.asyncio
+async def test_delete_member_confirm_true_deletes_and_returns_minimal_receipt(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    await store.record_ledger_event(
+        JoinEvent(guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=5))
+    )
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=GUILD_ID, member_id=TARGET_ID, occurred_at=NOW - timedelta(days=1),
+            channel_id=900,
+        )
+    )
+    result = await commands.delete_member(actor=staff_member(), target=other_member(), confirm=True)
+    assert result.status is CommandStatus.SUCCEEDED
+    events = await store.list_ledger_events(GUILD_ID, member_id=TARGET_ID)
+    assert events == ()
+    assert "receipt_id" in result.detail
+    assert "table" not in str(result.detail).lower()
+    assert "row" not in str(result.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_delete_member_confirm_true_is_idempotent(
+    commands: ActivityCommandService,
+) -> None:
+    first = await commands.delete_member(actor=staff_member(), target=other_member(), confirm=True)
+    second = await commands.delete_member(actor=staff_member(), target=other_member(), confirm=True)
+    assert first.status is CommandStatus.SUCCEEDED
+    assert second.status is CommandStatus.SUCCEEDED

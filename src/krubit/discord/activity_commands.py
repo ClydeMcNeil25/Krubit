@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from krubit.discord.content_commands import CommandResult, CommandStatus
+from krubit.discord.content_commands import CommandResult, CommandStatus, _confirmation
 from krubit.domain.activity_ledger import (
     CohortWindow,
     JoinEvent,
@@ -73,6 +73,7 @@ from krubit.services.activation_retention import (
     participation_trend_fetch_window_days,
     time_to_activation,
 )
+from krubit.services.activity_privacy import delete_member as delete_member_fn
 from krubit.services.activity_views import community_pulse as _community_pulse_view
 from krubit.services.activity_views import inactive_view, newcomer_view, returning_member_view
 from krubit.services.milestones import recognition_candidates as recognition_candidates_fn
@@ -544,4 +545,57 @@ class ActivityCommandService:
         )
         return CommandResult(
             CommandStatus.SUCCEEDED, card=card, detail={"count": len(candidates)}
+        )
+
+    # -- member delete: staff-only, irreversible, two-call confirm ----------------
+
+    async def delete_member(
+        self,
+        *,
+        actor: ActivityActorContext,
+        target: ActivityActorContext,
+        confirm: bool = False,
+    ) -> CommandResult:
+        """Staff-triggered, irreversible deletion of one member's ledger data.
+
+        Per the design spec's Privacy Controls section, deletion is staff-only --
+        unlike `activity`/`milestones`, there is no self-view/self-delete path.
+        """
+        if not actor.is_staff:
+            return _denied()
+        if not confirm:
+            card = _confirmation(
+                title="Delete Member Data",
+                description=(
+                    f"Permanently delete all activity-ledger data for "
+                    f"<@{target.member_id}>? This cannot be undone."
+                ),
+                Member=f"<@{target.member_id}>",
+            )
+            return CommandResult(
+                CommandStatus.CONFIRMATION_REQUIRED,
+                card=card,
+                detail={"member_id": target.member_id},
+            )
+        now = self._now()
+        receipt = await delete_member_fn(
+            self._store,
+            target.guild_id,
+            target.member_id,
+            requested_by=actor.member_id,
+            now=now,
+        )
+        card = Card(
+            kind="fetched",
+            title="Fetched: Member Data Deleted",
+            description=f"Deleted activity-ledger data for <@{target.member_id}>.",
+            fields=(
+                CardField("Receipt ID", receipt.receipt_id, True),
+                CardField("Deleted At", receipt.created_at.isoformat(), True),
+            ),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED,
+            card=card,
+            detail={"receipt_id": receipt.receipt_id, "member_id": target.member_id},
         )

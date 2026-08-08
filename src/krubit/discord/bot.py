@@ -21,6 +21,7 @@ from krubit.discord.content_commands import (
     ContentCommandService,
     CreatorCommands,
     NotificationCommands,
+    _present_result,
 )
 from krubit.discord.content_runtime import ConnectorScheduler, ContentRuntime
 from krubit.discord.events import guild_event
@@ -861,6 +862,29 @@ class ActivityAdminCommands(app_commands.Group):
             actor_id=actor_id,
             embed=embed,
             detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="member-delete", description="Permanently delete a member's activity-ledger data"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def member_delete(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_member_delete")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._parent._activity_commands.delete_member(actor=actor, target=target)
+        await _present_result(
+            interaction,
+            result,
+            confirm=lambda: self._parent._activity_commands.delete_member(
+                actor=actor, target=target, confirm=True
+            ),
         )
 
 
