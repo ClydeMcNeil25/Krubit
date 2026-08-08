@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
@@ -21,6 +22,7 @@ from krubit.discord.content_commands import (
     ContentCommandService,
     CreatorCommands,
     NotificationCommands,
+    _present_result,
 )
 from krubit.discord.content_runtime import ConnectorScheduler, ContentRuntime
 from krubit.discord.events import guild_event
@@ -128,6 +130,8 @@ class FetchCommands(app_commands.Group):
             else _DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS
         )
         self.add_command(BackupCommands(self))
+        self.add_command(AdminCommands(self))
+        self.add_command(SniffCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
         self.add_command(NotificationCommands(self, self._content_commands))
@@ -158,6 +162,21 @@ class FetchCommands(app_commands.Group):
             await self._service.authorize_manager(
                 interaction.guild_id, user.id, can_manage, action=action
             )
+        except (AuthorizationError, GuildDisabledError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        return interaction.guild, user.id
+
+    async def authorize_public(
+        self, interaction: discord.Interaction, action: str
+    ) -> tuple[discord.Guild, int] | None:
+        if interaction.guild_id is None or interaction.guild is None:
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return None
+        user = interaction.user
+        try:
+            await self._service.authorize_member(interaction.guild_id, action=action)
         except (AuthorizationError, GuildDisabledError) as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return None
@@ -203,153 +222,19 @@ class FetchCommands(app_commands.Group):
         else:
             await interaction.edit_original_response(embed=embed, view=view)
 
-    @app_commands.command(name="status", description="Fetch Krubit's Phase 1 status")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def status(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_status")
-        if context is None:
-            return
-        guild, actor_id = context
-        snapshot = await self._service.status(guild.id, actor_id=actor_id)
-        card = Card(
-            kind="fetched",
-            title="🦴 Fetched: Krubit Status",
-            description="Krubit's Phase 1 operational status.",
-            fields=(
-                CardField("Enabled", "Yes" if snapshot.enabled else "No", inline=True),
-                CardField("Events", str(snapshot.event_count), inline=True),
-                CardField("Receipts", str(snapshot.receipt_count), inline=True),
-                CardField(
-                    "Database",
-                    "Healthy" if snapshot.database_healthy else "Unavailable",
-                    inline=True,
-                ),
-            ),
-        )
-        await interaction.edit_original_response(embed=render_card(card))
-
-    @app_commands.command(name="test-card", description="Fetch an administrator test card")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def test_card(self, interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("This command is server-only.", ephemeral=True)
-            return
-        user = interaction.user
-        can_manage_guild = isinstance(user, discord.Member) and user.guild_permissions.manage_guild
-        try:
-            card = await self._service.test_card(
-                interaction.guild_id,
-                actor_id=user.id,
-                can_manage_guild=can_manage_guild,
-            )
-        except (AuthorizationError, GuildDisabledError) as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-        await interaction.response.send_message(embed=render_card(card), ephemeral=True)
-
-    @app_commands.command(name="server-health", description="Fetch factual server health")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def server_health(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_server_health")
-        if context is None:
-            return
-        guild, actor_id = context
-        _, snapshot = await self.capture(guild)
-        report = self._health.server_health(
-            snapshot,
-            now=datetime.now(UTC),
-            database_healthy=True,
-            gateway_ready=True,
-            watchdog=self._watchdog_facts,
-            activity_ledger=self._activity_ledger_facts,
-        )
-        await self.finish(
-            interaction,
-            action="fetch_server_health",
-            actor_id=actor_id,
-            embed=render_health_card(report, title="Fetched: Server Health"),
-            detail={"snapshot_version": snapshot.version},
-        )
-
-    @app_commands.command(name="changes", description="Fetch latest configuration changes")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def changes(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_changes")
-        if context is None:
-            return
-        guild, actor_id = context
-        previous = await self._snapshots.latest(guild.id)
-        _, current = await self.capture(guild)
-        diff = (
-            compare_inventory(current.content, current.content)
-            if previous is None or previous.snapshot_id == current.snapshot_id
-            else compare_inventory(previous.content, current.content)
-        )
-        await self.finish(
-            interaction,
-            action="fetch_changes",
-            actor_id=actor_id,
-            embed=render_diff_card(diff, title="Fetched: Server Changes"),
-            detail={"change_count": len(diff.items)},
-        )
-
-    @app_commands.command(name="permissions", description="Fetch Krubit's Discord permissions")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def permissions(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_permissions")
-        if context is None:
-            return
-        guild, actor_id = context
-        _, snapshot = await self.capture(guild)
-        report = self._health.permission_health(snapshot)
-        await self.finish(
-            interaction,
-            action="fetch_permissions",
-            actor_id=actor_id,
-            embed=render_health_card(report, title="Fetched: Permissions"),
-            detail={"finding_count": len(report.findings)},
-        )
-
-    @app_commands.command(name="integrations", description="Fetch integration visibility")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def integrations(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_integrations")
-        if context is None:
-            return
-        guild, actor_id = context
-        _, snapshot = await self.capture(guild)
-        connector_authorizations = await self._service.store.list_connector_authorization_status(
-            guild.id
-        )
-        report = self._health.integration_health(
-            snapshot,
-            watchdog=self._watchdog_facts,
-            activity_ledger=self._activity_ledger_facts,
-            connector_authorizations=connector_authorizations,
-        )
-        await self.finish(
-            interaction,
-            action="fetch_integrations",
-            actor_id=actor_id,
-            embed=render_health_card(report, title="Fetched: Integrations"),
-            detail={"finding_count": len(report.findings)},
-        )
-
     @app_commands.command(name="latest", description="Fetch the latest observed creator content")
     @app_commands.guild_only()
     async def latest(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_latest")
+        context = await self.authorize_public(interaction, "fetch_latest")
         if context is None:
             return
         guild, actor_id = context
+        user = interaction.user
+        is_admin = isinstance(user, discord.Member) and (
+            user.guild_permissions.manage_guild or user.guild_permissions.administrator
+        )
         actor = ActorContext(
-            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+            guild_id=guild.id, member_id=actor_id, is_admin=is_admin, has_creator_role=False
         )
         result = await self._content_commands.latest(actor=actor)
         assert result.card is not None
@@ -365,12 +250,16 @@ class FetchCommands(app_commands.Group):
     @app_commands.command(name="schedule", description="Fetch Scheduled Event status")
     @app_commands.guild_only()
     async def schedule(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_schedule")
+        context = await self.authorize_public(interaction, "fetch_schedule")
         if context is None:
             return
         guild, actor_id = context
+        user = interaction.user
+        is_admin = isinstance(user, discord.Member) and (
+            user.guild_permissions.manage_guild or user.guild_permissions.administrator
+        )
         actor = ActorContext(
-            guild_id=guild.id, member_id=actor_id, is_admin=True, has_creator_role=False
+            guild_id=guild.id, member_id=actor_id, is_admin=is_admin, has_creator_role=False
         )
         result = await self._content_commands.schedule_status(actor=actor)
         assert result.card is not None
@@ -383,142 +272,9 @@ class FetchCommands(app_commands.Group):
             detail={"count": int(count) if isinstance(count, (int, float)) else 0},
         )
 
-    # -- Phase 3 Watchdog: staff-only evidentiary reads --------------------------
+    # -- Phase 4 Activity Ledger: staff-or-self reads -----------------------------
     #
-    # Every one of these five delegates its actual authority check and query to
-    # `WatchdogCommandService`, but `self.authorize(...)` below is still the first
-    # thing each handler calls -- matching every other staff-only `/fetch` command
-    # in this class (`server_health`, `permissions`, `integrations`, ...) and
-    # `live_commands.py`/`content_commands.py`'s own established "denied before any
-    # query or render" convention. A member who fails `self.authorize` never reaches
-    # `WatchdogCommandService` at all; a member who passes it is still re-checked by
-    # `WatchdogCommandService` itself (`actor.is_staff`), since that service is also
-    # unit-tested directly, independent of this Discord-layer gate.
-
-    @app_commands.command(
-        name="sniff", description="Fetch a member's current or most recent Entry Sniff assessment"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def sniff(self, interaction: discord.Interaction, member: discord.Member) -> None:
-        context = await self.authorize(interaction, "fetch_sniff")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        target = WatchdogActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
-        result = await self._watchdog_commands.sniff(actor=actor, target=target)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_sniff",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="sniff-report",
-        description="Fetch a guild-wide Watchdog sniff report: high-band joins and open windows",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def sniff_report(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_sniff_report")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._watchdog_commands.sniff_report(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_sniff_report",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="incident", description="Fetch one Watchdog incident's full evidence packet"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def incident(self, interaction: discord.Interaction, incident_id: str) -> None:
-        context = await self.authorize(interaction, "fetch_incident")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._watchdog_commands.incident(actor=actor, incident_id=incident_id)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_incident",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="evidence", description="Fetch one Watchdog incident's raw, redacted evidence export"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def evidence(self, interaction: discord.Interaction, incident_id: str) -> None:
-        context = await self.authorize(interaction, "fetch_evidence")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._watchdog_commands.evidence(actor=actor, incident_id=incident_id)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_evidence",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="watchlist", description="Fetch this guild's open watch windows and allow/block lists"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def watchlist(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_watchlist")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._watchdog_commands.watchlist(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_watchlist",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    # -- Phase 4 Activity Ledger: staff-only and staff-or-self reads -------------
-    #
-    # `member`, `newcomers`, `inactive`, `retention`, and `community_pulse` are
-    # staff-only, exactly like the five Watchdog commands immediately above --
-    # `self.authorize(...)` denies a non-staff caller before this handler ever
-    # constructs an `ActivityActorContext` or touches storage. `activity` and
-    # `milestones` additionally accept a self-view: they deliberately do NOT use
+    # `activity` and `milestones` accept a self-view: they deliberately do NOT use
     # `self.authorize` (which unconditionally requires Manage Guild), matching
     # `content_commands.py`'s `_actor_context` precedent for staff-or-self
     # authority instead. The Discord-layer `member` parameter defaults to the
@@ -540,30 +296,6 @@ class FetchCommands(app_commands.Group):
         is_staff = user.guild_permissions.manage_guild or user.guild_permissions.administrator
         return interaction.guild, ActivityActorContext(
             guild_id=interaction.guild_id, member_id=user.id, is_staff=is_staff
-        )
-
-    @app_commands.command(name="member", description="Fetch a member's detailed activity profile")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def activity_member(
-        self, interaction: discord.Interaction, member: discord.Member
-    ) -> None:
-        context = await self.authorize(interaction, "fetch_member")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        target = ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
-        result = await self._activity_commands.member(actor=actor, target=target)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_member",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
         )
 
     @app_commands.command(
@@ -592,54 +324,6 @@ class FetchCommands(app_commands.Group):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
-        name="newcomers", description="Fetch guild-wide newcomer activation status"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def newcomers(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_newcomers")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.newcomers(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_newcomers",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="inactive", description="Fetch guild-wide inactive members"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def inactive(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_inactive")
-        if context is None:
-            return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.inactive(
-            actor=actor, inactivity_threshold=self._inactivity_threshold
-        )
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_inactive",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
         name="milestones", description="Fetch a member's milestones, or your own"
     )
     @app_commands.guild_only()
@@ -663,50 +347,31 @@ class FetchCommands(app_commands.Group):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
-        name="retention", description="Fetch guild-wide cohort retention (7-day and 30-day)"
+        name="member-export", description="Export a member's activity-ledger data, or your own"
     )
     @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def retention(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_retention")
-        if context is None:
+    async def member_export(
+        self, interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        resolved = await self._activity_actor(interaction)
+        if resolved is None:
             return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.retention(actor=actor)
+        guild, actor = resolved
+        target = (
+            ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+            if member is not None
+            else actor
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result, payload = await self._activity_commands.export_member(actor=actor, target=target)
         embed = render_card(result.card) if result.card is not None else discord.Embed(
             title=result.status.value
         )
-        await self.finish(
-            interaction,
-            action="fetch_retention",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
-
-    @app_commands.command(
-        name="community-pulse", description="Fetch a guild-wide factual activity summary"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def community_pulse(self, interaction: discord.Interaction) -> None:
-        context = await self.authorize(interaction, "fetch_community_pulse")
-        if context is None:
+        if payload is None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
-        guild, actor_id = context
-        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
-        result = await self._activity_commands.community_pulse(actor=actor)
-        embed = render_card(result.card) if result.card is not None else discord.Embed(
-            title=result.status.value
-        )
-        await self.finish(
-            interaction,
-            action="fetch_community_pulse",
-            actor_id=actor_id,
-            embed=embed,
-            detail=_receipt_detail(result.detail),
-        )
+        file = discord.File(io.BytesIO(payload), filename=f"krubit-export-{target.member_id}.json")
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
 
 class BackupCommands(app_commands.Group):
@@ -798,6 +463,535 @@ class BackupCommands(app_commands.Group):
             actor_id=actor_id,
             embed=render_diff_card(diff, title="Fetched: Restore Preview"),
             detail={"change_count": len(diff.items), "mutated": False},
+        )
+
+
+class AdminCommands(app_commands.Group):
+    """`/fetch admin` -- general-operational admin commands (status, test
+    card, server health, config changes, permissions, integrations) plus
+    Phase 4 activity-ledger maintenance commands (member profile, newcomers,
+    inactive, returning members, recognition candidates, member deletion,
+    channel-exclusion configuration), consolidated into a single admin-gated
+    group to free slots against Discord's 25-child-per-group cap on
+    `FetchCommands` itself. `member-export` is deliberately NOT here -- it is
+    staff-or-self, not admin-only, so it stays a flat `FetchCommands`
+    command."""
+
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(name="admin", description="Administrative and activity-ledger commands")
+        self._parent = parent
+
+    @app_commands.command(name="status", description="Fetch Krubit's Phase 1 status")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def status(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_status")
+        if context is None:
+            return
+        guild, actor_id = context
+        snapshot = await self._parent._service.status(guild.id, actor_id=actor_id)
+        card = Card(
+            kind="fetched",
+            title="🦴 Fetched: Krubit Status",
+            description="Krubit's Phase 1 operational status.",
+            fields=(
+                CardField("Enabled", "Yes" if snapshot.enabled else "No", inline=True),
+                CardField("Events", str(snapshot.event_count), inline=True),
+                CardField("Receipts", str(snapshot.receipt_count), inline=True),
+                CardField(
+                    "Database",
+                    "Healthy" if snapshot.database_healthy else "Unavailable",
+                    inline=True,
+                ),
+            ),
+        )
+        await interaction.edit_original_response(embed=render_card(card))
+
+    @app_commands.command(name="test-card", description="Fetch an administrator test card")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def test_card(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("This command is server-only.", ephemeral=True)
+            return
+        user = interaction.user
+        can_manage_guild = isinstance(user, discord.Member) and user.guild_permissions.manage_guild
+        try:
+            card = await self._parent._service.test_card(
+                interaction.guild_id,
+                actor_id=user.id,
+                can_manage_guild=can_manage_guild,
+            )
+        except (AuthorizationError, GuildDisabledError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(embed=render_card(card), ephemeral=True)
+
+    @app_commands.command(name="server-health", description="Fetch factual server health")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def server_health(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_server_health")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self._parent.capture(guild)
+        report = self._parent._health.server_health(
+            snapshot,
+            now=datetime.now(UTC),
+            database_healthy=True,
+            gateway_ready=True,
+            watchdog=self._parent._watchdog_facts,
+            activity_ledger=self._parent._activity_ledger_facts,
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_server_health",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Server Health"),
+            detail={"snapshot_version": snapshot.version},
+        )
+
+    @app_commands.command(name="changes", description="Fetch latest configuration changes")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def changes(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_changes")
+        if context is None:
+            return
+        guild, actor_id = context
+        previous = await self._parent.snapshots.latest(guild.id)
+        _, current = await self._parent.capture(guild)
+        diff = (
+            compare_inventory(current.content, current.content)
+            if previous is None or previous.snapshot_id == current.snapshot_id
+            else compare_inventory(previous.content, current.content)
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_changes",
+            actor_id=actor_id,
+            embed=render_diff_card(diff, title="Fetched: Server Changes"),
+            detail={"change_count": len(diff.items)},
+        )
+
+    @app_commands.command(name="permissions", description="Fetch Krubit's Discord permissions")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def permissions(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_permissions")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self._parent.capture(guild)
+        report = self._parent._health.permission_health(snapshot)
+        await self._parent.finish(
+            interaction,
+            action="fetch_permissions",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Permissions"),
+            detail={"finding_count": len(report.findings)},
+        )
+
+    @app_commands.command(name="integrations", description="Fetch integration visibility")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def integrations(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_integrations")
+        if context is None:
+            return
+        guild, actor_id = context
+        _, snapshot = await self._parent.capture(guild)
+        connector_authorizations = (
+            await self._parent._service.store.list_connector_authorization_status(guild.id)
+        )
+        report = self._parent._health.integration_health(
+            snapshot,
+            watchdog=self._parent._watchdog_facts,
+            activity_ledger=self._parent._activity_ledger_facts,
+            connector_authorizations=connector_authorizations,
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_integrations",
+            actor_id=actor_id,
+            embed=render_health_card(report, title="Fetched: Integrations"),
+            detail={"finding_count": len(report.findings)},
+        )
+
+    @app_commands.command(name="member", description="Fetch a member's detailed activity profile")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def member(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_member")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._parent._activity_commands.member(actor=actor, target=target)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_member",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="newcomers", description="Fetch guild-wide newcomer activation status"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def newcomers(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_newcomers")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.newcomers(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_newcomers",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="inactive", description="Fetch guild-wide inactive members"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def inactive(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_inactive")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.inactive(
+            actor=actor, inactivity_threshold=self._parent._inactivity_threshold
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_inactive",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(name="returning", description="Fetch members returning from inactivity")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def returning(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_returning")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.returning(
+            actor=actor, inactivity_threshold=self._parent._inactivity_threshold
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_returning",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="recognition-candidates", description="Fetch a factual recognition shortlist"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def recognition_candidates(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(
+            interaction, "fetch_activity_admin_recognition_candidates"
+        )
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.recognition_candidates(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_recognition_candidates",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="member-delete", description="Permanently delete a member's activity-ledger data"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def member_delete(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_member_delete")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._parent._activity_commands.delete_member(actor=actor, target=target)
+        await _present_result(
+            interaction,
+            result,
+            confirm=lambda: self._parent._activity_commands.delete_member(
+                actor=actor, target=target, confirm=True
+            ),
+        )
+
+    @app_commands.command(
+        name="exclude-channel", description="Exclude a channel from activity-ledger tracking"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def exclude_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        reason: app_commands.Range[str, 1, 300],
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_exclude_channel")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.exclude_channel(
+            actor=actor, channel_id=channel.id, reason=reason
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_exclude_channel",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="exclusions", description="Fetch guild-wide activity-ledger channel exclusions"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def exclusions(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_activity_admin_exclusions")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.exclusions(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_activity_admin_exclusions",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="retention", description="Fetch guild-wide cohort retention (7-day and 30-day)"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def retention(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_retention")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.retention(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_retention",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="community-pulse", description="Fetch a guild-wide factual activity summary"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def community_pulse(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_community_pulse")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._activity_commands.community_pulse(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_community_pulse",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+
+class SniffCommands(app_commands.Group):
+    """`/fetch sniff` -- Watchdog risk-assessment and incident-evidence
+    commands, consolidated from five flat `/fetch` commands to free slots
+    against Discord's 25-child-per-group cap. The member-assessment command
+    is named `member` here (not `sniff`) since a group cannot contain a
+    same-named subcommand."""
+
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(name="sniff", description="Watchdog risk assessment and incident evidence")
+        self._parent = parent
+
+    @app_commands.command(
+        name="member", description="Fetch a member's current or most recent Entry Sniff assessment"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def member(self, interaction: discord.Interaction, member: discord.Member) -> None:
+        context = await self._parent.authorize(interaction, "fetch_sniff_member")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        target = WatchdogActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+        result = await self._parent._watchdog_commands.sniff(actor=actor, target=target)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_sniff_member",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="report",
+        description="Fetch a guild-wide Watchdog sniff report: high-band joins and open windows",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def report(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_sniff_report")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._watchdog_commands.sniff_report(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_sniff_report",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="incident", description="Fetch one Watchdog incident's full evidence packet"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def incident(self, interaction: discord.Interaction, incident_id: str) -> None:
+        context = await self._parent.authorize(interaction, "fetch_sniff_incident")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._watchdog_commands.incident(
+            actor=actor, incident_id=incident_id
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_sniff_incident",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="evidence", description="Fetch one Watchdog incident's raw, redacted evidence export"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def evidence(self, interaction: discord.Interaction, incident_id: str) -> None:
+        context = await self._parent.authorize(interaction, "fetch_sniff_evidence")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._watchdog_commands.evidence(
+            actor=actor, incident_id=incident_id
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_sniff_evidence",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
+    @app_commands.command(
+        name="watchlist", description="Fetch this guild's open watch windows and allow/block lists"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def watchlist(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_sniff_watchlist")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = WatchdogActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        result = await self._parent._watchdog_commands.watchlist(actor=actor)
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_sniff_watchlist",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
         )
 
 

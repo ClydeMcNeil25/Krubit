@@ -53,14 +53,18 @@ documented default fallback when unset) before calling either method.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from krubit.discord.content_commands import CommandResult, CommandStatus
+from krubit.discord.content_commands import CommandResult, CommandStatus, _confirmation
 from krubit.domain.activity_ledger import (
     CohortWindow,
+    ExclusionEntry,
     JoinEvent,
     LedgerEvent,
     ModerationReceiptEvent,
@@ -73,8 +77,11 @@ from krubit.services.activation_retention import (
     participation_trend_fetch_window_days,
     time_to_activation,
 )
+from krubit.services.activity_privacy import delete_member as delete_member_fn
+from krubit.services.activity_privacy import export_member_data as export_member_data_fn
 from krubit.services.activity_views import community_pulse as _community_pulse_view
-from krubit.services.activity_views import inactive_view, newcomer_view
+from krubit.services.activity_views import inactive_view, newcomer_view, returning_member_view
+from krubit.services.milestones import recognition_candidates as recognition_candidates_fn
 
 if TYPE_CHECKING:
     from krubit.storage.sqlite import SQLiteStore
@@ -105,6 +112,53 @@ _RETENTION_WINDOWS: tuple[CohortWindow, ...] = (CohortWindow.SEVEN_DAY, CohortWi
 # `/fetch community-pulse`'s window. No command parameter exists for this
 # either, so a fixed 30-day window is used, matching `_ACTIVITY_TREND_WINDOW`.
 _COMMUNITY_PULSE_WINDOW = CohortWindow.THIRTY_DAY
+
+# `/fetch recognition-candidates`'s window. No command parameter exists for
+# this either, so a fixed 30-day window is used, matching
+# `_ACTIVITY_TREND_WINDOW`/`_COMMUNITY_PULSE_WINDOW`.
+_RECOGNITION_WINDOW = CohortWindow.THIRTY_DAY
+
+# Every list-rendering `/fetch` command caps its rendered entries at this many
+# lines and appends a "...and N more." summary line rather than risk exceeding
+# Discord's 4096-character embed description limit for large guilds. This is
+# new, deliberately defensive behavior -- no existing `/fetch` command guards
+# this today.
+_MAX_LIST_ENTRIES = 40
+
+# Character budget `_render_capped_lines` accumulates rendered lines up to,
+# leaving headroom under Discord's 4096-character embed description limit for
+# the "...and N more." suffix line and the rest of the embed (title/fields).
+# Per-entry length is unbounded for some callers (e.g. `exclusions`'s `reason`
+# can be up to 300 chars; a single `recognition-candidates` line can hold an
+# unbounded number of milestone reasons) -- `_MAX_LIST_ENTRIES` alone does not
+# prevent exceeding 4096 chars, so this budget is enforced in addition to it.
+_MAX_LIST_CHARS = 3900
+
+
+def _render_capped_lines(lines: list[str], total: int) -> str:
+    """Render `lines` (already capped by the caller to `_MAX_LIST_ENTRIES`
+    entries) up to `_MAX_LIST_CHARS` characters, stopping early -- and short
+    of the entry cap -- if individual lines are long enough to blow the
+    character budget first. `total` is the true total entry count (which may
+    exceed `len(lines)` if the caller already truncated to `_MAX_LIST_ENTRIES`
+    before calling this); the trailing "...and N more." summary reflects
+    every entry not rendered, whichever cap (entry count or character budget)
+    bound first.
+    """
+    if not lines:
+        return "None found."
+    rendered: list[str] = []
+    budget = _MAX_LIST_CHARS
+    for line in lines:
+        cost = len(line) + (1 if rendered else 0)  # +1 for the joining "\n"
+        if cost > budget:
+            break
+        rendered.append(line)
+        budget -= cost
+    remaining = total - len(rendered)
+    if remaining > 0:
+        rendered.append(f"...and {remaining} more.")
+    return "\n".join(rendered)
 
 
 def _trailing_window_events(
@@ -146,6 +200,20 @@ def _denied_self_or_staff() -> CommandResult:
         CommandStatus.DENIED,
         detail={"reason": "staff authority or self-view required"},
     )
+
+
+def _json_default(value: object) -> object:
+    """`json.dumps(..., default=...)` fallback for `export_member`'s payload.
+
+    `LedgerEvent`/`Milestone` fields are all JSON-primitive, `datetime`, or
+    `Enum` after `dataclasses.asdict` recursion -- `datetime` and `Enum` are
+    the only two types `json.dumps` cannot already handle natively.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class ActivityCommandService:
@@ -466,4 +534,244 @@ class ActivityCommandService:
                 "active_member_count": pulse.active_member_count,
                 "retention_pct": round(pulse.cohort.retention_rate * 100),
             },
+        )
+
+    # -- returning: staff-only guild-wide returning-member view -------------------
+
+    async def returning(
+        self, *, actor: ActivityActorContext, inactivity_threshold: timedelta
+    ) -> CommandResult:
+        """Members who had a gap exceeding `inactivity_threshold` and then
+        resumed activity, per `returning_member_view`."""
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        entries = await returning_member_view(
+            self._store, actor.guild_id, inactivity_threshold, now
+        )
+        lines = [
+            f"<@{e.member_id}> — {e.trend.active_day_count} active days, "
+            f"{e.trend.channel_diversity} channels (trailing "
+            f"{cohort_window_days(e.trend.window)} days)"
+            for e in entries[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(entries))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Returning Members",
+            description=description,
+            fields=(CardField("Count", str(len(entries)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(entries)}
+        )
+
+    # -- recognition-candidates: staff-only guild-wide recognition shortlist ------
+
+    async def recognition_candidates(self, *, actor: ActivityActorContext) -> CommandResult:
+        """A factual shortlist of members with notable, verifiable activity,
+        per `recognition_candidates_fn` -- never a numeric score."""
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        events = await self._store.list_ledger_events_for_guild(actor.guild_id)
+        candidates = recognition_candidates_fn(
+            actor.guild_id, events, _RECOGNITION_WINDOW, now
+        )
+        lines = [
+            f"<@{c.member_id}> — {', '.join(c.reasons)}"
+            for c in candidates[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(candidates))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Recognition Candidates",
+            description=description,
+            fields=(CardField("Count", str(len(candidates)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(candidates)}
+        )
+
+    # -- member delete: staff-only, irreversible, two-call confirm ----------------
+
+    async def delete_member(
+        self,
+        *,
+        actor: ActivityActorContext,
+        target: ActivityActorContext,
+        confirm: bool = False,
+    ) -> CommandResult:
+        """Staff-triggered, irreversible deletion of one member's ledger data.
+
+        Per the design spec's Privacy Controls section, deletion is staff-only --
+        unlike `activity`/`milestones`, there is no self-view/self-delete path.
+        """
+        if not actor.is_staff:
+            return _denied()
+        if actor.guild_id != target.guild_id:
+            return CommandResult(
+                CommandStatus.DENIED, detail={"reason": "cross_guild_target"}
+            )
+        if not confirm:
+            card = _confirmation(
+                title="Delete Member Data",
+                description=(
+                    f"Permanently delete all activity-ledger data for "
+                    f"<@{target.member_id}>? This cannot be undone."
+                ),
+                Member=f"<@{target.member_id}>",
+            )
+            return CommandResult(
+                CommandStatus.CONFIRMATION_REQUIRED,
+                card=card,
+                detail={"member_id": target.member_id},
+            )
+        now = self._now()
+        receipt = await delete_member_fn(
+            self._store,
+            target.guild_id,
+            target.member_id,
+            requested_by=actor.member_id,
+            now=now,
+        )
+        card = Card(
+            kind="fetched",
+            title="Fetched: Member Data Deleted",
+            description=f"Deleted activity-ledger data for <@{target.member_id}>.",
+            fields=(
+                CardField("Receipt ID", receipt.receipt_id, True),
+                CardField("Deleted At", receipt.created_at.isoformat(), True),
+            ),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED,
+            card=card,
+            detail={"receipt_id": receipt.receipt_id, "member_id": target.member_id},
+        )
+
+    # -- member-export: self-accessible for oneself, staff-only for another --
+    # member. Unlike every other command above, the payload does not fit in an
+    # embed at all, so it is returned separately as raw JSON bytes for the
+    # Discord layer to send as a file attachment.
+
+    async def export_member(
+        self, *, actor: ActivityActorContext, target: ActivityActorContext
+    ) -> tuple[CommandResult, bytes | None]:
+        """Export `target`'s own ledger events and milestones as JSON bytes.
+
+        `self_view` is computed from `target.member_id == actor.member_id`
+        here, matching `activity`/`milestones`'s re-validation discipline --
+        never trusted from a Discord-layer default. A self-view export writes
+        no audit receipt (a member reading their own data is not a
+        privacy-relevant action); a staff-on-behalf-of export writes one
+        `activity_receipts` row via `record_activity_receipt` before
+        returning, matching `delete_member`'s audit-trail precedent.
+        """
+        self_view = target.member_id == actor.member_id
+        if not self_view and not actor.is_staff:
+            return _denied_self_or_staff(), None
+        if actor.guild_id != target.guild_id:
+            return (
+                CommandResult(
+                    CommandStatus.DENIED, detail={"reason": "cross_guild_target"}
+                ),
+                None,
+            )
+        now = self._now()
+        package = await export_member_data_fn(
+            self._store, target.guild_id, target.member_id, now
+        )
+        if not self_view:
+            await self._store.record_activity_receipt(
+                guild_id=actor.guild_id,
+                receipt_id=str(uuid4()),
+                member_id=target.member_id,
+                action="member_data_exported",
+                detail={"requested_by": actor.member_id, "member_id": target.member_id},
+                created_at=now,
+            )
+        payload_dict = asdict(package)
+        # No `indent=2`: this payload is a Discord file attachment subject to
+        # Discord's attachment size limit, and the audit receipt below (for a
+        # staff-on-behalf-of export) is written before the attachment is sent
+        # -- keeping the payload compact reduces (without eliminating) the risk
+        # of a receipt claiming an export the requester never actually
+        # received because the attachment was rejected as oversized.
+        payload = json.dumps(payload_dict, default=_json_default).encode("utf-8")
+        card = Card(
+            kind="fetched",
+            title="Fetched: Member Data Export",
+            description=(
+                f"Export generated for <@{target.member_id}> "
+                f"({len(package.events)} events, {len(package.milestones)} milestones)."
+            ),
+            fields=(),
+        )
+        return (
+            CommandResult(
+                CommandStatus.SUCCEEDED,
+                card=card,
+                detail={"self_view": self_view, "event_count": len(package.events)},
+            ),
+            payload,
+        )
+
+    # -- exclude-channel: staff-only, records the real invoking staff member ------
+
+    async def exclude_channel(
+        self, *, actor: ActivityActorContext, channel_id: int, reason: str
+    ) -> CommandResult:
+        """Exclude `channel_id` from activity-ledger ingestion.
+
+        Records `excluded_by=actor.member_id` -- the real invoking staff
+        member's Discord ID. This is the first real caller of
+        `store.save_exclusion_entry`: the only prior caller,
+        `ActivityRuntime`'s default-exclusion seeding, always writes the bot's
+        own application ID, never an actual staff member.
+        """
+        if not actor.is_staff:
+            return _denied()
+        now = self._now()
+        try:
+            entry = ExclusionEntry(
+                guild_id=actor.guild_id,
+                channel_id=channel_id,
+                excluded_by=actor.member_id,
+                reason=reason,
+                excluded_at=now,
+            )
+        except ValueError as exc:
+            return CommandResult(CommandStatus.FAILED, detail={"reason": str(exc)})
+        saved = await self._store.save_exclusion_entry(entry)
+        card = Card(
+            kind="fetched",
+            title="Fetched: Channel Excluded",
+            description=f"<#{saved.channel_id}> excluded: {saved.reason}",
+            fields=(CardField("Excluded By", f"<@{saved.excluded_by}>", True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"channel_id": channel_id}
+        )
+
+    # -- exclusions: staff-only, read-only companion to exclude-channel -----------
+
+    async def exclusions(self, *, actor: ActivityActorContext) -> CommandResult:
+        if not actor.is_staff:
+            return _denied()
+        entries = await self._store.list_exclusion_entries(actor.guild_id)
+        lines = [
+            f"<#{e.channel_id}> — {e.reason} (excluded by <@{e.excluded_by}> "
+            f"at {e.excluded_at.isoformat()})"
+            for e in entries[:_MAX_LIST_ENTRIES]
+        ]
+        description = _render_capped_lines(lines, len(entries))
+        card = Card(
+            kind="fetched",
+            title="Fetched: Channel Exclusions",
+            description=description,
+            fields=(CardField("Count", str(len(entries)), True),),
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED, card=card, detail={"count": len(entries)}
         )

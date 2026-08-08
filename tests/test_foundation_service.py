@@ -126,3 +126,39 @@ async def test_phase_one_authorization_and_action_receipts_are_service_enforced(
         assert [receipt.status for receipt in receipts] == ["succeeded", "denied"]
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_authorize_member_allows_a_non_manager_in_an_enabled_guild(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    service = FoundationService(store)
+    try:
+        await service.authorize_member(111, action="fetch_latest")
+
+        receipts = await store.list_receipts(111)
+        assert receipts == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_authorize_member_rejects_a_disabled_guild_with_receipt(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    service = FoundationService(store)
+    try:
+        with pytest.raises(GuildDisabledError):
+            await service.authorize_member(111, action="fetch_latest")
+
+        receipts = await store.list_receipts(111)
+        assert len(receipts) == 1
+        assert receipts[0].status == "rejected"
+        assert receipts[0].detail == {"reason": "guild_disabled"}
+    finally:
+        await store.close()

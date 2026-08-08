@@ -12,7 +12,7 @@ from discord import app_commands
 import krubit.__main__ as cli
 from krubit.__main__ import main
 from krubit.config import Settings
-from krubit.discord.bot import FetchCommands, KrubitBot
+from krubit.discord.bot import AdminCommands, FetchCommands, KrubitBot
 from krubit.discord.content_commands import NotificationCommands
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
@@ -86,12 +86,6 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
         )
 
         assert {command.name for command in fetch.commands} == {
-            "status",
-            "test-card",
-            "server-health",
-            "changes",
-            "permissions",
-            "integrations",
             "backup",
             "live",
             "creator",
@@ -99,15 +93,41 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "latest",
             "schedule",
             "sniff",
-            "sniff-report",
+            "activity",
+            "milestones",
+            "admin",
+            "member-export",
+        }
+        sniff = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "sniff"),
+        )
+        assert {command.name for command in sniff.commands} == {
+            "member",
+            "report",
             "incident",
             "evidence",
             "watchlist",
+        }
+        admin = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "admin"),
+        )
+        assert {command.name for command in admin.commands} == {
+            "status",
+            "test-card",
+            "server-health",
+            "changes",
+            "permissions",
+            "integrations",
             "member",
-            "activity",
             "newcomers",
             "inactive",
-            "milestones",
+            "returning",
+            "recognition-candidates",
+            "member-delete",
+            "exclude-channel",
+            "exclusions",
             "retention",
             "community-pulse",
         }
@@ -141,6 +161,63 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
     finally:
         await bot.close()
         await store.close()
+
+
+def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
+    tmp_path: Path,
+) -> None:
+    """Structural completion check for the `/fetch` command-tree reorg (Tasks 1-3
+    plus the Fix Round 1 follow-up that resolved the `retention`/
+    `community-pulse` placement gap).
+
+    `retention` and `community-pulse` are folded into `/fetch admin`, exactly
+    like the other 14 staff-facing commands consolidated there in Task 2.
+    `FetchCommands` ends at 11 direct children: the 6 sub-groups (`sniff`,
+    `admin`, `backup`, `live`, `creator`, `notifications`) plus 5 flat
+    commands (`activity`, `milestones`, `member-export`, `latest`,
+    `schedule`). `AdminCommands` grows from 14 to 16 children.
+    """
+    store = asyncio.run(SQLiteStore.open(tmp_path / "krubit.db"))
+    try:
+        fetch_commands = FetchCommands(FoundationService(store))
+
+        assert len(fetch_commands.commands) == 11
+        assert {command.name for command in fetch_commands.commands} == {
+            "sniff",
+            "admin",
+            "backup",
+            "live",
+            "creator",
+            "notifications",
+            "activity",
+            "milestones",
+            "member-export",
+            "latest",
+            "schedule",
+        }
+
+        admin_commands = AdminCommands(fetch_commands)
+        assert len(admin_commands.commands) == 16
+        assert {command.name for command in admin_commands.commands} == {
+            "status",
+            "test-card",
+            "server-health",
+            "changes",
+            "permissions",
+            "integrations",
+            "member",
+            "newcomers",
+            "inactive",
+            "returning",
+            "recognition-candidates",
+            "member-delete",
+            "exclude-channel",
+            "exclusions",
+            "retention",
+            "community-pulse",
+        }
+    finally:
+        asyncio.run(store.close())
 
 
 @pytest.mark.asyncio
