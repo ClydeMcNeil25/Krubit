@@ -52,12 +52,32 @@ already established for `newcomers`/`inactive`/`activity`/`milestones`.
   since these are genuinely new code paths, not an existing convention being
   preserved.
 
+## Addendum (found during implementation): Discord's 25-child-per-group cap
+
+`FetchCommands` already has 24 direct children before this plan — Discord
+enforces a hard limit of 25 direct children per command group
+(`discord.py` raises `ValueError` at construction otherwise), so adding six
+new flat `/fetch <name>` commands would break the build.
+
+**Resolution:** all six commands nest under one new subgroup,
+`ActivityAdminCommands` (`/fetch activity-admin <name>`), added as a single
+new child of `FetchCommands` — bringing it to exactly 25/25, not over. No
+existing command's path changes. This was chosen over the alternative
+(nesting existing, already-shipped Watchdog commands into a subgroup to free
+slots) specifically because that alternative would change the invocation
+path of commands already in production use, which is a real behavioral
+change to existing functionality and not something to decide unilaterally
+without the user present — whereas assigning a nested path to
+not-yet-existing commands has no such cost. **Flagged for the user's review
+in the morning**, since it does deviate from this doc's original flat
+`/fetch <name>` command list below (kept as-is to show original intent;
+actual paths are `/fetch activity-admin <name>` per this addendum).
+
 ## Commands
 
 All are `@app_commands.default_permissions(manage_guild=True)`,
-`@app_commands.guild_only()`, under the existing `FetchCommands` group in
-`bot.py` — matching every other staff-only `/fetch` command. No new command
-namespace.
+`@app_commands.guild_only()`. Per the addendum above, actual invocation is
+`/fetch activity-admin <name>`, not the flat `/fetch <name>` shown below.
 
 1. **`/fetch returning`** — staff-only. Calls `returning_member_view` with the
    guild's configured `activity_ledger_inactivity_threshold_days` setting (the
