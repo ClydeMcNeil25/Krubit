@@ -133,6 +133,43 @@ async def test_fetch_latest_still_rejects_a_disabled_guild_regardless_of_staff_s
         assert staff.response.sent["ephemeral"] is True
         assert staff.response.deferred is None
         assert staff.edited_embed is None
+
+        member = _FakeInteraction(_FakeMember(42, can_manage_guild=False))
+        await commands.latest.callback(commands, member)  # type: ignore[arg-type]
+
+        assert member.response.sent is not None
+        assert member.response.sent["ephemeral"] is True
+        assert member.response.deferred is None
+        assert member.edited_embed is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_schedule_still_rejects_a_disabled_guild_regardless_of_staff_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    commands = FetchCommands(FoundationService(store))
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    try:
+        staff = _FakeInteraction(_FakeMember(7, can_manage_guild=True))
+        await commands.schedule.callback(commands, staff)  # type: ignore[arg-type]
+
+        assert staff.response.sent is not None
+        assert staff.response.sent["ephemeral"] is True
+        assert staff.response.deferred is None
+        assert staff.edited_embed is None
+
+        member = _FakeInteraction(_FakeMember(42, can_manage_guild=False))
+        await commands.schedule.callback(commands, member)  # type: ignore[arg-type]
+
+        assert member.response.sent is not None
+        assert member.response.sent["ephemeral"] is True
+        assert member.response.deferred is None
+        assert member.edited_embed is None
     finally:
         await store.close()
 
