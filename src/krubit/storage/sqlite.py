@@ -163,6 +163,26 @@ class OAuthAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorAuthorization:
+    guild_id: int
+    account_id: str
+    capability: str
+    secret_ref: str
+    provider_resource_id: str
+    authorization_subject_id: str
+    status: str
+    expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorAuthorizationStatus:
+    platform: str
+    capability: str
+    status: str
+    expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class MentionBudgetReceipt:
     """A guild-scoped, redacted audit record of one mention-budget outcome.
 
@@ -469,6 +489,8 @@ class SQLiteStore:
                 account_id TEXT NOT NULL,
                 capability TEXT NOT NULL,
                 secret_ref TEXT,
+                provider_resource_id TEXT,
+                authorization_subject_id TEXT,
                 status TEXT NOT NULL,
                 expires_at TEXT,
                 updated_at TEXT NOT NULL,
@@ -476,6 +498,9 @@ class SQLiteStore:
                 FOREIGN KEY (guild_id, account_id)
                     REFERENCES creator_accounts (guild_id, account_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_connector_authorizations_subject
+                ON connector_authorizations (authorization_subject_id);
 
             CREATE TABLE IF NOT EXISTS oauth_attempts (
                 state_hash TEXT NOT NULL PRIMARY KEY,
@@ -2217,6 +2242,139 @@ class SQLiteStore:
                 (consumed_cutoff, unconsumed_cutoff),
             )
             return result.rowcount
+
+    async def save_connector_authorization(
+        self,
+        *,
+        guild_id: int,
+        account_id: str,
+        capability: str,
+        secret_ref: str,
+        provider_resource_id: str,
+        authorization_subject_id: str,
+        status: str,
+        expires_at: datetime | None,
+        now: datetime,
+    ) -> None:
+        _require_guild_id(guild_id)
+        async with self._write_transaction(immediate=True):
+            await self._connection.execute(
+                """
+                INSERT INTO connector_authorizations (
+                    guild_id, account_id, capability, secret_ref,
+                    provider_resource_id, authorization_subject_id, status,
+                    expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, account_id, capability) DO UPDATE SET
+                    secret_ref = excluded.secret_ref,
+                    provider_resource_id = excluded.provider_resource_id,
+                    authorization_subject_id = excluded.authorization_subject_id,
+                    status = excluded.status,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id, account_id, capability, secret_ref,
+                    provider_resource_id, authorization_subject_id, status,
+                    expires_at.isoformat() if expires_at is not None else None,
+                    now.isoformat(),
+                ),
+            )
+
+    async def get_connector_authorization(
+        self, guild_id: int, account_id: str, capability: str
+    ) -> ConnectorAuthorization | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, account_id, capability, secret_ref,
+                   provider_resource_id, authorization_subject_id, status, expires_at
+            FROM connector_authorizations
+            WHERE guild_id = ? AND account_id = ? AND capability = ?
+            """,
+            (guild_id, account_id, capability),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_connector_authorization(row)
+
+    async def find_connector_authorizations_by_authorization_subject(
+        self, platform: str, authorization_subject_id: str
+    ) -> tuple[ConnectorAuthorization, ...]:
+        cursor = await self._connection.execute(
+            """
+            SELECT ca.guild_id, ca.account_id, ca.capability, ca.secret_ref,
+                   ca.provider_resource_id, ca.authorization_subject_id, ca.status,
+                   ca.expires_at
+            FROM connector_authorizations ca
+            JOIN creator_accounts acc
+                ON acc.guild_id = ca.guild_id AND acc.account_id = ca.account_id
+            WHERE acc.platform = ? AND ca.authorization_subject_id = ?
+            """,
+            (platform, authorization_subject_id),
+        )
+        rows = await cursor.fetchall()
+        return tuple(_row_to_connector_authorization(row) for row in rows)
+
+    async def delete_connector_authorizations(
+        self, rows: tuple[ConnectorAuthorization, ...], *, now: datetime
+    ) -> None:
+        if not rows:
+            return
+        async with self._write_transaction(immediate=True):
+            for row in rows:
+                await self._connection.execute(
+                    """
+                    DELETE FROM connector_authorizations
+                    WHERE guild_id = ? AND account_id = ? AND capability = ?
+                    """,
+                    (row.guild_id, row.account_id, row.capability),
+                )
+                await self._connection.execute(
+                    """
+                    INSERT INTO creator_registry_receipts (
+                        guild_id, receipt_id, account_id, action, actor_member_id,
+                        detail_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row.guild_id, uuid4().hex, row.account_id,
+                        "connector_deauthorized", 0,
+                        json.dumps(
+                            {"platform_capability": row.capability, "account_id": row.account_id},
+                            sort_keys=True,
+                        ),
+                        now.isoformat(),
+                    ),
+                )
+
+    async def list_connector_authorization_status(
+        self, guild_id: int
+    ) -> tuple[ConnectorAuthorizationStatus, ...]:
+        cursor = await self._connection.execute(
+            """
+            SELECT acc.platform, ca.capability, ca.status, ca.expires_at
+            FROM connector_authorizations ca
+            JOIN creator_accounts acc
+                ON acc.guild_id = ca.guild_id AND acc.account_id = ca.account_id
+            WHERE ca.guild_id = ?
+            """,
+            (guild_id,),
+        )
+        rows = await cursor.fetchall()
+        return tuple(
+            ConnectorAuthorizationStatus(
+                platform=str(row["platform"]),
+                capability=str(row["capability"]),
+                status=str(row["status"]),
+                expires_at=(
+                    datetime.fromisoformat(row["expires_at"])
+                    if row["expires_at"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        )
 
     async def get_content_cursor(self, guild_id: int, account_id: str) -> ContentCursor | None:
         _require_guild_id(guild_id)
@@ -3964,3 +4122,20 @@ class SQLiteStore:
                 "DELETE FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
                 (guild_id, member_id),
             )
+
+
+def _row_to_connector_authorization(row: aiosqlite.Row) -> ConnectorAuthorization:
+    return ConnectorAuthorization(
+        guild_id=int(row["guild_id"]),
+        account_id=str(row["account_id"]),
+        capability=str(row["capability"]),
+        secret_ref=str(row["secret_ref"]),
+        provider_resource_id=str(row["provider_resource_id"]),
+        authorization_subject_id=str(row["authorization_subject_id"]),
+        status=str(row["status"]),
+        expires_at=(
+            datetime.fromisoformat(row["expires_at"])
+            if row["expires_at"] is not None
+            else None
+        ),
+    )
