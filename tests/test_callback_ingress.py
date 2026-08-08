@@ -90,7 +90,7 @@ def test_callback_server_rejects_non_https_public_base_url() -> None:
 
 def test_callback_server_rejects_out_of_range_port() -> None:
     with pytest.raises(CallbackServerError, match="port"):
-        CallbackServer(public_base_url="https://callbacks.example.com", port=0)
+        CallbackServer(public_base_url="https://callbacks.example.com", port=65536)
 
 
 def test_callback_server_disabled_without_base_url_and_port() -> None:
@@ -107,3 +107,41 @@ async def test_callback_server_start_is_a_no_op_when_not_fully_configured() -> N
     await server.start()
     assert server.enabled is False
     await server.close()
+
+
+async def test_callback_server_defaults_to_loopback_bind_host() -> None:
+    server = CallbackServer(public_base_url="https://example.test", port=0)
+    assert server._bind_host == "127.0.0.1"
+
+
+async def test_callback_server_accepts_explicit_bind_host() -> None:
+    server = CallbackServer(public_base_url="https://example.test", port=0, bind_host="0.0.0.0")
+    assert server._bind_host == "0.0.0.0"
+
+
+async def test_callback_server_second_start_is_a_noop() -> None:
+    server = CallbackServer(public_base_url="https://example.test", port=0)
+    await server.start()
+    runner_after_first_start = server._runner
+    await server.start()
+    assert server._runner is runner_after_first_start
+    await server.close()
+
+
+async def test_callback_server_access_log_is_silent_for_query_string_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def handle(request: web.Request) -> web.Response:
+        return web.Response(status=200)
+
+    server = CallbackServer(
+        public_base_url="https://example.test",
+        port=0,
+        routes=(CallbackRoute(path="/cb", method="GET", handler=handle),),
+    )
+    app = server.build_app()
+    async with TestServer(app) as test_server, TestClient(test_server) as client:
+        with caplog.at_level(logging.INFO, logger="aiohttp.access"):
+            await client.get("/cb?code=super-secret-code&state=super-secret-state")
+    access_records = [r for r in caplog.records if r.name == "aiohttp.access"]
+    assert access_records == []

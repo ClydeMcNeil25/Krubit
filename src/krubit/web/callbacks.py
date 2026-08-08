@@ -109,14 +109,16 @@ class CallbackServer:
         public_base_url: str | None,
         port: int | None,
         routes: tuple[CallbackRoute, ...] = (),
+        bind_host: str = "127.0.0.1",
     ) -> None:
         if public_base_url is not None and not public_base_url.startswith("https://"):
             raise CallbackServerError("callback public base URL must use https")
-        if port is not None and not (_MIN_PORT <= port <= _MAX_PORT):
+        if port is not None and port != 0 and not (_MIN_PORT <= port <= _MAX_PORT):
             raise CallbackServerError(f"callback port must be between {_MIN_PORT} and {_MAX_PORT}")
         self._public_base_url = public_base_url
         self._port = port
         self._routes = routes
+        self._bind_host = bind_host
         self._runner: web.AppRunner | None = None
 
     @property
@@ -126,6 +128,10 @@ class CallbackServer:
 
     def build_app(self) -> web.Application:
         """Build the aiohttp application, independent of whether it is ever bound."""
+        # Disable aiohttp's default access logger to prevent secrets in query strings
+        # from being logged (e.g., OAuth code/state parameters).
+        logging.getLogger("aiohttp.access").disabled = True
+
         app = web.Application(
             client_max_size=_MAX_BODY_BYTES, middlewares=[_redacted_errors_middleware]
         )
@@ -140,9 +146,9 @@ class CallbackServer:
         if not self.enabled or self._runner is not None:
             return
         app = self.build_app()
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self._port)
+        site = web.TCPSite(runner, self._bind_host, self._port)
         await site.start()
         self._runner = runner
 
