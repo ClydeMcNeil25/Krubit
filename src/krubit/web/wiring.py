@@ -13,6 +13,7 @@ Meta's deauthorization/data-deletion routes require only `meta_app_secret`
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from krubit.config import Settings
@@ -73,7 +74,7 @@ def _build_tiktok_authorize_route(
 ) -> CallbackRoute:
     redirect_uri = f"{settings.callback_public_base_url}/callbacks/tiktok/authorize"
 
-    async def handle_redirect(query: object) -> str:
+    async def handle_redirect(query: Mapping[str, str]) -> str:
         code = query.get("code")
         state = query.get("state")
         if not code or not state:
@@ -131,7 +132,7 @@ def _build_meta_authorize_route(
 ) -> CallbackRoute:
     redirect_uri = f"{settings.callback_public_base_url}/callbacks/meta/authorize"
 
-    async def handle_redirect(query: object) -> str:
+    async def handle_redirect(query: Mapping[str, str]) -> str:
         code = query.get("code")
         state = query.get("state")
         if not code or not state:

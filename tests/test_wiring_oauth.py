@@ -135,6 +135,84 @@ async def test_tiktok_authorize_route_rejects_reused_state(tmp_path, monkeypatch
     await store.close()
 
 
+async def test_meta_authorize_route_instagram_end_to_end(tmp_path, monkeypatch):
+    store = await _store(tmp_path)
+    vault = CredentialVault.from_env_key("a" * 32)
+
+    from krubit.domain.creator_signals import CreatorAccount, Platform
+    # Mirrors test_tiktok_authorize_route_rejects_reused_state: the handler calls
+    # datetime.now(UTC) internally, so the attempt must be issued relative to the
+    # real wall clock rather than a hardcoded past timestamp.
+    now = datetime.now(UTC)
+    await store.save_creator_account(
+        CreatorAccount(
+            guild_id=1, account_id="instagram:acct-1", owner_member_id=2,
+            platform=Platform.INSTAGRAM, handle="creator_handle",
+            canonical_url="https://instagram.com/creator_handle",
+            external_id="creator_handle", paused=True, created_at=now, updated_at=now,
+        )
+    )
+    token = await store.issue_oauth_attempt(
+        guild_id=1, member_id=2, account_id="instagram:acct-1", platform="instagram",
+        capability="account",
+        redirect_uri="https://example.test/callbacks/meta/authorize",
+        now=now, ttl=timedelta(minutes=10),
+    )
+
+    async def fake_exchange(*args: object, **kwargs: object) -> object:
+        from krubit.integrations.meta import MetaOAuthGrant
+        return MetaOAuthGrant(access_token="tok", refresh_token=None, expires_at=None)
+
+    monkeypatch.setattr(
+        "krubit.integrations.meta.exchange_authorization_code", fake_exchange
+    )
+
+    async def fake_resolve_account(self: object, recognized: object) -> object:
+        from krubit.integrations.base import ConnectorAccount
+        return ConnectorAccount(
+            platform=Platform.INSTAGRAM,
+            external_id="ig-external-id",
+            handle="creator_handle",
+            canonical_url="https://instagram.com/creator_handle",
+        )
+
+    monkeypatch.setattr(
+        "krubit.integrations.meta.InstagramConnector.resolve_account",
+        fake_resolve_account,
+    )
+
+    async def fake_fetch_authorizing_user_id(*args: object, **kwargs: object) -> str:
+        return "authorizing-user-id"
+
+    monkeypatch.setattr(
+        "krubit.integrations.meta.fetch_authorizing_user_id",
+        fake_fetch_authorizing_user_id,
+    )
+
+    routes = build_callback_routes(
+        _settings(meta_app_id="app-id", meta_app_secret="app-secret"),
+        store, vault, object(),
+    )
+    server = CallbackServer(
+        public_base_url="https://example.test", port=0, routes=routes
+    )
+    app = server.build_app()
+    async with TestServer(app) as test_server, TestClient(test_server) as client:
+        response = await client.get(
+            "/callbacks/meta/authorize", params={"code": "authcode", "state": token}
+        )
+        assert response.status == 200
+        body = await response.text()
+        assert "Authorization complete" in body
+
+    saved = await store.get_connector_authorization(1, "instagram:acct-1", "account")
+    assert saved is not None
+    assert saved.provider_resource_id == "ig-external-id"
+    assert saved.authorization_subject_id == "authorizing-user-id"
+    assert saved.provider_resource_id != saved.authorization_subject_id
+    await store.close()
+
+
 async def test_authorize_route_never_redirects_regardless_of_query(tmp_path):
     store = await _store(tmp_path)
     vault = CredentialVault.from_env_key("a" * 32)
