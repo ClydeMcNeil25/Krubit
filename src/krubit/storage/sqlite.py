@@ -19,6 +19,7 @@ import aiosqlite
 from krubit.domain.activity_ledger import (
     ExclusionEntry,
     LedgerEvent,
+    MEANINGFUL_EVENT_KINDS,
     Milestone,
     RetentionPolicy,
 )
@@ -85,6 +86,11 @@ def _json_object(value: object) -> dict[str, JSONValue]:
 def _require_guild_id(guild_id: int) -> None:
     if guild_id <= 0:
         raise ValueError("guild_id must be positive")
+
+
+def _require_aware(name: str, value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must include a timezone")
 
 
 def _stored_timestamp(value: datetime | None) -> str | None:
@@ -3944,6 +3950,44 @@ class SQLiteStore:
         )
         rows = await cursor.fetchall()
         return tuple(cast(LedgerEvent, ledger_event_from_row(row)) for row in rows)
+
+    async def leaderboard_counts(
+        self, guild_id: int, *, start: datetime, end: datetime
+    ) -> tuple[tuple[int, int], ...]:
+        """Return `(member_id, count)` pairs for every member with at least one
+        `MEANINGFUL_EVENT_KINDS` event in the half-open interval `[start, end)`,
+        sorted by count descending then `member_id` ascending.
+
+        Backs `/fetch admin leaderboard`. Aggregates in SQL rather than reading
+        raw rows into Python (unlike `list_ledger_events_for_guild`, which caps
+        at 5000 rows) since a full calendar year of events can exceed that cap
+        for an active guild and the leaderboard only ever needs counts, never
+        event detail.
+        """
+        _require_guild_id(guild_id)
+        _require_aware("start", start)
+        _require_aware("end", end)
+        kind_placeholders = ", ".join("?" for _ in MEANINGFUL_EVENT_KINDS)
+        cursor = await self._connection.execute(
+            f"""
+            SELECT member_id, COUNT(*) AS action_count
+            FROM ledger_events
+            WHERE guild_id = ?
+              AND kind IN ({kind_placeholders})
+              AND occurred_at >= ?
+              AND occurred_at < ?
+            GROUP BY member_id
+            ORDER BY action_count DESC, member_id ASC
+            """,
+            (
+                guild_id,
+                *(kind.value for kind in MEANINGFUL_EVENT_KINDS),
+                start.isoformat(),
+                end.isoformat(),
+            ),
+        )
+        rows = await cursor.fetchall()
+        return tuple((int(row[0]), int(row[1])) for row in rows)
 
     async def save_milestone(self, milestone: Milestone) -> Milestone:
         """Insert or replace one milestone record.
