@@ -67,19 +67,36 @@ Every Phase 2 surface defaults off: `KRUBIT_CREATOR_SIGNALS_ENABLED` and
 decorative — leaving both at their default means the connector polling scheduler never
 starts and no Discord message is ever sent, even if accounts are enrolled, resumed, and
 routed. Every missing per-platform credential simply leaves that capability at
-`unconfigured` rather than blocking startup. Three production gaps remain even with
+`unconfigured` rather than blocking startup. Two production gaps remain even with
 both flags enabled: Instagram, Facebook, Threads, and TikTok connectors are fully
 implemented and tested but are **not wired into the polling scheduler in this
 build** (they need per-account OAuth credential resolution that is not yet built, so
 scheduling them with one shared bot-wide token would fetch every creator's content
-under one account's credentials); the OAuth/push **callback server is never started**
-by `krubit run`; and Discord **Scheduled Event synchronization has no production call
-site** — nothing in the running process ever calls it, so `/fetch schedule` will always
-report no Krubit-owned events. See the
-[Phase 2 operations guide](docs/operations/phase-2-creator-signal-hub.md) for the full
-operator runbook, including all three gaps, and the
+under one account's credentials); and Discord **Scheduled Event synchronization has
+no production call site** — nothing in the running process ever calls it, so
+`/fetch schedule` will always report no Krubit-owned events.
+
+The OAuth/push **callback server now starts** with `krubit run` (bound to
+`127.0.0.1` by default, access-logging disabled so OAuth codes/state never reach
+stdout), and durably, single-use, account-bound OAuth authorization is fully wired
+for **TikTok, Instagram, and Threads**, plus Meta's deauthorization and
+legally-required data-deletion webhook contract for every Meta capability. Two
+things are still missing before this is end-to-end for an operator: the "click to
+authorize" link a creator actually clicks is not yet generated anywhere (that's the
+per-account credential resolution work above); and **Facebook Page and Facebook
+Profile authorization are deliberately not supported** — neither connector can
+independently confirm which Facebook account granted access without a proper
+Page-token exchange this build doesn't implement, so those two capabilities cleanly
+reject every authorization attempt rather than silently accepting one bound to the
+wrong account. See the
+[Phase 2 operations guide](docs/operations/phase-2-creator-signal-hub.md) for the
+full operator runbook, the
 [Phase 2 completion audit](docs/operations/phase-2-completion-audit.md) for exactly
-what is evidenced versus deferred to a credentialed operator.
+what is evidenced versus deferred to a credentialed operator, and the
+[Phase 2 callback server design](docs/superpowers/specs/2026-08-07-phase-2-callback-server-design.md)
+and
+[development log](docs/devlogs/2026-08-08-phase-2-callback-server.md)
+for the callback server's own scope and known limitations.
 
 ## Phase 3 capabilities
 
