@@ -609,10 +609,11 @@ async def export_member(
     if not self_view:
         await self._store.record_activity_receipt(
             guild_id=actor.guild_id,
+            receipt_id=str(uuid4()),
             member_id=target.member_id,
             action="member_data_exported",
             detail={"requested_by": actor.member_id, "member_id": target.member_id},
-            now=now,
+            created_at=now,
         )
     payload_dict = asdict(package)
     payload = json.dumps(payload_dict, default=_json_default, indent=2).encode("utf-8")
@@ -640,10 +641,16 @@ Import `export_member_data as export_member_data_fn` from
 exact existing name/import in this file (used by `activity`/`milestones`
 already) and reuse it rather than redefining.
 
-**Before relying on `record_activity_receipt`'s exact signature**, read it at
-`storage/sqlite.py:4091` and match its real parameter names/order — the
-signature sketched above (`guild_id, member_id, action, detail, now`) is
-illustrative and must be verified against the actual method, not assumed.
+**Confirmed against the real signature** (`storage/sqlite.py:4091-4100`):
+`record_activity_receipt(self, *, guild_id, receipt_id, member_id, action,
+detail, created_at)` — `receipt_id` is caller-supplied (generate with
+`str(uuid4())`, matching every other receipt-writing call site in this
+codebase), and the timestamp parameter is named `created_at`, not `now`. The
+snippet above already reflects this. Add `from uuid import uuid4` to
+`activity_commands.py`'s imports if not already present (check first —
+`delete_member`'s underlying `activity_privacy.delete_member` may already
+import it transitively, but this file's own top-level imports must have it
+directly for `export_member` to use it).
 
 - [ ] **Step 4: Wire the Discord-layer command with a file attachment**
 
