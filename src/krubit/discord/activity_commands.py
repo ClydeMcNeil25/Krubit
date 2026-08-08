@@ -125,13 +125,40 @@ _RECOGNITION_WINDOW = CohortWindow.THIRTY_DAY
 # this today.
 _MAX_LIST_ENTRIES = 40
 
+# Character budget `_render_capped_lines` accumulates rendered lines up to,
+# leaving headroom under Discord's 4096-character embed description limit for
+# the "...and N more." suffix line and the rest of the embed (title/fields).
+# Per-entry length is unbounded for some callers (e.g. `exclusions`'s `reason`
+# can be up to 300 chars; a single `recognition-candidates` line can hold an
+# unbounded number of milestone reasons) -- `_MAX_LIST_ENTRIES` alone does not
+# prevent exceeding 4096 chars, so this budget is enforced in addition to it.
+_MAX_LIST_CHARS = 3900
+
 
 def _render_capped_lines(lines: list[str], total: int) -> str:
+    """Render `lines` (already capped by the caller to `_MAX_LIST_ENTRIES`
+    entries) up to `_MAX_LIST_CHARS` characters, stopping early -- and short
+    of the entry cap -- if individual lines are long enough to blow the
+    character budget first. `total` is the true total entry count (which may
+    exceed `len(lines)` if the caller already truncated to `_MAX_LIST_ENTRIES`
+    before calling this); the trailing "...and N more." summary reflects
+    every entry not rendered, whichever cap (entry count or character budget)
+    bound first.
+    """
     if not lines:
         return "None found."
-    if total > len(lines):
-        lines = [*lines[:_MAX_LIST_ENTRIES], f"...and {total - _MAX_LIST_ENTRIES} more."]
-    return "\n".join(lines)
+    rendered: list[str] = []
+    budget = _MAX_LIST_CHARS
+    for line in lines:
+        cost = len(line) + (1 if rendered else 0)  # +1 for the joining "\n"
+        if cost > budget:
+            break
+        rendered.append(line)
+        budget -= cost
+    remaining = total - len(rendered)
+    if remaining > 0:
+        rendered.append(f"...and {remaining} more.")
+    return "\n".join(rendered)
 
 
 def _trailing_window_events(
@@ -582,6 +609,10 @@ class ActivityCommandService:
         """
         if not actor.is_staff:
             return _denied()
+        if actor.guild_id != target.guild_id:
+            return CommandResult(
+                CommandStatus.DENIED, detail={"reason": "cross_guild_target"}
+            )
         if not confirm:
             card = _confirmation(
                 title="Delete Member Data",
@@ -640,6 +671,13 @@ class ActivityCommandService:
         self_view = target.member_id == actor.member_id
         if not self_view and not actor.is_staff:
             return _denied_self_or_staff(), None
+        if actor.guild_id != target.guild_id:
+            return (
+                CommandResult(
+                    CommandStatus.DENIED, detail={"reason": "cross_guild_target"}
+                ),
+                None,
+            )
         now = self._now()
         package = await export_member_data_fn(
             self._store, target.guild_id, target.member_id, now
@@ -654,7 +692,13 @@ class ActivityCommandService:
                 created_at=now,
             )
         payload_dict = asdict(package)
-        payload = json.dumps(payload_dict, default=_json_default, indent=2).encode("utf-8")
+        # No `indent=2`: this payload is a Discord file attachment subject to
+        # Discord's attachment size limit, and the audit receipt below (for a
+        # staff-on-behalf-of export) is written before the attachment is sent
+        # -- keeping the payload compact reduces (without eliminating) the risk
+        # of a receipt claiming an export the requester never actually
+        # received because the attachment was rejected as oversized.
+        payload = json.dumps(payload_dict, default=_json_default).encode("utf-8")
         card = Card(
             kind="fetched",
             title="Fetched: Member Data Export",
@@ -689,13 +733,16 @@ class ActivityCommandService:
         if not actor.is_staff:
             return _denied()
         now = self._now()
-        entry = ExclusionEntry(
-            guild_id=actor.guild_id,
-            channel_id=channel_id,
-            excluded_by=actor.member_id,
-            reason=reason,
-            excluded_at=now,
-        )
+        try:
+            entry = ExclusionEntry(
+                guild_id=actor.guild_id,
+                channel_id=channel_id,
+                excluded_by=actor.member_id,
+                reason=reason,
+                excluded_at=now,
+            )
+        except ValueError as exc:
+            return CommandResult(CommandStatus.FAILED, detail={"reason": str(exc)})
         saved = await self._store.save_exclusion_entry(entry)
         card = Card(
             kind="fetched",

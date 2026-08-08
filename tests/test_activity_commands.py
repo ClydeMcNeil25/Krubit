@@ -18,14 +18,17 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from krubit.discord import activity_commands as activity_commands_module
 from krubit.discord.activity_commands import ActivityActorContext, ActivityCommandService
 from krubit.discord.content_commands import CommandStatus
 from krubit.domain.activity_ledger import (
+    CohortWindow,
     JoinEvent,
     MessageEvent,
     Milestone,
     MilestoneKind,
     ModerationReceiptEvent,
+    RecognitionCandidate,
 )
 from krubit.storage.sqlite import SQLiteStore
 
@@ -526,6 +529,58 @@ async def test_recognition_candidates_renders_reasons(
     assert f"<@{TARGET_ID}>" in result.card.description
 
 
+@pytest.mark.asyncio
+async def test_recognition_candidates_truncates_single_candidate_with_many_reasons(
+    commands: ActivityCommandService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A single member's `reasons` tuple has no element-count cap (unlike
+    # `ExclusionEntry.reason`, which is capped per-entry at 300 chars) -- one
+    # prolific member can accumulate enough milestone reasons that their
+    # single joined line alone approaches or exceeds `_MAX_LIST_CHARS`, before
+    # any other candidate is even rendered. Each reason here is close to
+    # `RecognitionCandidate`'s own 300-char-per-reason domain limit, and there
+    # are enough of them that the joined line is well past the render budget.
+    long_reasons = tuple(
+        f"Reached milestone message_count (count={i}) at 2026-08-06T00:00:00+00:00 "
+        + "x" * 220
+        for i in range(20)
+    )
+    fake_candidate = RecognitionCandidate(
+        guild_id=GUILD_ID,
+        member_id=TARGET_ID,
+        window=CohortWindow.THIRTY_DAY,
+        reasons=long_reasons,
+        evaluated_at=NOW,
+    )
+    def _fake_recognition_candidates(
+        guild_id: int,
+        events: object,
+        window: CohortWindow,
+        now: datetime,
+    ) -> tuple[RecognitionCandidate, ...]:
+        return (fake_candidate,)
+
+    monkeypatch.setattr(
+        activity_commands_module, "recognition_candidates_fn", _fake_recognition_candidates
+    )
+    result = await commands.recognition_candidates(actor=staff_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    description = result.card.description
+    # The whole-embed budget must never be exceeded even though the single
+    # candidate's raw joined line (reasons alone) is far longer than that.
+    # `_MAX_LIST_CHARS` in `activity_commands.py` is 3900; give ample headroom
+    # (well under Discord's 4096-char embed description limit) without
+    # depending on the module's private constant directly.
+    assert len(description) <= 4000
+    raw_line_len = len(f"<@{TARGET_ID}> — {', '.join(long_reasons)}")
+    assert raw_line_len > 3900
+    # Nothing was rendered for this one oversized candidate -- it is entirely
+    # accounted for by the "...and N more." summary, not truncated mid-line.
+    assert "...and 1 more." in description
+    assert result.detail["count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # member-delete
 # ---------------------------------------------------------------------------
@@ -704,3 +759,98 @@ async def test_exclusions_renders_empty_and_populated_state(
     assert populated.card is not None
     assert "555" in populated.card.description
     assert "mod-only" in populated.card.description
+
+
+@pytest.mark.asyncio
+async def test_exclusions_truncates_on_character_budget_before_entry_cap(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    # Each `reason` is near `ExclusionEntry`'s own 300-char domain limit
+    # (`_MAX_REASON_LENGTH`), so far fewer than the 40-entry cap is needed to
+    # blow past `_MAX_LIST_CHARS` (~3900 chars): each rendered line is
+    # `reason` plus channel/staff mentions and a timestamp, so 3900 / ~370
+    # chars-per-line is roughly 10-11 entries, well under 40.
+    long_reason = "r" * 290
+    for channel_id in range(1, 41):
+        await commands.exclude_channel(
+            actor=staff_member(), channel_id=channel_id, reason=long_reason
+        )
+    result = await commands.exclusions(actor=staff_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    description = result.card.description
+    assert len(description) <= 4000
+    assert "...and" in description
+    assert result.detail["count"] == 40
+    entries = await store.list_exclusion_entries(GUILD_ID)
+    assert len(entries) == 40
+    # The whole-embed 4096-char budget must never have been at risk -- proof
+    # that entry-count capping alone (all 40 entries) would have blown past
+    # it, while the actual render stayed well under.
+    naive_length = sum(
+        len(
+            f"<#{e.channel_id}> — {e.reason} (excluded by <@{e.excluded_by}> "
+            f"at {e.excluded_at.isoformat()})"
+        )
+        + 1
+        for e in entries
+    )
+    assert naive_length > 4096
+    assert len(description) < 4096
+
+
+# ---------------------------------------------------------------------------
+# exclude-channel error handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exclude_channel_blank_reason_returns_failed_not_exception(
+    commands: ActivityCommandService,
+) -> None:
+    result = await commands.exclude_channel(
+        actor=staff_member(), channel_id=555, reason="   "
+    )
+    assert result.status is CommandStatus.FAILED
+    assert "reason" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_exclude_channel_over_length_reason_returns_failed_not_exception(
+    commands: ActivityCommandService,
+) -> None:
+    result = await commands.exclude_channel(
+        actor=staff_member(), channel_id=555, reason="x" * 301
+    )
+    assert result.status is CommandStatus.FAILED
+    assert "reason" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# cross-guild defense-in-depth (delete_member / export_member)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_member_denies_cross_guild_target(
+    commands: ActivityCommandService,
+) -> None:
+    mismatched_target = ActivityActorContext(
+        guild_id=GUILD_ID + 1, member_id=TARGET_ID, is_staff=False
+    )
+    result = await commands.delete_member(actor=staff_member(), target=mismatched_target)
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_export_member_denies_cross_guild_target(
+    commands: ActivityCommandService,
+) -> None:
+    mismatched_target = ActivityActorContext(
+        guild_id=GUILD_ID + 1, member_id=999999, is_staff=False
+    )
+    result, payload = await commands.export_member(
+        actor=staff_member(), target=mismatched_target
+    )
+    assert result.status is CommandStatus.DENIED
+    assert payload is None

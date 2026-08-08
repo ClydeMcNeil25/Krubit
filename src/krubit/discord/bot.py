@@ -923,7 +923,10 @@ class ActivityAdminCommands(app_commands.Group):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def exclude_channel(
-        self, interaction: discord.Interaction, channel: discord.TextChannel, reason: str
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        reason: app_commands.Range[str, 1, 300],
     ) -> None:
         context = await self._parent.authorize(interaction, "fetch_activity_admin_exclude_channel")
         if context is None:
