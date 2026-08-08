@@ -53,10 +53,13 @@ documented default fallback when unset) before calling either method.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from krubit.discord.content_commands import CommandResult, CommandStatus, _confirmation
 from krubit.domain.activity_ledger import (
@@ -74,6 +77,7 @@ from krubit.services.activation_retention import (
     time_to_activation,
 )
 from krubit.services.activity_privacy import delete_member as delete_member_fn
+from krubit.services.activity_privacy import export_member_data as export_member_data_fn
 from krubit.services.activity_views import community_pulse as _community_pulse_view
 from krubit.services.activity_views import inactive_view, newcomer_view, returning_member_view
 from krubit.services.milestones import recognition_candidates as recognition_candidates_fn
@@ -168,6 +172,20 @@ def _denied_self_or_staff() -> CommandResult:
         CommandStatus.DENIED,
         detail={"reason": "staff authority or self-view required"},
     )
+
+
+def _json_default(value: object) -> object:
+    """`json.dumps(..., default=...)` fallback for `export_member`'s payload.
+
+    `LedgerEvent`/`Milestone` fields are all JSON-primitive, `datetime`, or
+    `Enum` after `dataclasses.asdict` recursion -- `datetime` and `Enum` are
+    the only two types `json.dumps` cannot already handle natively.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class ActivityCommandService:
@@ -598,4 +616,58 @@ class ActivityCommandService:
             CommandStatus.SUCCEEDED,
             card=card,
             detail={"receipt_id": receipt.receipt_id, "member_id": target.member_id},
+        )
+
+    # -- member-export: self-accessible for oneself, staff-only for another --
+    # member. Unlike every other command above, the payload does not fit in an
+    # embed at all, so it is returned separately as raw JSON bytes for the
+    # Discord layer to send as a file attachment.
+
+    async def export_member(
+        self, *, actor: ActivityActorContext, target: ActivityActorContext
+    ) -> tuple[CommandResult, bytes | None]:
+        """Export `target`'s own ledger events and milestones as JSON bytes.
+
+        `self_view` is computed from `target.member_id == actor.member_id`
+        here, matching `activity`/`milestones`'s re-validation discipline --
+        never trusted from a Discord-layer default. A self-view export writes
+        no audit receipt (a member reading their own data is not a
+        privacy-relevant action); a staff-on-behalf-of export writes one
+        `activity_receipts` row via `record_activity_receipt` before
+        returning, matching `delete_member`'s audit-trail precedent.
+        """
+        self_view = target.member_id == actor.member_id
+        if not self_view and not actor.is_staff:
+            return _denied_self_or_staff(), None
+        now = self._now()
+        package = await export_member_data_fn(
+            self._store, target.guild_id, target.member_id, now
+        )
+        if not self_view:
+            await self._store.record_activity_receipt(
+                guild_id=actor.guild_id,
+                receipt_id=str(uuid4()),
+                member_id=target.member_id,
+                action="member_data_exported",
+                detail={"requested_by": actor.member_id, "member_id": target.member_id},
+                created_at=now,
+            )
+        payload_dict = asdict(package)
+        payload = json.dumps(payload_dict, default=_json_default, indent=2).encode("utf-8")
+        card = Card(
+            kind="fetched",
+            title="Fetched: Member Data Export",
+            description=(
+                f"Export generated for <@{target.member_id}> "
+                f"({len(package.events)} events, {len(package.milestones)} milestones)."
+            ),
+            fields=(),
+        )
+        return (
+            CommandResult(
+                CommandStatus.SUCCEEDED,
+                card=card,
+                detail={"self_view": self_view, "event_count": len(package.events)},
+            ),
+            payload,
         )

@@ -10,10 +10,12 @@ are exercised end to end through real storage rather than a fake.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from krubit.discord.activity_commands import ActivityActorContext, ActivityCommandService
@@ -581,3 +583,77 @@ async def test_delete_member_confirm_true_is_idempotent(
     second = await commands.delete_member(actor=staff_member(), target=other_member(), confirm=True)
     assert first.status is CommandStatus.SUCCEEDED
     assert second.status is CommandStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# member-export
+# ---------------------------------------------------------------------------
+
+
+async def _receipt_count(db_path: Path, *, guild_id: int, member_id: int) -> int:
+    async with aiosqlite.connect(db_path) as connection:
+        cursor = await connection.execute(
+            "SELECT COUNT(*) FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
+            (guild_id, member_id),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+
+@pytest.mark.asyncio
+async def test_export_member_denies_non_staff_non_self(
+    commands: ActivityCommandService,
+) -> None:
+    result, payload = await commands.export_member(actor=regular_member(), target=other_member())
+    assert result.status is CommandStatus.DENIED
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_export_member_self_view_writes_no_receipt(
+    tmp_path: Path, store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    await _seed_member(store, member_id=REGULAR_ID, joined_days_ago=10, last_active_days_ago=1)
+    result, payload = await commands.export_member(actor=regular_member(), target=regular_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert payload is not None
+    decoded = json.loads(payload)
+    assert decoded["member_id"] == REGULAR_ID
+    db_path = tmp_path / "krubit.db"
+    assert await _receipt_count(db_path, guild_id=GUILD_ID, member_id=REGULAR_ID) == 0
+
+
+@pytest.mark.asyncio
+async def test_export_member_staff_on_behalf_writes_audit_receipt(
+    tmp_path: Path, store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    await _seed_member(store, member_id=TARGET_ID, joined_days_ago=10, last_active_days_ago=1)
+    result, payload = await commands.export_member(actor=staff_member(), target=other_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert payload is not None
+    db_path = tmp_path / "krubit.db"
+    assert await _receipt_count(db_path, guild_id=GUILD_ID, member_id=TARGET_ID) == 1
+    async with aiosqlite.connect(db_path) as connection:
+        cursor = await connection.execute(
+            "SELECT action FROM activity_receipts WHERE guild_id = ? AND member_id = ?",
+            (GUILD_ID, TARGET_ID),
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == "member_data_exported"
+
+
+@pytest.mark.asyncio
+async def test_export_member_json_never_includes_another_members_data(
+    store: SQLiteStore, commands: ActivityCommandService
+) -> None:
+    other_target_id = 444
+    await _seed_member(store, member_id=TARGET_ID, joined_days_ago=10, last_active_days_ago=1)
+    await _seed_member(store, member_id=other_target_id, joined_days_ago=10, last_active_days_ago=1)
+    result, payload = await commands.export_member(actor=staff_member(), target=other_member())
+    assert result.status is CommandStatus.SUCCEEDED
+    assert payload is not None
+    decoded = json.loads(payload)
+    serialized = json.dumps(decoded)
+    assert str(other_target_id) not in serialized

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
@@ -886,6 +887,35 @@ class ActivityAdminCommands(app_commands.Group):
                 actor=actor, target=target, confirm=True
             ),
         )
+
+    @app_commands.command(
+        name="member-export", description="Export a member's activity-ledger data, or your own"
+    )
+    @app_commands.guild_only()
+    async def member_export(
+        self, interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        resolved = await self._parent._activity_actor(interaction)
+        if resolved is None:
+            return
+        guild, actor = resolved
+        target = (
+            ActivityActorContext(guild_id=guild.id, member_id=member.id, is_staff=False)
+            if member is not None
+            else actor
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result, payload = await self._parent._activity_commands.export_member(
+            actor=actor, target=target
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        if payload is None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        file = discord.File(io.BytesIO(payload), filename=f"krubit-export-{target.member_id}.json")
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
 
 class KrubitBot(discord.Client):
