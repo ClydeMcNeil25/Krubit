@@ -16,12 +16,12 @@ from krubit.integrations.meta import (
     MetaConnectorError,
     MetaOAuthGrant,
     MetaOAuthStates,
+    _verify_meta_webhook_signature,
     build_meta_deauthorization_route,
     build_meta_oauth_redirect_route,
     exchange_authorization_code,
     open_oauth_grant,
     seal_oauth_grant,
-    verify_meta_signed_request,
 )
 from krubit.security.credential_vault import CredentialVault
 from krubit.services.creator_registry import CreatorAuthorityError, CreatorRegistry
@@ -435,10 +435,10 @@ def _sign(body: bytes, secret: str) -> str:
 
 def test_verify_meta_signed_request_accepts_only_a_matching_signature() -> None:
     body = b'{"object":"user","entry":[]}'
-    assert verify_meta_signed_request(body, _sign(body, "app-secret"), "app-secret") is True
-    assert verify_meta_signed_request(body, _sign(body, "wrong-secret"), "app-secret") is False
-    assert verify_meta_signed_request(body, None, "app-secret") is False
-    assert verify_meta_signed_request(body, "sha1=deadbeef", "app-secret") is False
+    assert _verify_meta_webhook_signature(body, _sign(body, "app-secret"), "app-secret") is True
+    assert _verify_meta_webhook_signature(body, _sign(body, "wrong-secret"), "app-secret") is False
+    assert _verify_meta_webhook_signature(body, None, "app-secret") is False
+    assert _verify_meta_webhook_signature(body, "sha1=deadbeef", "app-secret") is False
 
 
 @pytest.fixture

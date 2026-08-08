@@ -52,6 +52,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hmac
+import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1039,7 +1040,9 @@ def build_meta_oauth_redirect_route(
     return build_oauth_redirect_route(path=path, redirect=redirect)
 
 
-def verify_meta_signed_request(body: bytes, signature_header: str | None, app_secret: str) -> bool:
+def _verify_meta_webhook_signature(
+    body: bytes, signature_header: str | None, app_secret: str
+) -> bool:
     """Verify Meta's `X-Hub-Signature-256` HMAC-SHA256 over the raw webhook body."""
     if not signature_header or not app_secret:
         return False
@@ -1048,6 +1051,53 @@ def verify_meta_signed_request(body: bytes, signature_header: str | None, app_se
         return False
     expected = hmac.new(app_secret.encode("utf-8"), body, sha256).hexdigest()
     return hmac.compare_digest(expected, digest.lower())
+
+
+def verify_meta_signed_request(
+    signed_request: str,
+    app_secret: str,
+    *,
+    now: Callable[[], datetime] = _utc_now,
+    max_age: timedelta = timedelta(minutes=5),
+) -> Mapping[str, object] | None:
+    """Verify and parse Meta's form-posted `signed_request` value.
+
+    Format: `<base64url-signature>.<base64url-json-payload>`, HMAC-SHA256 over the
+    encoded payload string, keyed by the app secret. Rejects a missing/extra
+    separator, a bad signature, non-JSON payload, or an `issued_at` older than
+    `max_age` — a validly-signed but stale request is a replay, not a fresh call.
+    """
+    parts = signed_request.split(".")
+    if len(parts) != 2:
+        return None
+    encoded_signature, encoded_payload = parts
+    try:
+        signature = base64.urlsafe_b64decode(encoded_signature + "==")
+        payload_bytes = base64.urlsafe_b64decode(encoded_payload + "==")
+    except (binascii.Error, ValueError):
+        return None
+    expected_signature = hmac.new(
+        app_secret.encode("utf-8"), encoded_payload.encode("utf-8"), sha256
+    ).digest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return None
+    try:
+        payload_raw = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload_raw, dict):
+        return None
+    payload = cast(dict[str, object], payload_raw)
+    issued_at = payload.get("issued_at")
+    if not isinstance(issued_at, int):
+        return None
+    issued_datetime = datetime.fromtimestamp(issued_at, tz=UTC)
+    if now() - issued_datetime > max_age:
+        return None
+    user_id = payload.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    return payload
 
 
 def build_meta_deauthorization_route(
@@ -1061,7 +1111,9 @@ def build_meta_deauthorization_route(
     is rejected with 403 and `handle_deauthorization` is never called.
     """
     webhook = SignedWebhook(
-        verify_signature=lambda body, header: verify_meta_signed_request(body, header, app_secret),
+        verify_signature=lambda body, header: _verify_meta_webhook_signature(
+            body, header, app_secret
+        ),
         handle_notification=handle_deauthorization,
     )
     return build_signed_webhook_route(path=path, header_name="X-Hub-Signature-256", webhook=webhook)

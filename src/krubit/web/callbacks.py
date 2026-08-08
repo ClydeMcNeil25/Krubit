@@ -275,3 +275,40 @@ def build_signed_webhook_route(
         return web.Response(status=204)
 
     return CallbackRoute(path=path, method="POST", handler=handle_post)
+
+
+@dataclass(frozen=True, slots=True)
+class SignedFormRequest:
+    """A form-posted signed request's verification and ingestion behavior.
+
+    Mirrors `SignedWebhook` but for platforms (Meta's deauthorization/data-deletion
+    callbacks) that sign a single form field's value rather than the raw request
+    body — `verify_and_parse` receives that field's raw string value and returns
+    the parsed, verified payload, or `None` to reject.
+    """
+
+    verify_and_parse: Callable[[str], Mapping[str, object] | None]
+    handle_notification: Callable[[Mapping[str, object]], Awaitable[web.StreamResponse]]
+
+
+def build_signed_form_route(
+    *, path: str, field_name: str, webhook: SignedFormRequest
+) -> CallbackRoute:
+    """Build the single POST route for one form-signed-request endpoint.
+
+    An unverified or missing field is rejected with 403 and `handle_notification`
+    is never called, matching every other verify-before-ingest route in this
+    module.
+    """
+
+    async def handle_post(request: web.Request) -> web.StreamResponse:
+        form = await request.post()
+        raw_value = form.get(field_name)
+        if not isinstance(raw_value, str):
+            return web.Response(status=403)
+        parsed = webhook.verify_and_parse(raw_value)
+        if parsed is None:
+            return web.Response(status=403)
+        return await webhook.handle_notification(parsed)
+
+    return CallbackRoute(path=path, method="POST", handler=handle_post)
