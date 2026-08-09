@@ -16,10 +16,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+import check_deploy_health  # noqa: E402
 from check_deploy_health import (  # noqa: E402
     build_discord_message,
     classify_status,
     determine_action,
+    main,
     post_to_discord,
     query_railway_deployment,
     read_state,
@@ -75,6 +77,12 @@ def test_read_state_returns_none_when_file_missing(tmp_path: Path) -> None:
 def test_read_state_returns_none_when_file_malformed(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     path.write_text("not valid json", encoding="utf-8")
+    assert read_state(path) is None
+
+
+def test_read_state_returns_none_when_json_is_not_a_dict(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps("healthy"), encoding="utf-8")
     assert read_state(path) is None
 
 
@@ -142,10 +150,11 @@ def test_query_railway_deployment_success() -> None:
     mock_response.__exit__.return_value = None
 
     with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-        status, deployment_id = query_railway_deployment(token)
+        status, deployment_id, created_at = query_railway_deployment(token)
 
         assert status == "SUCCESS"
         assert deployment_id == "dep-123"
+        assert created_at == "2026-08-08T19:45:00Z"
         mock_urlopen.assert_called_once()
 
 
@@ -184,6 +193,44 @@ def test_query_railway_deployment_url_error_raises_runtime_error() -> None:
 
         error_message = str(exc_info.value)
         assert "request failed" in error_message.lower()
+        assert token not in error_message, (
+            f"Token leaked into error message: {error_message}"
+        )
+
+
+def test_query_railway_deployment_timeout_error_raises_runtime_error() -> None:
+    """Test that a raw TimeoutError (not wrapped in URLError, as urlopen
+    can raise directly on socket timeouts) is caught and converted to
+    RuntimeError instead of propagating and crashing the checker."""
+    token = "secret-token-xyz123"
+
+    with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        error_message = str(exc_info.value)
+        assert "request failed" in error_message.lower()
+        assert token not in error_message, (
+            f"Token leaked into error message: {error_message}"
+        )
+
+
+def test_query_railway_deployment_non_utf8_response_raises_runtime_error() -> None:
+    """Test that a response body that fails UTF-8 decoding (UnicodeDecodeError,
+    a ValueError subclass) is caught and converted to RuntimeError."""
+    token = "secret-token-xyz123"
+
+    mock_response = MagicMock()
+    mock_response.read.return_value = b"\xff\xfe not valid utf-8"
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        error_message = str(exc_info.value)
+        assert "unreadable" in error_message.lower()
         assert token not in error_message, (
             f"Token leaked into error message: {error_message}"
         )
@@ -282,3 +329,88 @@ def test_post_to_discord_constructs_correct_request() -> None:
         mock_urlopen.assert_called_once()
         assert mock_urlopen.call_args[0][0] == mock_request_instance
         assert mock_urlopen.call_args[1]["timeout"] == 15
+
+
+# Integration tests for main()'s orchestration -- query_railway_deployment
+# and post_to_discord are always mocked here, so these never make a real
+# network call. _STATE_PATH is patched to a tmp_path file so tests never
+# touch the real committed state file.
+def _seed_state(path: Path, *, classification: str) -> None:
+    write_state(
+        path,
+        classification=classification,
+        deployment_id="dep-previous",
+        checked_at="2026-08-08T00:00:00Z",
+    )
+
+
+def test_main_transient_does_not_clobber_stored_state(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "state.json"
+    _seed_state(state_path, classification="unhealthy")
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake")
+    monkeypatch.setattr(check_deploy_health, "_STATE_PATH", state_path)
+
+    with patch.object(
+        check_deploy_health,
+        "query_railway_deployment",
+        return_value=("BUILDING", "dep-new", "2026-08-09T00:00:00Z"),
+    ), patch.object(check_deploy_health, "post_to_discord") as mock_post:
+        result = main()
+
+    assert result == 0
+    mock_post.assert_not_called()
+    state = read_state(state_path)
+    assert state is not None
+    assert state["classification"] == "unhealthy"
+    assert state["deployment_id"] == "dep-previous"
+
+
+def test_main_no_op_poll_does_not_write_or_alert(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "state.json"
+    _seed_state(state_path, classification="healthy")
+    before_mtime = state_path.stat().st_mtime_ns
+    before_content = state_path.read_text(encoding="utf-8")
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake")
+    monkeypatch.setattr(check_deploy_health, "_STATE_PATH", state_path)
+
+    with patch.object(
+        check_deploy_health,
+        "query_railway_deployment",
+        return_value=("SUCCESS", "dep-new", "2026-08-09T00:00:00Z"),
+    ), patch.object(check_deploy_health, "post_to_discord") as mock_post:
+        result = main()
+
+    assert result == 0
+    mock_post.assert_not_called()
+    assert state_path.stat().st_mtime_ns == before_mtime
+    assert state_path.read_text(encoding="utf-8") == before_content
+
+
+def test_main_real_transition_posts_and_writes_state(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "state.json"
+    _seed_state(state_path, classification="healthy")
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake")
+    monkeypatch.setattr(check_deploy_health, "_STATE_PATH", state_path)
+
+    with patch.object(
+        check_deploy_health,
+        "query_railway_deployment",
+        return_value=("CRASHED", "dep-new", "2026-08-09T00:00:00Z"),
+    ), patch.object(check_deploy_health, "post_to_discord") as mock_post:
+        result = main()
+
+    assert result == 0
+    mock_post.assert_called_once()
+    posted_message = mock_post.call_args[0][1]
+    assert "CRASHED" in posted_message
+
+    state = read_state(state_path)
+    assert state is not None
+    assert state["classification"] == "unhealthy"
+    assert state["deployment_id"] == "dep-new"

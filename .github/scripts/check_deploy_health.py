@@ -97,9 +97,10 @@ def read_state(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def write_state(
@@ -143,12 +144,12 @@ def build_discord_message(
     )
 
 
-def query_railway_deployment(token: str) -> tuple[str, str]:
-    """Query Railway's GraphQL API for the latest deployment's status and
-    id. Raises `RuntimeError` (never a raw urllib/json exception) on any
-    failure, with a short, non-sensitive detail message -- the token
-    itself must never appear in a raised message, since that could end up
-    logged."""
+def query_railway_deployment(token: str) -> tuple[str, str, str]:
+    """Query Railway's GraphQL API for the latest deployment's status, id,
+    and createdAt timestamp. Raises `RuntimeError` (never a raw
+    urllib/json exception) on any failure, with a short, non-sensitive
+    detail message -- the token itself must never appear in a raised
+    message, since that could end up logged."""
     body = json.dumps(
         {
             "query": _DEPLOYMENTS_QUERY,
@@ -176,10 +177,16 @@ def query_railway_deployment(token: str) -> tuple[str, str]:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Railway API returned HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Railway API request failed: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Railway API returned a non-JSON response") from exc
+    except OSError as exc:
+        # Covers URLError, TimeoutError, ConnectionError, and other
+        # network-layer failures -- none of these can contain the token
+        # (it lives only in the Authorization header, never in these
+        # exception types' string forms).
+        raise RuntimeError(f"Railway API request failed: {exc}") from exc
+    except ValueError as exc:
+        # Covers json.JSONDecodeError and UnicodeDecodeError (both are
+        # ValueError subclasses) -- a non-JSON or non-UTF8 response body.
+        raise RuntimeError("Railway API returned an unreadable response") from exc
 
     if "errors" in payload:
         raise RuntimeError(f"Railway API returned GraphQL errors: {payload['errors']}")
@@ -188,7 +195,7 @@ def query_railway_deployment(token: str) -> tuple[str, str]:
         if not edges:
             raise RuntimeError("Railway API returned no deployments for this service")
         node = edges[0]["node"]
-        return str(node["status"]), str(node["id"])
+        return str(node["status"]), str(node["id"]), str(node["createdAt"])
     except (KeyError, TypeError, IndexError) as exc:
         raise RuntimeError("Railway API response had an unexpected shape") from exc
 
@@ -220,8 +227,9 @@ def main() -> int:
 
     detail: str | None = None
     deployment_id: str | None = None
+    created_at: str | None = None
     try:
-        status, deployment_id = query_railway_deployment(token)
+        status, deployment_id, created_at = query_railway_deployment(token)
         classification = classify_status(status)
     except RuntimeError as exc:
         status = "check_failed"
@@ -233,7 +241,10 @@ def main() -> int:
         return 0
 
     action = determine_action(previous_classification, classification)
-    print(f"status={status} classification={classification} action={action}")
+    print(
+        f"status={status} classification={classification} action={action} "
+        f"deployment_created_at={created_at}"
+    )
 
     if action == "none":
         return 0
