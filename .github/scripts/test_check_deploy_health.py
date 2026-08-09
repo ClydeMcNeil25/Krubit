@@ -7,8 +7,11 @@ never real HTTP.
 
 from __future__ import annotations
 
+import json
 import sys
+import urllib.error
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,6 +20,8 @@ from check_deploy_health import (  # noqa: E402
     build_discord_message,
     classify_status,
     determine_action,
+    post_to_discord,
+    query_railway_deployment,
     read_state,
     write_state,
 )
@@ -110,3 +115,170 @@ def test_build_discord_message_check_failed_is_distinguishable_from_unhealthy() 
     )
     assert "check" in alert_message.lower()
     assert "401" in alert_message
+
+
+# Tests for query_railway_deployment with mocked urllib
+def test_query_railway_deployment_success() -> None:
+    """Test successful deployment query returns (status, id) tuple."""
+    token = "secret-token-xyz123"
+    mock_response_data = {
+        "data": {
+            "deployments": {
+                "edges": [
+                    {
+                        "node": {
+                            "id": "dep-123",
+                            "status": "SUCCESS",
+                            "createdAt": "2026-08-08T19:45:00Z",
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps(mock_response_data).encode("utf-8")
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
+        status, deployment_id = query_railway_deployment(token)
+
+        assert status == "SUCCESS"
+        assert deployment_id == "dep-123"
+        mock_urlopen.assert_called_once()
+
+
+def test_query_railway_deployment_http_error_raises_runtime_error() -> None:
+    """Test that HTTPError raises RuntimeError and does not leak the token."""
+    token = "secret-token-xyz123"
+
+    mock_error = urllib.error.HTTPError(
+        url="https://railway.com",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=None,
+    )
+
+    with patch("urllib.request.urlopen", side_effect=mock_error):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        error_message = str(exc_info.value)
+        assert "HTTP" in error_message
+        assert token not in error_message, (
+            f"Token leaked into error message: {error_message}"
+        )
+
+
+def test_query_railway_deployment_url_error_raises_runtime_error() -> None:
+    """Test that URLError raises RuntimeError and does not leak the token."""
+    token = "secret-token-xyz123"
+
+    mock_error = urllib.error.URLError("Connection refused")
+
+    with patch("urllib.request.urlopen", side_effect=mock_error):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        error_message = str(exc_info.value)
+        assert "request failed" in error_message.lower()
+        assert token not in error_message, (
+            f"Token leaked into error message: {error_message}"
+        )
+
+
+def test_query_railway_deployment_graphql_errors() -> None:
+    """Test that GraphQL errors in response raise RuntimeError and do not leak the token."""
+    token = "secret-token-xyz123"
+    mock_response_data = {
+        "errors": [
+            {"message": "Invalid query", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+        ]
+    }
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps(mock_response_data).encode("utf-8")
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        error_message = str(exc_info.value)
+        assert "GraphQL errors" in error_message
+        assert "Invalid query" in error_message
+        assert token not in error_message, (
+            f"Token leaked into error message: {error_message}"
+        )
+
+
+def test_query_railway_deployment_empty_edges_list() -> None:
+    """Test that empty edges list raises RuntimeError."""
+    token = "secret-token-xyz123"
+    mock_response_data = {"data": {"deployments": {"edges": []}}}
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps(mock_response_data).encode("utf-8")
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        assert "no deployments" in str(exc_info.value).lower()
+
+
+def test_query_railway_deployment_unexpected_response_shape() -> None:
+    """Test that unexpected response shape raises RuntimeError, not KeyError."""
+    token = "secret-token-xyz123"
+    mock_response_data = {"unexpected": "structure"}
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps(mock_response_data).encode("utf-8")
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response):
+        with pytest.raises(RuntimeError) as exc_info:
+            query_railway_deployment(token)
+
+        assert "unexpected shape" in str(exc_info.value).lower()
+
+
+# Tests for post_to_discord with mocked urllib
+def test_post_to_discord_constructs_correct_request() -> None:
+    """Test that post_to_discord constructs POST request with correct body and headers."""
+    webhook_url = "https://discord.com/api/webhooks/123/abc"
+    content = "Test alert message"
+
+    mock_response = MagicMock()
+    mock_response.read.return_value = b""
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen, patch(
+        "urllib.request.Request"
+    ) as mock_request_class:
+        mock_request_instance = MagicMock()
+        mock_request_class.return_value = mock_request_instance
+
+        post_to_discord(webhook_url, content)
+
+        # Verify Request was instantiated with correct arguments
+        mock_request_class.assert_called_once()
+        call_args = mock_request_class.call_args
+
+        assert call_args[0][0] == webhook_url
+        assert call_args[1]["method"] == "POST"
+        assert call_args[1]["headers"]["Content-Type"] == "application/json"
+
+        # Verify the body contains the correct JSON
+        body = call_args[1]["data"]
+        body_dict = json.loads(body.decode("utf-8"))
+        assert body_dict["content"] == content
+
+        # Verify urlopen was called with the request and timeout
+        mock_urlopen.assert_called_once()
+        assert mock_urlopen.call_args[0][0] == mock_request_instance
+        assert mock_urlopen.call_args[1]["timeout"] == 15
