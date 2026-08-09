@@ -87,6 +87,76 @@ async def test_fetch_status_is_staff_only_and_receipts_the_requesting_actor(
 
 
 @pytest.mark.asyncio
+async def test_fetch_admin_leaderboard_is_staff_only_and_defaults_to_current_year(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    commands = FetchCommands(FoundationService(store))
+    admin = next(command for command in commands.commands if command.name == "admin")
+    leaderboard = next(
+        command for command in admin.commands if command.name == "leaderboard"  # type: ignore[attr-defined]
+    )
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    try:
+        assert leaderboard.default_permissions is not None
+        assert leaderboard.default_permissions.manage_guild is True
+
+        denied = _FakeInteraction(_FakeMember(42, can_manage_guild=False))
+        await leaderboard.callback(admin, denied, None)  # type: ignore[arg-type]
+
+        assert denied.response.sent is not None
+        assert denied.response.sent["ephemeral"] is True
+        assert denied.edited_embed is None
+
+        allowed = _FakeInteraction(_FakeMember(7, can_manage_guild=True))
+        await leaderboard.callback(admin, allowed, None)  # type: ignore[arg-type]
+
+        assert allowed.response.deferred == {"ephemeral": True, "thinking": True}
+        assert allowed.edited_embed is not None
+
+        receipts = await store.list_receipts(111)
+        assert [(item.action, item.status, item.actor_id) for item in receipts] == [
+            ("fetch_admin_leaderboard", "succeeded", 7),
+            ("fetch_admin_leaderboard", "denied", 42),
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_admin_leaderboard_accepts_explicit_past_year(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    commands = FetchCommands(FoundationService(store))
+    admin = next(command for command in commands.commands if command.name == "admin")
+    leaderboard = next(
+        command for command in admin.commands if command.name == "leaderboard"  # type: ignore[attr-defined]
+    )
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    try:
+        allowed = _FakeInteraction(_FakeMember(7, can_manage_guild=True))
+        await leaderboard.callback(admin, allowed, 2025)  # type: ignore[arg-type]
+
+        assert allowed.response.deferred == {"ephemeral": True, "thinking": True}
+        assert allowed.response.sent is None
+        assert allowed.edited_embed is not None
+
+        receipts = await store.list_receipts(111)
+        assert [(item.action, item.status, item.actor_id) for item in receipts] == [
+            ("fetch_admin_leaderboard", "succeeded", 7),
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_fetch_latest_is_open_to_any_guild_member(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

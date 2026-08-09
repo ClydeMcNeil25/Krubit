@@ -861,6 +861,36 @@ class AdminCommands(app_commands.Group):
             detail=_receipt_detail(result.detail),
         )
 
+    @app_commands.command(
+        name="leaderboard", description="Fetch the meaningful-action leaderboard for a year"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def leaderboard(
+        self,
+        interaction: discord.Interaction,
+        year: app_commands.Range[int, 2020, datetime.now(UTC).year] | None = None,
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_admin_leaderboard")
+        if context is None:
+            return
+        guild, actor_id = context
+        actor = ActivityActorContext(guild_id=guild.id, member_id=actor_id, is_staff=True)
+        resolved_year = year if year is not None else datetime.now(UTC).year
+        result = await self._parent._activity_commands.leaderboard(
+            actor=actor, year=resolved_year
+        )
+        embed = render_card(result.card) if result.card is not None else discord.Embed(
+            title=result.status.value
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_admin_leaderboard",
+            actor_id=actor_id,
+            embed=embed,
+            detail=_receipt_detail(result.detail),
+        )
+
 
 class SniffCommands(app_commands.Group):
     """`/fetch sniff` -- Watchdog risk-assessment and incident-evidence

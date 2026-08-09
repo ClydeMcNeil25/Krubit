@@ -130,6 +130,7 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "exclusions",
             "retention",
             "community-pulse",
+            "leaderboard",
         }
         backup = cast(
             app_commands.Group,
@@ -197,7 +198,7 @@ def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
         }
 
         admin_commands = AdminCommands(fetch_commands)
-        assert len(admin_commands.commands) == 16
+        assert len(admin_commands.commands) == 17
         assert {command.name for command in admin_commands.commands} == {
             "status",
             "test-card",
@@ -215,6 +216,7 @@ def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
             "exclusions",
             "retention",
             "community-pulse",
+            "leaderboard",
         }
     finally:
         asyncio.run(store.close())

@@ -11,7 +11,7 @@ not just a failing assertion.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -183,6 +183,70 @@ async def test_list_ledger_events_orders_most_recent_first(store: SQLiteStore) -
     stored = await store.list_ledger_events(111, member_id=222)
     assert stored[0].occurred_at == LATER
     assert stored[1].occurred_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_counts_counts_only_meaningful_kinds_and_orders_by_count(
+    store: SQLiteStore,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2027, 1, 1, tzinfo=UTC)
+    mid = datetime(2026, 6, 1, tzinfo=UTC)
+
+    # Member 1: two meaningful events (message + reaction) -> count 2.
+    await store.record_ledger_event(
+        MessageEvent(guild_id=111, member_id=1, occurred_at=mid, channel_id=333)
+    )
+    await store.record_ledger_event(
+        ReactionEvent(
+            guild_id=111, member_id=1, occurred_at=mid, channel_id=333, emoji="🎉"
+        )
+    )
+    # Member 1's JOIN event must NOT be counted (not a meaningful kind).
+    await store.record_ledger_event(JoinEvent(guild_id=111, member_id=1, occurred_at=mid))
+
+    # Member 2: three meaningful events -> count 3, ranks above member 1.
+    for _ in range(3):
+        await store.record_ledger_event(
+            MessageEvent(guild_id=111, member_id=2, occurred_at=mid, channel_id=333)
+        )
+
+    # A different guild's events must never contribute.
+    await store.record_ledger_event(
+        MessageEvent(guild_id=999, member_id=1, occurred_at=mid, channel_id=333)
+    )
+
+    counts = await store.leaderboard_counts(111, start=start, end=end)
+    assert counts == ((2, 3), (1, 2))
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_counts_respects_half_open_year_boundary(
+    store: SQLiteStore,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2027, 1, 1, tzinfo=UTC)
+
+    # Exactly at start: counts.
+    await store.record_ledger_event(
+        MessageEvent(guild_id=111, member_id=1, occurred_at=start, channel_id=333)
+    )
+    # Exactly at end: must NOT count (exclusive upper bound).
+    await store.record_ledger_event(
+        MessageEvent(guild_id=111, member_id=1, occurred_at=end, channel_id=333)
+    )
+    # One second before end: counts.
+    await store.record_ledger_event(
+        MessageEvent(
+            guild_id=111,
+            member_id=1,
+            occurred_at=end - timedelta(seconds=1),
+            channel_id=333,
+        )
+    )
+
+    counts = await store.leaderboard_counts(111, start=start, end=end)
+    assert counts == ((1, 2),)
 
 
 # -- Milestones -----------------------------------------------------------------

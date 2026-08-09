@@ -29,6 +29,7 @@ from krubit.domain.activity_ledger import (
     MilestoneKind,
     ModerationReceiptEvent,
     RecognitionCandidate,
+    RetentionPolicy,
 )
 from krubit.storage.sqlite import SQLiteStore
 
@@ -854,3 +855,51 @@ async def test_export_member_denies_cross_guild_target(
     )
     assert result.status is CommandStatus.DENIED
     assert payload is None
+
+
+# ---------------------------------------------------------------------------
+# leaderboard: staff-only guild-wide meaningful-action ranking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_denies_non_staff_before_any_query(store: SQLiteStore) -> None:
+    service = ActivityCommandService(store, now=lambda: NOW)
+    actor = ActivityActorContext(guild_id=111, member_id=1, is_staff=False)
+
+    result = await service.leaderboard(actor=actor, year=2026)
+
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_renders_top_entries_for_staff(store: SQLiteStore) -> None:
+    inside_year = datetime(2026, 3, 1, tzinfo=UTC)
+    await store.record_ledger_event(
+        MessageEvent(guild_id=111, member_id=2, occurred_at=inside_year, channel_id=333)
+    )
+    service = ActivityCommandService(store, now=lambda: NOW)
+    actor = ActivityActorContext(guild_id=111, member_id=1, is_staff=True)
+
+    result = await service.leaderboard(actor=actor, year=2026)
+
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert "<@2>" in result.card.description
+    assert result.detail["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_appends_caveat_when_retention_policy_is_short(
+    store: SQLiteStore,
+) -> None:
+    await store.save_retention_policy(
+        RetentionPolicy(guild_id=111, max_age_days=1, updated_by=555, updated_at=NOW)
+    )
+    service = ActivityCommandService(store, now=lambda: NOW)
+    actor = ActivityActorContext(guild_id=111, member_id=1, is_staff=True)
+
+    result = await service.leaderboard(actor=actor, year=2026)
+
+    assert result.card is not None
+    assert "retention" in result.card.description.lower()

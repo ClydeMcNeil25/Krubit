@@ -30,7 +30,7 @@ existing table's scan-based reads, not something this module introduces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from krubit.domain.activity_ledger import (
     MEANINGFUL_EVENT_KINDS,
@@ -64,6 +64,11 @@ _LEFT_EVENT_TYPE = "member_left"
 # per-guild configuration" discipline `activity_ledger`'s module docstring uses
 # for `MEANINGFUL_EVENT_KINDS`.
 _RETURNING_TREND_WINDOW = CohortWindow.THIRTY_DAY
+
+# `leaderboard`'s displayed entry cap -- matches the design doc's confirmed
+# "top 10" decision, not a general-purpose list-rendering cap (unlike
+# `activity_commands._MAX_LIST_ENTRIES`, which this module does not use).
+_LEADERBOARD_ENTRY_LIMIT = 10
 
 
 def _require_positive_id(name: str, value: int) -> None:
@@ -162,6 +167,36 @@ class CommunityPulse:
             raise ValueError("channel_contribution_count must not be negative")
         if self.event_contribution_count < 0:
             raise ValueError("event_contribution_count must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class LeaderboardEntry:
+    """One member's meaningful-action count within a `leaderboard` result."""
+
+    member_id: int
+    count: int
+
+    def __post_init__(self) -> None:
+        _require_positive_id("member_id", self.member_id)
+        if self.count < 0:
+            raise ValueError("count must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class LeaderboardResult:
+    """The outcome of `leaderboard` for one guild and calendar year.
+
+    `retention_caveat` is `True` whenever the guild's currently configured
+    `RetentionPolicy.max_age_days` puts the retention sweep's absolute
+    cutoff (`now - max_age_days`) at or after this result's `year` began --
+    meaning the sweep has already pruned into or past the start of the year,
+    so `entries` may undercount. `False` when no policy is configured
+    (nothing is pruned) or the cutoff falls before the year started.
+    """
+
+    year: int
+    entries: tuple[LeaderboardEntry, ...]
+    retention_caveat: bool
 
 
 def _group_events_by_member(
@@ -391,3 +426,38 @@ async def community_pulse(
         channel_contribution_count=len(channel_ids),
         event_contribution_count=len(event_ids),
     )
+
+
+def _year_boundary(year: int) -> tuple[datetime, datetime]:
+    start = datetime(year, 1, 1, tzinfo=UTC)
+    end = datetime(year + 1, 1, 1, tzinfo=UTC)
+    return start, end
+
+
+async def leaderboard(
+    store: SQLiteStore, guild_id: int, *, year: int, now: datetime
+) -> LeaderboardResult:
+    """The top `_LEADERBOARD_ENTRY_LIMIT` members by meaningful-action count
+    for one calendar year, per the half-open interval `[Jan 1 00:00 UTC of
+    `year`, Jan 1 00:00 UTC of `year + 1`)`.
+
+    The retention caveat compares the guild's retention policy against the
+    same absolute cutoff the scheduled retention sweep actually uses (`now -
+    max_age_days`), rather than against the year's elapsed span -- so it
+    fires correctly for both the current year and any past year, however far
+    back.
+    """
+    _require_positive_id("guild_id", guild_id)
+    _require_aware("now", now)
+    start, end = _year_boundary(year)
+
+    counts = await store.leaderboard_counts(guild_id, start=start, end=min(end, now))
+    entries = tuple(
+        LeaderboardEntry(member_id=member_id, count=count)
+        for member_id, count in counts[:_LEADERBOARD_ENTRY_LIMIT]
+    )
+
+    policy = await store.get_retention_policy(guild_id)
+    retention_caveat = policy is not None and now - timedelta(days=policy.max_age_days) > start
+
+    return LeaderboardResult(year=year, entries=entries, retention_caveat=retention_caveat)
