@@ -1,0 +1,40 @@
+name: Krubit Deploy Health Check
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run health check
+        id: check
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python .github/scripts/check_deploy_health.py
+
+      - name: Commit updated state file if changed
+        run: |
+          if ! git diff --quiet -- .github/krubit-health-state.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/krubit-health-state.json
+            git commit -m "chore: update deploy health state"
+            git push
+          else
+            echo "No state change, nothing to commit"
+          fi
