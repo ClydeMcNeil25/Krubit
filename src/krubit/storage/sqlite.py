@@ -17,9 +17,9 @@ from uuid import uuid4
 import aiosqlite
 
 from krubit.domain.activity_ledger import (
+    MEANINGFUL_EVENT_KINDS,
     ExclusionEntry,
     LedgerEvent,
-    MEANINGFUL_EVENT_KINDS,
     Milestone,
     RetentionPolicy,
 )

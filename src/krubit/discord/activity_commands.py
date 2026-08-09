@@ -795,9 +795,9 @@ class ActivityCommandService:
         description = "\n".join(lines) or "No activity recorded for this year."
         if result.retention_caveat:
             description += (
-                "\n\n⚠️ This guild's retention policy is shorter than this "
-                "year's elapsed span — early-year activity may already be "
-                "pruned, so this count could be incomplete."
+                "\n\n⚠️ Some or all of this year's events may already have been "
+                "pruned by this guild's retention policy, so these counts may "
+                "be incomplete."
             )
         card = Card(
             kind="fetched",

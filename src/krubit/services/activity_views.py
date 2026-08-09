@@ -187,13 +187,11 @@ class LeaderboardResult:
     """The outcome of `leaderboard` for one guild and calendar year.
 
     `retention_caveat` is `True` whenever the guild's currently configured
-    `RetentionPolicy.max_age_days` is shorter than the span of days this
-    result's `year` actually covers (bounded by `now` for the current year,
-    or the full 365/366-day year for a past year) -- meaning raw events from
-    the early part of that span may already have been pruned by the
-    scheduled retention sweep, so `entries` may undercount. `False` when no
-    policy is configured (nothing is pruned) or the policy covers the full
-    span.
+    `RetentionPolicy.max_age_days` puts the retention sweep's absolute
+    cutoff (`now - max_age_days`) at or after this result's `year` began --
+    meaning the sweep has already pruned into or past the start of the year,
+    so `entries` may undercount. `False` when no policy is configured
+    (nothing is pruned) or the cutoff falls before the year started.
     """
 
     year: int
@@ -443,11 +441,11 @@ async def leaderboard(
     for one calendar year, per the half-open interval `[Jan 1 00:00 UTC of
     `year`, Jan 1 00:00 UTC of `year + 1`)`.
 
-    For the current year (`year == now.year`), the relevant span for the
-    retention caveat is bounded by `now` (days elapsed so far), not the full
-    year -- future days cannot yet have been pruned. For a past year, the
-    relevant span is the full year length (365 or 366 days), since the
-    entire year has already elapsed.
+    The retention caveat compares the guild's retention policy against the
+    same absolute cutoff the scheduled retention sweep actually uses (`now -
+    max_age_days`), rather than against the year's elapsed span -- so it
+    fires correctly for both the current year and any past year, however far
+    back.
     """
     _require_positive_id("guild_id", guild_id)
     _require_aware("now", now)
@@ -459,9 +457,7 @@ async def leaderboard(
         for member_id, count in counts[:_LEADERBOARD_ENTRY_LIMIT]
     )
 
-    elapsed_end = min(now, end)
-    elapsed_days = max((elapsed_end - start).days, 0)
     policy = await store.get_retention_policy(guild_id)
-    retention_caveat = policy is not None and policy.max_age_days < elapsed_days
+    retention_caveat = policy is not None and now - timedelta(days=policy.max_age_days) > start
 
     return LeaderboardResult(year=year, entries=entries, retention_caveat=retention_caveat)

@@ -138,3 +138,19 @@ async def test_leaderboard_past_year_retention_caveat_uses_full_year_span(
     result = await leaderboard(store, 111, year=2025, now=NOW)
 
     assert result.retention_caveat is True
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_retention_caveat_true_for_year_entirely_pruned_by_cutoff(
+    store: SQLiteStore,
+) -> None:
+    # NOW is 2026-08-08; a 400-day policy's cutoff is 2025-07-04, which is
+    # well after all of 2024 -- every 2024 event has already been pruned by
+    # the sweep, so the caveat must fire even though 400 days > 365/366.
+    await store.save_retention_policy(
+        RetentionPolicy(guild_id=111, max_age_days=400, updated_by=555, updated_at=NOW)
+    )
+
+    result = await leaderboard(store, 111, year=2024, now=NOW)
+
+    assert result.retention_caveat is True
