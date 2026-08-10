@@ -24,7 +24,7 @@ import discord
 import pytest
 
 from krubit.discord.watchdog_runtime import WatchdogRuntime
-from krubit.domain.watchdog import Incident, IncidentKind, RiskBand
+from krubit.domain.watchdog import AllowBlockEntry, Incident, IncidentKind, RiskBand
 from krubit.services.raid_detection import SpamWaveDetector
 from krubit.services.watch_window import WATCH_WINDOW_DURATION
 from krubit.services.webhook_and_permission_risk import WebhookAbuseDetector
@@ -245,6 +245,117 @@ async def test_on_member_join_is_a_no_op_when_watchdog_disabled(store: SQLiteSto
 
     assert await store.get_entry_sniff_assessment(GUILD_ID, MEMBER_ID) is None
     assert await store.list_open_watch_windows(GUILD_ID) == ()
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_records_and_notifies_an_incident_for_incident_band(
+    store: SQLiteStore,
+) -> None:
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 1
+    assert incidents[0].kind is IncidentKind.MEMBER
+    assert incidents[0].band is RiskBand.INCIDENT
+    assert len(channel.sent) == 1
+    assert "embed" in channel.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_records_no_incident_for_a_watch_band(
+    store: SQLiteStore,
+) -> None:
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    member = FakeMember(MEMBER_ID, guild, has_avatar=False)  # WATCH band, not INCIDENT
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert incidents == ()
+    assert channel.sent == ()
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_incident_reflects_the_assessments_own_signals(
+    store: SQLiteStore,
+) -> None:
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    assessment = await store.get_entry_sniff_assessment(GUILD_ID, MEMBER_ID)
+    assert assessment is not None
+    receipts = await store.list_sniff_receipts(GUILD_ID)
+    incident_receipt = next(r for r in receipts if r.action == "incident_recorded")
+    signal_names = incident_receipt.detail["signal_names"]
+    assert signal_names == [s.name for s in assessment.signals]
+
+
+@pytest.mark.asyncio
+async def test_two_separate_incident_band_joins_each_get_their_own_incident(
+    store: SQLiteStore,
+) -> None:
+    """Proves the no-dedup Global Constraint: a second INCIDENT-band join
+    while a first is still fresh is NOT suppressed, unlike the four
+    existing guild-scoped detectors' same-kind cooldown."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    other_member_id = MEMBER_ID + 1
+    for mid in (MEMBER_ID, other_member_id):
+        await store.save_allow_block_entry(
+            AllowBlockEntry(
+                guild_id=GUILD_ID,
+                discord_user_id=mid,
+                list_kind="block",
+                reason="test block entry",
+                set_by=1,
+                set_at=NOW,
+            )
+        )
+
+    await rt.on_member_join(cast(discord.Member, FakeMember(MEMBER_ID, guild)), NOW)
+    await rt.on_member_join(
+        cast(discord.Member, FakeMember(other_member_id, guild)), NOW + timedelta(seconds=1)
+    )
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 2
+    assert len(channel.sent) == 2
 
 
 # --- on_message: both flagged in-memory caches must both be fed --------------------

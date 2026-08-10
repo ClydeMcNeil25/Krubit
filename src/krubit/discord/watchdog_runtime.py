@@ -73,8 +73,14 @@ from uuid import uuid4
 import discord
 
 from krubit.discord.cards import render_card
-from krubit.domain.models import Card, CardField
-from krubit.domain.watchdog import Incident, RiskBand
+from krubit.domain.models import Card, CardField, JSONValue
+from krubit.domain.watchdog import (
+    EntrySniffAssessment,
+    Incident,
+    IncidentKind,
+    RiskBand,
+    RiskSignal,
+)
 from krubit.services.entry_sniff import EntrySniffService
 from krubit.services.raid_detection import RaidDetector, SpamWaveDetector
 from krubit.services.watch_window import InspectableMessage, WatchWindowService
@@ -88,6 +94,19 @@ _logger = logging.getLogger(__name__)
 
 GuildLookup = Callable[[int], discord.Guild | None]
 GuildIds = Callable[[], Sequence[int]]
+
+_MEMBER_INCIDENT_RECOMMENDED_ACTION = (
+    "Review this member's Entry Sniff assessment and signals; consider "
+    "manual verification, timeout, or removal if warranted. No automatic "
+    "action has been taken."
+)
+
+
+def _default_evidence_builder(
+    guild_id: int, signals: tuple[RiskSignal, ...], now: datetime
+) -> str:
+    del guild_id, signals, now
+    return f"evidence:{uuid4().hex}"
 
 
 def _require_aware(name: str, value: datetime) -> None:
@@ -138,6 +157,8 @@ class WatchdogRuntime:
         webhook_abuse_detector: WebhookAbuseDetector | None = None,
         permission_risk_detector: PermissionRiskDetector | None = None,
         now: Callable[[], datetime] | None = None,
+        evidence_builder: Callable[[int, tuple[RiskSignal, ...], datetime], str]
+        | None = None,
     ) -> None:
         self._store = store
         self._watchdog_enabled = watchdog_enabled
@@ -155,6 +176,7 @@ class WatchdogRuntime:
             permission_risk_detector or PermissionRiskDetector(store)
         )
         self._now = now or (lambda: datetime.now(UTC))
+        self._evidence_builder = evidence_builder or _default_evidence_builder
         # See the module docstring's "Avoiding a watch-window query per message"
         # section. Never the authority on whether a window is open -- only a fast
         # pre-filter; `WatchWindowService.inspect_message` re-validates against
@@ -177,16 +199,18 @@ class WatchdogRuntime:
         self._watched_members[guild_id] = {window.member_id for window in windows}
 
     async def on_member_join(self, member: discord.Member, now: datetime) -> None:
-        """Assess a fresh join and open a bounded watch window when warranted.
+        """Assess a fresh join, open a bounded watch window when warranted, and --
+        new in this task -- record a durable `Incident` and notify staff
+        immediately when the assessment reaches `RiskBand.INCIDENT`.
 
-        Exactly Task 4's own two calls, in order: `EntrySniffService.assess_join`
-        produces the one durable per-join assessment, then `WatchWindowService.
-        open_if_warranted` opens a window for anything above `RiskBand.CLEAR`. Neither
-        call is skipped or reordered; this method adds no independent risk logic of
-        its own. Converting an `INCIDENT`-band member assessment into a durable
-        `Incident`/staff notification is intentionally out of this task's scope (no
-        such interface was specified) -- the assessment itself is still recorded and
-        visible via the existing `/fetch sniff`-family read surface once built.
+        Exactly Task 4's original two calls, in order, unchanged: `EntrySniffService.
+        assess_join` produces the one durable per-join assessment, then
+        `WatchWindowService.open_if_warranted` opens a window for anything above
+        `RiskBand.CLEAR`. The new third step is strictly additive and never skips or
+        reorders either original call. No same-kind dedup is applied here (unlike the
+        four sweep-cycle detectors' `_has_open_incident_of_kind` cooldown) -- each
+        `INCIDENT`-band join is an independent member and independent evidence, so
+        every one gets its own `Incident` and its own notification.
         """
         if not self._watchdog_enabled:
             return
@@ -195,6 +219,39 @@ class WatchdogRuntime:
         window = await self._watch_window.open_if_warranted(assessment, now)
         if window is not None:
             self._watched_members[window.guild_id].add(window.member_id)
+        if assessment.band is RiskBand.INCIDENT:
+            await self._record_member_incident(assessment, now)
+
+    async def _record_member_incident(
+        self, assessment: EntrySniffAssessment, now: datetime
+    ) -> None:
+        evidence_packet_id = self._evidence_builder(
+            assessment.guild_id, assessment.signals, now
+        )
+        incident = Incident(
+            guild_id=assessment.guild_id,
+            incident_id=f"member:{uuid4().hex}",
+            kind=IncidentKind.MEMBER,
+            band=RiskBand.INCIDENT,
+            opened_at=now,
+            evidence_packet_id=evidence_packet_id,
+            recommended_action=_MEMBER_INCIDENT_RECOMMENDED_ACTION,
+            acknowledged_by=None,
+        )
+        saved = await self._store.record_incident(incident)
+        detail: dict[str, JSONValue] = {
+            "kind": saved.kind.value,
+            "signal_names": [signal.name for signal in assessment.signals],
+        }
+        await self._store.record_sniff_receipt(
+            guild_id=saved.guild_id,
+            receipt_id=f"incident:{saved.incident_id}",
+            member_id=assessment.member_id,
+            action="incident_recorded",
+            detail=detail,
+            created_at=now,
+        )
+        await self.notify_staff(saved)
 
     async def on_message(self, message: InspectableMessage, now: datetime) -> None:
         """Feed a guild message into watch-window inspection and spam-wave correlation.
