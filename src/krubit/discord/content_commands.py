@@ -25,9 +25,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import discord
 from discord import app_commands
@@ -42,12 +42,15 @@ from krubit.discord.content_cards import (
 )
 from krubit.discord.content_runtime import ContentRuntime, parse_delivery_id
 from krubit.domain.creator_signals import (
+    Capability,
     ContentEvent,
     ContentKind,
     ContentState,
     Platform,
+    creator_account_id,
 )
 from krubit.domain.models import Card, CardField, JSONValue
+from krubit.integrations.authorize_urls import build_meta_authorize_url, build_tiktok_authorize_url
 from krubit.integrations.catalog import CATALOG, recognize_account_url
 from krubit.services.creator_analytics import CreatorAnalyticsService
 from krubit.services.creator_registry import CreatorAuthorityError, CreatorRegistry
@@ -62,6 +65,13 @@ _CREATOR_ROLE_NAME = "Creator"
 _NOTIFICATION_CHANNEL_NAME = "social-notifications"
 _PREVIEW_ROUTE_MISSING = "no route is configured for this content kind yet"
 _UNLIMITED = MentionBudgetState(limit=None)
+
+# How long an issued authorize link stays valid before it must be
+# re-requested. No existing precedent constant for this in the codebase
+# (this is the first caller of `issue_oauth_attempt`) -- 10 minutes is
+# long enough for a member to click through, short enough that a leaked
+# link (e.g. pasted into the wrong channel) has a small blast radius.
+_OAUTH_ATTEMPT_TTL = timedelta(minutes=10)
 
 
 class CommandStatus(StrEnum):
@@ -220,6 +230,118 @@ class ContentCommandService:
         )
         return CommandResult(
             CommandStatus.SUCCEEDED, card=card, detail={"account_id": account.account_id}
+        )
+
+    async def creator_authorize(
+        self,
+        *,
+        actor: ActorContext,
+        owner: ActorContext,
+        url: str,
+        capability: Capability,
+        meta_app_id: str | None,
+        meta_callback_base_url: str | None,
+        tiktok_client_key: str | None,
+        tiktok_callback_base_url: str | None,
+    ) -> CommandResult:
+        if actor.guild_id != owner.guild_id:
+            return CommandResult(CommandStatus.DENIED, detail={"reason": "cross_guild_owner"})
+        try:
+            _require_authority(
+                actor_member_id=actor.member_id,
+                owner_member_id=owner.member_id,
+                actor_is_admin=actor.is_admin,
+                actor_has_creator_role=actor.has_creator_role,
+            )
+        except CreatorAuthorityError as exc:
+            return _denied(exc)
+        if capability not in (Capability.ACCOUNT, Capability.SOCIAL):
+            return CommandResult(
+                CommandStatus.FAILED,
+                detail={"reason": f"{capability.value} capability is not supported yet"},
+            )
+        try:
+            recognized = recognize_account_url(url)
+        except ValueError as exc:
+            return CommandResult(CommandStatus.FAILED, detail={"reason": str(exc)})
+
+        account_id = creator_account_id(recognized.platform, recognized.handle)
+        account = await self._store.get_creator_account(owner.guild_id, account_id)
+        if account is None or account.owner_member_id != owner.member_id:
+            return CommandResult(
+                CommandStatus.FAILED,
+                detail={
+                    "reason": "creator account not found -- add it first with /fetch creator add"
+                },
+            )
+
+        now = self._now()
+        if recognized.platform in (Platform.INSTAGRAM, Platform.THREADS):
+            if meta_app_id is None or meta_callback_base_url is None:
+                return CommandResult(
+                    CommandStatus.FAILED,
+                    detail={"reason": "Meta authorization is not configured yet"},
+                )
+            redirect_uri = f"{meta_callback_base_url}/callbacks/meta/authorize"
+            state = await self._store.issue_oauth_attempt(
+                guild_id=owner.guild_id,
+                member_id=owner.member_id,
+                account_id=account.account_id,
+                platform=recognized.platform.value,
+                capability=capability.value,
+                redirect_uri=redirect_uri,
+                now=now,
+                ttl=_OAUTH_ATTEMPT_TTL,
+            )
+            authorize_url = build_meta_authorize_url(
+                app_id=meta_app_id,
+                redirect_uri=redirect_uri,
+                state=state,
+                platform=recognized.platform,
+                capability=capability,
+            )
+        elif recognized.platform is Platform.TIKTOK:
+            if tiktok_client_key is None or tiktok_callback_base_url is None:
+                return CommandResult(
+                    CommandStatus.FAILED,
+                    detail={"reason": "TikTok authorization is not configured yet"},
+                )
+            redirect_uri = f"{tiktok_callback_base_url}/callbacks/tiktok/authorize"
+            state = await self._store.issue_oauth_attempt(
+                guild_id=owner.guild_id,
+                member_id=owner.member_id,
+                account_id=account.account_id,
+                platform=recognized.platform.value,
+                capability=capability.value,
+                redirect_uri=redirect_uri,
+                now=now,
+                ttl=_OAUTH_ATTEMPT_TTL,
+            )
+            authorize_url = build_tiktok_authorize_url(
+                client_key=tiktok_client_key,
+                redirect_uri=redirect_uri,
+                state=state,
+                capability=capability,
+            )
+        else:
+            return CommandResult(
+                CommandStatus.FAILED,
+                detail={
+                    "reason": f"{recognized.platform.value} does not support OAuth authorization"
+                },
+            )
+
+        card = Card(
+            "fetched",
+            "Fetched: Authorization Link",
+            f"Click to authorize {capability.value} access for {account.handle}: "
+            f"{authorize_url}\n\nThis link expires in "
+            f"{int(_OAUTH_ATTEMPT_TTL.total_seconds() // 60)} minutes and can only be used once.",
+        )
+        return CommandResult(
+            CommandStatus.SUCCEEDED,
+            card=card,
+            detail={"platform": recognized.platform.value, "capability": capability.value},
         )
 
     async def _toggle_pause(
@@ -913,6 +1035,40 @@ class CreatorCommands(app_commands.Group):
         await self._present(interaction, result, confirm=lambda: self._service.creator_add(
             actor=actor, owner=owner, url=url, confirm=True
         ))
+
+    @app_commands.command(
+        name="authorize", description="Get an OAuth authorization link for a creator account"
+    )
+    @app_commands.guild_only()
+    async def authorize(
+        self,
+        interaction: discord.Interaction,
+        url: str,
+        capability: Literal["account", "social"],
+        member: discord.Member | None = None,
+    ) -> None:
+        actor = await _actor_context(self._service, interaction)
+        if actor is None:
+            return
+        owner = (
+            await _actor_context(self._service, interaction, member_id=member.id)
+            if member is not None
+            else actor
+        )
+        if owner is None:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self._service.creator_authorize(
+            actor=actor,
+            owner=owner,
+            url=url,
+            capability=Capability(capability),
+            meta_app_id=self._parent._meta_app_id,
+            meta_callback_base_url=self._parent._meta_callback_base_url,
+            tiktok_client_key=self._parent._tiktok_client_key,
+            tiktok_callback_base_url=self._parent._tiktok_callback_base_url,
+        )
+        await self._present(interaction, result)
 
     @app_commands.command(name="pause", description="Pause a creator account")
     @app_commands.guild_only()

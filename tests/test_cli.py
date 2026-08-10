@@ -150,6 +150,7 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
         # registered — the operator runbook documents it as available.
         assert {command.name for command in creator.commands} == {
             "add",
+            "authorize",
             "pause",
             "resume",
             "remove",

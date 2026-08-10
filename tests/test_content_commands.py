@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import discord
 import pytest
 
 from krubit.discord.content_commands import (
@@ -15,7 +16,12 @@ from krubit.discord.content_commands import (
     GuildLike,
 )
 from krubit.discord.content_runtime import ContentRuntime, delivery_id_for
-from krubit.domain.creator_signals import ContentKind, CreatorRoute, Platform
+from krubit.domain.creator_signals import (
+    Capability,
+    ContentKind,
+    CreatorRoute,
+    Platform,
+)
 from krubit.services.content_signals import ContentSignalService
 from krubit.storage.sqlite import CreatorRegistryReceipt, SQLiteStore
 
@@ -177,6 +183,296 @@ async def test_denied_actor_never_receives_a_confirmation_card(
         actor=creator_member(), owner=other_member(), url=YOUTUBE_URL
     )
     assert denied.card is None
+
+
+# -- authorize -----------------------------------------------------------------
+
+INSTAGRAM_URL = "https://www.instagram.com/examplecreator"
+TIKTOK_URL = "https://www.tiktok.com/@examplecreator"
+
+_META_APP_ID = "test-meta-app-id"
+_META_CALLBACK_BASE_URL = "https://example.com"
+_TIKTOK_CLIENT_KEY = "test-tiktok-client-key"
+_TIKTOK_CALLBACK_BASE_URL = "https://example.com"
+
+
+async def _add_and_confirm(
+    commands: ContentCommandService, *, actor: ActorContext, owner: ActorContext, url: str
+) -> str:
+    added = await commands.creator_add(actor=actor, owner=owner, url=url, confirm=True)
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+    return account_id
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_denies_non_owner_non_admin(
+    commands: ContentCommandService,
+) -> None:
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=other_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.DENIED
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_succeeds_for_owner_with_instagram_account(
+    commands: ContentCommandService,
+) -> None:
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert "facebook.com" in result.card.description
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_succeeds_for_admin_on_behalf_of_another_member(
+    commands: ContentCommandService,
+) -> None:
+    await _add_and_confirm(commands, actor=creator_member(), owner=creator_member(), url=TIKTOK_URL)
+
+    result = await commands.creator_authorize(
+        actor=admin_member(),
+        owner=creator_member(),
+        url=TIKTOK_URL,
+        capability=Capability.SOCIAL,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    assert "tiktok.com" in result.card.description
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_fails_when_account_not_yet_added(
+    commands: ContentCommandService,
+) -> None:
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_rejects_facebook_page_before_issuing_any_state(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    facebook_page_url = "https://www.facebook.com/pages/Example-Page/123456789"
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=facebook_page_url
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=facebook_page_url,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_rejects_live_capability_before_issuing_any_state(
+    commands: ContentCommandService,
+) -> None:
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.LIVE,
+        meta_app_id=_META_APP_ID,
+        meta_callback_base_url=_META_CALLBACK_BASE_URL,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_fails_cleanly_when_meta_not_configured(
+    commands: ContentCommandService,
+) -> None:
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=None,
+        meta_callback_base_url=None,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+    )
+    assert result.status is CommandStatus.FAILED
+
+
+class _FakeParent:
+    """A minimal stand-in for `FetchCommands` -- `CreatorCommands.
+    authorize` only reads these four credential attributes off `_parent`,
+    so a full `FetchCommands`/`KrubitBot` construction is unnecessary."""
+
+    def __init__(self) -> None:
+        self._meta_app_id: str | None = _META_APP_ID
+        self._meta_callback_base_url: str | None = _META_CALLBACK_BASE_URL
+        self._tiktok_client_key: str | None = _TIKTOK_CLIENT_KEY
+        self._tiktok_callback_base_url: str | None = _TIKTOK_CALLBACK_BASE_URL
+
+
+class _AuthorizeFakeMember:
+    def __init__(self, member_id: int) -> None:
+        self.id = member_id
+        self.guild_permissions = SimpleNamespace(administrator=False, manage_guild=False)
+        self.roles: list[object] = []
+
+
+class _AuthorizeFakeGuild:
+    def __init__(self, members: dict[int, _AuthorizeFakeMember]) -> None:
+        self.id = GUILD_ID
+        self.roles: list[object] = []
+        self.text_channels: list[object] = []
+        self._members = members
+
+    def get_member(self, member_id: int) -> _AuthorizeFakeMember | None:
+        return self._members.get(member_id)
+
+
+class _AuthorizeFakeResponse:
+    def __init__(self) -> None:
+        self.deferred: dict[str, bool] | None = None
+        self.sent: dict[str, object] | None = None
+
+    async def defer(self, *, ephemeral: bool, thinking: bool) -> None:
+        self.deferred = {"ephemeral": ephemeral, "thinking": thinking}
+
+    async def send_message(self, content: str, *, ephemeral: bool) -> None:
+        self.sent = {"content": content, "ephemeral": ephemeral}
+
+
+class _AuthorizeFakeFollowup:
+    def __init__(self) -> None:
+        self.sent: dict[str, object] | None = None
+
+    async def send(
+        self, content: str | None = None, *, embed: object | None = None, ephemeral: bool = False
+    ) -> None:
+        self.sent = {"content": content, "embed": embed, "ephemeral": ephemeral}
+
+
+class _AuthorizeFakeInteraction:
+    def __init__(self, guild: _AuthorizeFakeGuild, member: _AuthorizeFakeMember) -> None:
+        self.guild_id = guild.id
+        self.guild = guild
+        self.user = member
+        self.response = _AuthorizeFakeResponse()
+        self.followup = _AuthorizeFakeFollowup()
+
+
+@pytest.mark.asyncio
+async def test_authorize_command_denies_non_owner_before_any_send(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`other` (not the account owner, not an admin) tries to authorize
+    `owner`'s account. `CreatorCommands.authorize` defers (matching every
+    other mutating command's defer-then-call-service shape -- see `add`)
+    and only then learns from the service that the actor is unauthorized.
+    The safety property this proves is the same "denied actor never sees
+    the informative card" contract the module docstring documents for
+    every other command: the actor's `followup.send` receives only a bare
+    status string, never an embed carrying the account's handle/URL."""
+    from krubit.discord.content_commands import ContentCommandService, CreatorCommands
+
+    monkeypatch.setattr(
+        "krubit.discord.content_commands.discord.Member", _AuthorizeFakeMember
+    )
+    service = ContentCommandService(store, now=lambda: NOW)
+    await service.creator_add(
+        actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL, confirm=True
+    )
+    commands = CreatorCommands(cast(object, _FakeParent()), service)
+    owner = _AuthorizeFakeMember(OWNER_ID)
+    other = _AuthorizeFakeMember(OTHER_ID)
+    guild = _AuthorizeFakeGuild({OWNER_ID: owner, OTHER_ID: other})
+    interaction = _AuthorizeFakeInteraction(guild, other)
+
+    await commands.authorize.callback(  # type: ignore[attr-defined]
+        commands, cast(discord.Interaction, interaction), INSTAGRAM_URL, "account", owner
+    )
+
+    assert interaction.response.deferred == {"ephemeral": True, "thinking": True}
+    assert interaction.followup.sent is not None
+    assert interaction.followup.sent["embed"] is None
+    assert interaction.followup.sent["content"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_authorize_command_sends_an_embed_for_the_owner(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from krubit.discord.content_commands import ContentCommandService, CreatorCommands
+
+    monkeypatch.setattr(
+        "krubit.discord.content_commands.discord.Member", _AuthorizeFakeMember
+    )
+    service = ContentCommandService(store, now=lambda: NOW)
+    await service.creator_add(
+        actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL, confirm=True
+    )
+    commands = CreatorCommands(cast(object, _FakeParent()), service)
+    owner = _AuthorizeFakeMember(OWNER_ID)
+    guild = _AuthorizeFakeGuild({OWNER_ID: owner})
+    interaction = _AuthorizeFakeInteraction(guild, owner)
+
+    await commands.authorize.callback(  # type: ignore[attr-defined]
+        commands, cast(discord.Interaction, interaction), INSTAGRAM_URL, "account", None
+    )
+
+    assert interaction.response.deferred == {"ephemeral": True, "thinking": True}
+    assert interaction.followup.sent is not None
 
 
 # -- pause/resume/remove -------------------------------------------------------------

@@ -87,6 +87,10 @@ class FetchCommands(app_commands.Group):
         watchdog_facts: WatchdogHealthFacts | None = None,
         activity_ledger_facts: ActivityLedgerHealthFacts | None = None,
         activity_ledger_inactivity_threshold_days: int | None = None,
+        meta_app_id: str | None = None,
+        meta_callback_base_url: str | None = None,
+        tiktok_client_key: str | None = None,
+        tiktok_callback_base_url: str | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -96,6 +100,10 @@ class FetchCommands(app_commands.Group):
         self._presence_intent = presence_intent
         self._twitch_credentials = twitch_credentials
         self._twitch_available = twitch_available
+        self._meta_app_id = meta_app_id
+        self._meta_callback_base_url = meta_callback_base_url
+        self._tiktok_client_key = tiktok_client_key
+        self._tiktok_callback_base_url = tiktok_callback_base_url
         # See `WatchdogHealthFacts`'s own docstring for why this is a process-level
         # fact bundle passed in at construction rather than derived from a captured
         # `SnapshotRecord` -- it mirrors `presence_intent`/`twitch_credentials`/
@@ -1161,6 +1169,10 @@ class KrubitBot(discord.Client):
                 activity_ledger_inactivity_threshold_days=(
                     settings.activity_ledger_inactivity_threshold_days
                 ),
+                meta_app_id=settings.meta_app_id,
+                meta_callback_base_url=settings.meta_callback_base_url,
+                tiktok_client_key=settings.tiktok_client_key,
+                tiktok_callback_base_url=settings.tiktok_callback_base_url,
             )
         )
 
