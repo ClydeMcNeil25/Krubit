@@ -29,6 +29,12 @@ _PROJECT_ID = "6ee1417e-f70d-486c-bebf-621bc5c8fd62"
 _ENVIRONMENT_ID = "f530bd42-cd24-4e03-b5f1-4d1c33fbb28d"
 _SERVICE_ID = "90238c9f-2a9d-41e7-aee5-7f9c0e2595bf"
 _RAILWAY_PROJECT_URL = f"https://railway.com/project/{_PROJECT_ID}"
+# Python's default urllib User-Agent ("Python-urllib/3.x") is a well-known
+# bot signature that Cloudflare-fronted APIs (including Railway's) commonly
+# reject outright with a 403 before the request ever reaches the actual
+# GraphQL resolver -- sending a descriptive one avoids that class of
+# false-negative "the token/query is fine but we got blocked anyway" failure.
+_USER_AGENT = "krubit-deploy-health-check/1.0 (+https://github.com/ClydeMcNeil25/Krubit)"
 
 _STATE_PATH = Path(__file__).parent.parent / "krubit-health-state.json"
 
@@ -169,6 +175,7 @@ def query_railway_deployment(token: str) -> tuple[str, str, str]:
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            "User-Agent": _USER_AGENT,
         },
         method="POST",
     )
@@ -205,7 +212,7 @@ def post_to_discord(webhook_url: str, content: str) -> None:
     request = urllib.request.Request(
         webhook_url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": _USER_AGENT},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=15) as response:
