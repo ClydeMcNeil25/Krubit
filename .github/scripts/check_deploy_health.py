@@ -243,7 +243,7 @@ def main() -> int:
     action = determine_action(previous_classification, classification)
     print(
         f"status={status} classification={classification} action={action} "
-        f"deployment_created_at={created_at}"
+        f"deployment_created_at={created_at} detail={detail}"
     )
 
     if action == "none":
