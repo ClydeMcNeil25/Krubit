@@ -54,8 +54,16 @@ def test_build_meta_authorize_url_for_threads_account() -> None:
         platform=Platform.THREADS,
         capability=Capability.ACCOUNT,
     )
-    query = parse_qs(urlparse(url).query)
+    parsed = urlparse(url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "threads.net"
+    assert parsed.path == "/oauth/authorize"
+    query = parse_qs(parsed.query)
+    assert query["client_id"] == ["app123"]
+    assert query["redirect_uri"] == ["https://example.com/callbacks/meta/authorize"]
+    assert query["state"] == ["state-token"]
     assert query["scope"] == ["threads_basic"]
+    assert query["response_type"] == ["code"]
 
 
 def test_build_meta_authorize_url_for_threads_social_includes_publish_scope() -> None:

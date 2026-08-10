@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import pytest
@@ -191,9 +193,8 @@ INSTAGRAM_URL = "https://www.instagram.com/examplecreator"
 TIKTOK_URL = "https://www.tiktok.com/@examplecreator"
 
 _META_APP_ID = "test-meta-app-id"
-_META_CALLBACK_BASE_URL = "https://example.com"
 _TIKTOK_CLIENT_KEY = "test-tiktok-client-key"
-_TIKTOK_CALLBACK_BASE_URL = "https://example.com"
+_CALLBACK_PUBLIC_BASE_URL = "https://example.com"
 
 
 async def _add_and_confirm(
@@ -219,9 +220,8 @@ async def test_creator_authorize_denies_non_owner_non_admin(
         url=INSTAGRAM_URL,
         capability=Capability.ACCOUNT,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.DENIED
 
@@ -240,9 +240,8 @@ async def test_creator_authorize_succeeds_for_owner_with_instagram_account(
         url=INSTAGRAM_URL,
         capability=Capability.ACCOUNT,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.SUCCEEDED
     assert result.card is not None
@@ -261,9 +260,8 @@ async def test_creator_authorize_succeeds_for_admin_on_behalf_of_another_member(
         url=TIKTOK_URL,
         capability=Capability.SOCIAL,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.SUCCEEDED
     assert result.card is not None
@@ -280,9 +278,8 @@ async def test_creator_authorize_fails_when_account_not_yet_added(
         url=INSTAGRAM_URL,
         capability=Capability.ACCOUNT,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.FAILED
 
@@ -302,9 +299,8 @@ async def test_creator_authorize_rejects_facebook_page_before_issuing_any_state(
         url=facebook_page_url,
         capability=Capability.ACCOUNT,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.FAILED
 
@@ -323,9 +319,8 @@ async def test_creator_authorize_rejects_live_capability_before_issuing_any_stat
         url=INSTAGRAM_URL,
         capability=Capability.LIVE,
         meta_app_id=_META_APP_ID,
-        meta_callback_base_url=_META_CALLBACK_BASE_URL,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
     )
     assert result.status is CommandStatus.FAILED
 
@@ -344,23 +339,86 @@ async def test_creator_authorize_fails_cleanly_when_meta_not_configured(
         url=INSTAGRAM_URL,
         capability=Capability.ACCOUNT,
         meta_app_id=None,
-        meta_callback_base_url=None,
         tiktok_client_key=_TIKTOK_CLIENT_KEY,
-        tiktok_callback_base_url=_TIKTOK_CALLBACK_BASE_URL,
+        callback_public_base_url=None,
     )
     assert result.status is CommandStatus.FAILED
 
 
+@pytest.mark.asyncio
+async def test_creator_authorize_redirect_uri_is_built_from_callback_public_base_url(
+    commands: ContentCommandService,
+) -> None:
+    """Final-review Important #2: `redirect_uri` must come from the single
+    `callback_public_base_url` (`KRUBIT_CALLBACK_PUBLIC_BASE_URL`) that the real
+    callback routes are actually mounted under -- not from the unrelated, unvalidated
+    `meta_callback_base_url`/`tiktok_callback_base_url` settings, which have no
+    cross-validation against where the callback server actually listens."""
+    await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    match = re.search(r"https://\S+", result.card.description)
+    assert match is not None
+    query = parse_qs(urlparse(match.group(0)).query)
+    assert query["redirect_uri"] == [f"{_CALLBACK_PUBLIC_BASE_URL}/callbacks/meta/authorize"]
+
+
+@pytest.mark.asyncio
+async def test_creator_authorize_records_a_redacted_audit_receipt(
+    commands: ContentCommandService, store: SQLiteStore
+) -> None:
+    """Final-review Minor #4: issuing an authorization link is arguably the most
+    audit-worthy action in this group -- an admin can trigger it on another
+    member's behalf, and it mints a real credential-grant token -- yet it recorded
+    no receipt at all. This proves a redacted receipt is recorded (platform,
+    capability, owner_member_id only -- never the state token) matching the
+    pattern every other mutating command in this module already follows."""
+    account_id = await _add_and_confirm(
+        commands, actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL
+    )
+
+    result = await commands.creator_authorize(
+        actor=creator_member(),
+        owner=creator_member(),
+        url=INSTAGRAM_URL,
+        capability=Capability.ACCOUNT,
+        meta_app_id=_META_APP_ID,
+        tiktok_client_key=_TIKTOK_CLIENT_KEY,
+        callback_public_base_url=_CALLBACK_PUBLIC_BASE_URL,
+    )
+    assert result.status is CommandStatus.SUCCEEDED
+
+    receipts = await store.list_creator_registry_receipts(GUILD_ID, account_id)
+    issued = [r for r in receipts if r.action == "authorize_link_issued"]
+    assert len(issued) == 1
+    assert issued[0].detail == {
+        "platform": Platform.INSTAGRAM.value,
+        "capability": Capability.ACCOUNT.value,
+        "owner_member_id": OWNER_ID,
+    }
+
+
 class _FakeParent:
     """A minimal stand-in for `FetchCommands` -- `CreatorCommands.
-    authorize` only reads these four credential attributes off `_parent`,
+    authorize` only reads these three credential attributes off `_parent`,
     so a full `FetchCommands`/`KrubitBot` construction is unnecessary."""
 
     def __init__(self) -> None:
         self._meta_app_id: str | None = _META_APP_ID
-        self._meta_callback_base_url: str | None = _META_CALLBACK_BASE_URL
         self._tiktok_client_key: str | None = _TIKTOK_CLIENT_KEY
-        self._tiktok_callback_base_url: str | None = _TIKTOK_CALLBACK_BASE_URL
+        self._callback_public_base_url: str | None = _CALLBACK_PUBLIC_BASE_URL
 
 
 class _AuthorizeFakeMember:

@@ -310,6 +310,39 @@ class CreatorRegistry:
         )
         return saved
 
+    async def record_authorize_link_issued(
+        self,
+        *,
+        guild_id: int,
+        account_id: str,
+        actor_member_id: int,
+        owner_member_id: int,
+        platform: Platform,
+        capability: Capability,
+        now: datetime,
+    ) -> None:
+        """Record a redacted audit receipt when an OAuth authorization link is issued.
+
+        Distinct from `record_oauth_authorization` (which records the receipt for a
+        *completed* authorization once the callback side redeems the code): this
+        covers link *issuance* itself -- arguably the most audit-worthy action in
+        this group, since an admin can trigger it on another member's behalf and it
+        mints a real credential-grant token. `detail` never carries the state token,
+        matching every other receipt this class records.
+        """
+        await self._record_receipt(
+            guild_id=guild_id,
+            account_id=account_id,
+            action="authorize_link_issued",
+            actor_member_id=actor_member_id,
+            detail={
+                "platform": platform.value,
+                "capability": capability.value,
+                "owner_member_id": owner_member_id,
+            },
+            now=now,
+        )
+
     async def _set_paused(
         self,
         *,

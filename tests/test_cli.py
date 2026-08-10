@@ -706,6 +706,46 @@ async def test_enabled_live_runtime_loop_is_cancelled_by_bot_close(
         await store.close()
 
 
+@pytest.mark.asyncio
+async def test_activity_ledger_sweep_starts_when_only_creator_signals_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final-review Important #3: `ActivityRuntime.sweep_cycle` deliberately purges
+    `oauth_attempts` *before* checking `activity_ledger_enabled`, precisely so a
+    deployment with `creator_signals_enabled=True, activity_ledger_enabled=False`
+    (a real, supported configuration) still purges unconsumed OAuth attempt rows.
+    That un-gating is worthless if the sweep loop itself never starts under this
+    configuration -- this proves `activity_ledger_sweep_cycle` starts when
+    `creator_signals_enabled` is on, even with the activity ledger off."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    bot = KrubitBot(
+        Settings(
+            application_id=123,
+            database_path=tmp_path / "krubit.db",
+            creator_signals_enabled=True,
+            activity_ledger_enabled=False,
+        ),
+        FoundationService(store),
+    )
+
+    async def sync() -> None:
+        return None
+
+    async def ready() -> None:
+        return None
+
+    monkeypatch.setattr(bot.tree, "sync", sync)
+    monkeypatch.setattr(bot, "wait_until_ready", ready)
+
+    try:
+        await bot.setup_hook()
+        task = bot.activity_ledger_sweep_cycle.get_task()
+        assert task is not None and not task.done()
+    finally:
+        await bot.close()
+        await store.close()
+
+
 class _InertConnector:
     """Enough of `Connector` to enable `content_scheduler_cycle`; never actually called."""
 

@@ -22,6 +22,18 @@ implemented), and `Capability.LIVE` is unsupported for every platform
 (neither Meta nor TikTok has a stable, well-documented scope for this
 today) -- both raise `ValueError` rather than building a URL that can't
 work.
+
+Threads is not routed through Facebook's Login dialog (`www.facebook.com`):
+despite living under the Meta umbrella, Threads has its own standalone
+OAuth authorization host (`https://threads.net/oauth/authorize`), matching
+`src/krubit/integrations/meta.py`'s own `_THREADS_TOKEN_EXCHANGE_URL`
+(`https://graph.threads.net/oauth/access_token`) -- the Facebook Login
+dialog does not grant `threads_basic`/`threads_content_publish` scopes or
+mint a code redeemable at `graph.threads.net`. Instagram genuinely does use
+the Facebook Login dialog, so only Threads gets this separate host; both
+still authenticate with the same `meta_app_id`/`meta_app_secret` Meta
+Developer app credentials (`src/krubit/web/wiring.py`'s token-exchange
+route already assumes this for both platforms).
 """
 
 from __future__ import annotations
@@ -31,6 +43,13 @@ from urllib.parse import urlencode
 from krubit.domain.creator_signals import Capability, Platform
 
 _META_GRAPH_API_VERSION = "v21.0"
+
+# Threads' own standalone OAuth authorization host -- not Facebook's Login
+# dialog. Matches `krubit.integrations.meta._THREADS_TOKEN_EXCHANGE_URL`
+# (`https://graph.threads.net/oauth/access_token`), which this codebase
+# already uses to redeem a Threads authorization code; a code minted by the
+# Facebook Login dialog can't be redeemed there. See the module docstring.
+_THREADS_AUTHORIZE_URL = "https://threads.net/oauth/authorize"
 
 _INSTAGRAM_SCOPES: dict[Capability, str] = {
     Capability.ACCOUNT: "instagram_basic",
@@ -69,6 +88,8 @@ def build_meta_authorize_url(
             "response_type": "code",
         }
     )
+    if platform is Platform.THREADS:
+        return f"{_THREADS_AUTHORIZE_URL}?{query}"
     return f"https://www.facebook.com/{_META_GRAPH_API_VERSION}/dialog/oauth?{query}"
 
 

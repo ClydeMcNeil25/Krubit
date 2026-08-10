@@ -240,9 +240,8 @@ class ContentCommandService:
         url: str,
         capability: Capability,
         meta_app_id: str | None,
-        meta_callback_base_url: str | None,
         tiktok_client_key: str | None,
-        tiktok_callback_base_url: str | None,
+        callback_public_base_url: str | None,
     ) -> CommandResult:
         if actor.guild_id != owner.guild_id:
             return CommandResult(CommandStatus.DENIED, detail={"reason": "cross_guild_owner"})
@@ -277,12 +276,12 @@ class ContentCommandService:
 
         now = self._now()
         if recognized.platform in (Platform.INSTAGRAM, Platform.THREADS):
-            if meta_app_id is None or meta_callback_base_url is None:
+            if meta_app_id is None or callback_public_base_url is None:
                 return CommandResult(
                     CommandStatus.FAILED,
                     detail={"reason": "Meta authorization is not configured yet"},
                 )
-            redirect_uri = f"{meta_callback_base_url}/callbacks/meta/authorize"
+            redirect_uri = f"{callback_public_base_url.rstrip('/')}/callbacks/meta/authorize"
             state = await self._store.issue_oauth_attempt(
                 guild_id=owner.guild_id,
                 member_id=owner.member_id,
@@ -301,12 +300,12 @@ class ContentCommandService:
                 capability=capability,
             )
         elif recognized.platform is Platform.TIKTOK:
-            if tiktok_client_key is None or tiktok_callback_base_url is None:
+            if tiktok_client_key is None or callback_public_base_url is None:
                 return CommandResult(
                     CommandStatus.FAILED,
                     detail={"reason": "TikTok authorization is not configured yet"},
                 )
-            redirect_uri = f"{tiktok_callback_base_url}/callbacks/tiktok/authorize"
+            redirect_uri = f"{callback_public_base_url.rstrip('/')}/callbacks/tiktok/authorize"
             state = await self._store.issue_oauth_attempt(
                 guild_id=owner.guild_id,
                 member_id=owner.member_id,
@@ -330,6 +329,16 @@ class ContentCommandService:
                     "reason": f"{recognized.platform.value} does not support OAuth authorization"
                 },
             )
+
+        await self._registry.record_authorize_link_issued(
+            guild_id=owner.guild_id,
+            account_id=account.account_id,
+            actor_member_id=actor.member_id,
+            owner_member_id=owner.member_id,
+            platform=recognized.platform,
+            capability=capability,
+            now=now,
+        )
 
         card = Card(
             "fetched",
@@ -1064,9 +1073,8 @@ class CreatorCommands(app_commands.Group):
             url=url,
             capability=Capability(capability),
             meta_app_id=self._parent._meta_app_id,
-            meta_callback_base_url=self._parent._meta_callback_base_url,
             tiktok_client_key=self._parent._tiktok_client_key,
-            tiktok_callback_base_url=self._parent._tiktok_callback_base_url,
+            callback_public_base_url=self._parent._callback_public_base_url,
         )
         await self._present(interaction, result)
 

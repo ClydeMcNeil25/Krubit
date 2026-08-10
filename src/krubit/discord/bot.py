@@ -88,9 +88,8 @@ class FetchCommands(app_commands.Group):
         activity_ledger_facts: ActivityLedgerHealthFacts | None = None,
         activity_ledger_inactivity_threshold_days: int | None = None,
         meta_app_id: str | None = None,
-        meta_callback_base_url: str | None = None,
         tiktok_client_key: str | None = None,
-        tiktok_callback_base_url: str | None = None,
+        callback_public_base_url: str | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -101,9 +100,8 @@ class FetchCommands(app_commands.Group):
         self._twitch_credentials = twitch_credentials
         self._twitch_available = twitch_available
         self._meta_app_id = meta_app_id
-        self._meta_callback_base_url = meta_callback_base_url
         self._tiktok_client_key = tiktok_client_key
-        self._tiktok_callback_base_url = tiktok_callback_base_url
+        self._callback_public_base_url = callback_public_base_url
         # See `WatchdogHealthFacts`'s own docstring for why this is a process-level
         # fact bundle passed in at construction rather than derived from a captured
         # `SnapshotRecord` -- it mirrors `presence_intent`/`twitch_credentials`/
@@ -1170,9 +1168,8 @@ class KrubitBot(discord.Client):
                     settings.activity_ledger_inactivity_threshold_days
                 ),
                 meta_app_id=settings.meta_app_id,
-                meta_callback_base_url=settings.meta_callback_base_url,
                 tiktok_client_key=settings.tiktok_client_key,
-                tiktok_callback_base_url=settings.tiktok_callback_base_url,
+                callback_public_base_url=settings.callback_public_base_url,
             )
         )
 
@@ -1185,7 +1182,7 @@ class KrubitBot(discord.Client):
             self.content_scheduler_cycle.start()
         if self._settings.watchdog_enabled:
             self.watchdog_sweep_cycle.start()
-        if self._settings.activity_ledger_enabled:
+        if self._settings.activity_ledger_enabled or self._settings.creator_signals_enabled:
             self.activity_ledger_sweep_cycle.start()
 
     async def close(self) -> None:
