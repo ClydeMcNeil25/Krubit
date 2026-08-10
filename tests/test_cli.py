@@ -310,9 +310,11 @@ async def test_on_member_join_survives_an_announcement_send_failure(
             )
 
         def permissions_for(self, member: object) -> object:
-            return object()
+            return SimpleNamespace(view_channel=True, send_messages=True)
 
-    guild = SimpleNamespace(id=111, name="Krucial Town", channels=[_FailingChannel()])
+    guild = SimpleNamespace(
+        id=111, name="Krucial Town", channels=[_FailingChannel()], me=object()
+    )
     member = SimpleNamespace(
         id=42,
         guild=guild,

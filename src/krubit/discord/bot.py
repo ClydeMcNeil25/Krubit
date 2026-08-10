@@ -1133,7 +1133,7 @@ class KrubitBot(discord.Client):
             default_retention_policy_owner_id=settings.application_id,
             excluded_channel_ids=settings.activity_ledger_excluded_channel_ids,
         )
-        self._membership_announcements = MembershipAnnouncementRuntime()
+        self._membership_announcements = MembershipAnnouncementRuntime(service.store)
         self.tree.add_command(
             FetchCommands(
                 service,

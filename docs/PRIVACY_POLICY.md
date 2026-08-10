@@ -37,7 +37,9 @@ Configuration snapshots do not include message history or a backup of server mem
 
 Krubit may collect Discord user or member identifiers when necessary to:
 
-- record member joins and departures;
+- record member joins and departures, which may include posting a public join
+  announcement to a channel named `welcome`, if present, in addition to any
+  internal staff-facing record;
 - verify whether a person is authorized to use a staff command;
 - record which authorized staff member requested or approved an action;
 - prevent duplicate processing; and
