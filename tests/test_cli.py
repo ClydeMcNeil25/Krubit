@@ -1,9 +1,9 @@
 import asyncio
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import discord
 import pytest
@@ -14,6 +14,7 @@ from krubit.__main__ import main
 from krubit.config import Settings
 from krubit.discord.bot import AdminCommands, FetchCommands, KrubitBot
 from krubit.discord.content_commands import NotificationCommands
+from krubit.discord.membership_announcements import WELCOME_CHANNEL_NAME
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
 from krubit.integrations.catalog import CATALOG
@@ -281,6 +282,49 @@ async def test_bot_records_guild_installed_while_runtime_is_connected(tmp_path: 
 
         event_count, _ = await store.counts(111)
         assert event_count == 1
+    finally:
+        await bot.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_survives_an_announcement_send_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed announcement send must never block guild-event ingestion --
+    Watchdog and Activity Ledger are both disabled by default (Settings()'s
+    defaults), so this only needs to prove `_ingest_change` still runs."""
+    store = await SQLiteStore.open(tmp_path / "krubit.db")
+    await store.initialize()
+    await store.set_guild_enabled(111, True)
+    settings = Settings(application_id=123, database_path=tmp_path / "krubit.db")
+    bot = KrubitBot(settings, FoundationService(store))
+
+    class _FailingChannel:
+        name = WELCOME_CHANNEL_NAME
+
+        async def send(self, **kwargs: object) -> None:
+            raise discord.Forbidden(
+                cast(Any, SimpleNamespace(status=403, reason="forbidden", headers={})),
+                "no permission",
+            )
+
+        def permissions_for(self, member: object) -> object:
+            return object()
+
+    guild = SimpleNamespace(id=111, name="Krucial Town", channels=[_FailingChannel()])
+    member = SimpleNamespace(
+        id=42,
+        guild=guild,
+        bot=False,
+        created_at=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+
+    try:
+        await bot.on_member_join(cast(discord.Member, member))  # must not raise
+
+        event_count, _ = await store.counts(111)
+        assert event_count == 1  # _ingest_change still recorded "member_joined"
     finally:
         await bot.close()
         await store.close()

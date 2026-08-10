@@ -30,6 +30,7 @@ from krubit.discord.install import phase_three_intents, phase_two_intents, phase
 from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
+from krubit.discord.membership_announcements import MembershipAnnouncementRuntime
 from krubit.discord.watchdog_commands import WatchdogActorContext, WatchdogCommandService
 from krubit.discord.watchdog_runtime import WatchdogRuntime
 from krubit.domain.companion import SnapshotRecord
@@ -1132,6 +1133,7 @@ class KrubitBot(discord.Client):
             default_retention_policy_owner_id=settings.application_id,
             excluded_channel_ids=settings.activity_ledger_excluded_channel_ids,
         )
+        self._membership_announcements = MembershipAnnouncementRuntime()
         self.tree.add_command(
             FetchCommands(
                 service,
@@ -1472,6 +1474,7 @@ class KrubitBot(discord.Client):
         )
         await self._watchdog_runtime.on_member_join(member, datetime.now(UTC))
         await self._activity_runtime.on_member_join(member, datetime.now(UTC))
+        await self._membership_announcements.on_member_join(member)
 
     async def on_message(self, message: discord.Message) -> None:
         await self._watchdog_runtime.on_message(message, datetime.now(UTC))
@@ -1483,6 +1486,7 @@ class KrubitBot(discord.Client):
         )
         await self._live_runtime.handle_member_leave(member)
         await self._activity_runtime.on_member_remove(member, datetime.now(UTC))
+        await self._membership_announcements.on_member_remove(member)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         before_roles = ",".join(str(role.id) for role in before.roles)
