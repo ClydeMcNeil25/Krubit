@@ -358,6 +358,181 @@ async def test_two_separate_incident_band_joins_each_get_their_own_incident(
     assert len(channel.sent) == 2
 
 
+def _raid_correlated_recent_joins(guild: FakeGuild, *, count: int = 10) -> tuple[FakeMember, ...]:
+    """Build `count` other recent joiners that are old enough (>7d, no `account_age`
+    signal) and avatar-present (no `default_avatar` signal) and share this test's
+    member's own age/avatar pattern, so they drive `join_velocity`/
+    `join_cluster_similarity` to their HIGH tiers without contributing any other
+    signal. `count=10` clears both `join_velocity`'s HIGH tier (>= 10) and
+    `join_cluster_similarity`'s HIGH tier (>= 8 similar)."""
+    return tuple(
+        FakeMember(
+            MEMBER_ID + 100 + i,
+            guild,
+            created_at=NOW - timedelta(days=30),
+            has_avatar=True,
+            joined_at=NOW - timedelta(seconds=30),
+        )
+        for i in range(count)
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_records_but_does_not_notify_for_raid_correlation_only_incident(
+    store: SQLiteStore,
+) -> None:
+    """Finding 1: an INCIDENT band reached purely from the guild-wide
+    `join_velocity`/`join_cluster_similarity` correlation signals (no signal about the
+    member's own attributes) must still be durably recorded, but must NOT trigger an
+    immediate per-member notification -- that scenario is `RaidDetector`'s own
+    sweep-cycle notification's responsibility, and notifying here would recreate the
+    notification-storm regression."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    guild.members = list(_raid_correlated_recent_joins(guild))
+    # The member itself: old account, has an avatar, ordinary name -- no signal about
+    # its OWN attributes fires; only join_velocity + join_cluster_similarity do.
+    member = FakeMember(MEMBER_ID, guild, created_at=NOW - timedelta(days=30), has_avatar=True)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 1
+    assert incidents[0].band is RiskBand.INCIDENT
+    assert incidents[0].kind is IncidentKind.MEMBER
+    assert channel.sent == ()
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_notifies_when_own_signal_reaches_incident_even_with_raid_correlation(
+    store: SQLiteStore,
+) -> None:
+    """Finding 1's over-suppression guard: a member whose OWN signal (here, a block-
+    list entry) alone reaches INCIDENT must still notify immediately, even when
+    join_velocity/join_cluster_similarity are ALSO present alongside it."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    guild.members = list(_raid_correlated_recent_joins(guild))
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild, created_at=NOW - timedelta(days=30), has_avatar=True)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 1
+    assert len(channel.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_incident_id_names_the_member(store: SQLiteStore) -> None:
+    """Finding 2: staff must be able to identify the member from the incident id
+    itself, since neither the live embed nor `/fetch incident`/`/fetch evidence`
+    otherwise surfaces a member field on `Incident`."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 1
+    segments = incidents[0].incident_id.split(":")
+    assert str(MEMBER_ID) in segments
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_does_not_raise_when_incident_recording_fails(
+    store: SQLiteStore,
+) -> None:
+    """Finding 3: a failure while recording/notifying an incident must not propagate
+    out of `on_member_join` and must not affect the already-completed
+    `open_if_warranted` step's effects (a watch window, if applicable)."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=True)
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild)
+
+    async def _boom(incident: Incident) -> Incident:
+        raise RuntimeError("simulated storage failure")
+
+    store.record_incident = _boom  # type: ignore[method-assign]
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)  # must not raise
+
+    windows = await store.list_open_watch_windows(GUILD_ID)
+    assert len(windows) == 1
+    assert windows[0].member_id == MEMBER_ID
+    assert await store.list_recent_incidents(GUILD_ID) == ()
+    assert channel.sent == ()
+
+
+@pytest.mark.asyncio
+async def test_on_member_join_records_incident_but_sends_nothing_when_notifications_disabled(
+    store: SQLiteStore,
+) -> None:
+    """Finding 5: recording and notifying are decoupled at the
+    `watchdog_notifications_enabled` gate too, not just at the new raid-correlation
+    gate from Finding 1."""
+    guild = FakeGuild()
+    channel = FakeChannel()
+    guild.channels[channel.id] = channel
+    rt = build_runtime(store, guild=guild, watchdog_notifications_enabled=False)
+    await store.save_allow_block_entry(
+        AllowBlockEntry(
+            guild_id=GUILD_ID,
+            discord_user_id=MEMBER_ID,
+            list_kind="block",
+            reason="test block entry",
+            set_by=1,
+            set_at=NOW,
+        )
+    )
+    member = FakeMember(MEMBER_ID, guild)
+
+    await rt.on_member_join(cast(discord.Member, member), NOW)
+
+    incidents = await store.list_recent_incidents(GUILD_ID)
+    assert len(incidents) == 1
+    assert incidents[0].band is RiskBand.INCIDENT
+    assert channel.sent == ()
+
+
 # --- on_message: both flagged in-memory caches must both be fed --------------------
 
 

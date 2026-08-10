@@ -152,14 +152,16 @@ class WatchdogCommandService:
     async def sniff_report(self, *, actor: WatchdogActorContext) -> CommandResult:
         """Surface open watch windows AND recent `SUSPICIOUS`/`INCIDENT` assessments.
 
-        Real-time INCIDENT notification for a lone member's join assessment does not
-        exist yet (only sweep-cycle detectors notify staff proactively — see
-        `WatchdogRuntime.on_member_join`'s docstring), which makes this the primary
-        way staff discover a risky join that never escalated into a guild-scoped
-        incident. Recent high-band assessments are therefore listed prominently and
-        first, not buried after the open-watch-window list, and are never limited to
-        currently-open windows: a member whose window already expired is still worth
-        surfacing here within the lookback window.
+        `WatchdogRuntime.on_member_join` notifies staff in real time for a genuinely
+        member-driven `INCIDENT`-band join, but deliberately suppresses the immediate
+        notification (never the recording) when the band was only reached via the
+        guild-wide `join_velocity`/`join_cluster_similarity` correlation signals — see
+        that method's docstring. This command remains the primary way staff discover
+        such a join, and any other risky join that never escalated into a
+        guild-scoped incident. Recent high-band assessments are therefore listed
+        prominently and first, not buried after the open-watch-window list, and are
+        never limited to currently-open windows: a member whose window already
+        expired is still worth surfacing here within the lookback window.
         """
         if not actor.is_staff:
             return _denied()

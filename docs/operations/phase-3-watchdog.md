@@ -210,29 +210,23 @@ alone will not discover it.
 
 ## Known limitations that change what "enabling Watchdog" actually does
 
-### Gap 1: A lone INCIDENT-band join is never notified in real time (the single biggest functional gap)
+### Gap 1 (closed): A lone INCIDENT-band join is now notified in real time
 
 `WatchdogRuntime.on_member_join` (`src/krubit/discord/watchdog_runtime.py`) calls
-`EntrySniffService.assess_join` and `WatchWindowService.open_if_warranted` — exactly
-Task 4's two calls — and nothing else. **It never constructs an `Incident` or calls
-`notify_staff`, no matter how high the resulting risk band is.** Only the sweep-cycle
-detectors (`RaidDetector`, `SpamWaveDetector`, `WebhookAbuseDetector`,
-`PermissionRiskDetector`) ever produce an `Incident`/staff notification. The domain
-enum `IncidentKind.MEMBER` (`src/krubit/domain/watchdog.py`) exists but is
-constructed **nowhere** in this codebase — confirmed by grep across `src/krubit`.
-
-**Practical consequence:** a single raid participant who trips the `INCIDENT` band on
-join (for example, a brand-new account joining seconds after account creation, with a
-default avatar, during an active join-velocity spike) but never posts a follow-up
-message and isn't part of a multi-member cluster the sweep-cycle raid detector
-notices, sits **silently** in `entry_sniff_assessments` and (if `watch`-band-or-higher)
-`watch_windows` — visible only if staff proactively run `/fetch sniff <member>` or
-`/fetch sniff-report`. This directly undercuts the design doc's stated goal ("Zariya
-and staff are notified of risk quickly") for exactly the single-member case, and is
-comparable in severity to Phase 2's "Meta/TikTok connectors not scheduled" gap. A
-future task must add an `on_member_join` path that constructs an `Incident` (using
-`IncidentKind.MEMBER`) and calls `notify_staff` when `assess_join` returns `INCIDENT`
-band, mirroring the sweep-cycle detectors' own pattern.
+`EntrySniffService.assess_join` and `WatchWindowService.open_if_warranted` — Task 4's
+original two calls — and then, when the assessment reaches `RiskBand.INCIDENT`,
+constructs an `Incident` (`IncidentKind.MEMBER`) and durably records it every time.
+Staff notification is real-time for a genuinely member-driven `INCIDENT`-band join
+(for example, a block-listed account or a very-new account with a default avatar), but
+is deliberately suppressed — the incident is still recorded, only the immediate
+per-member `notify_staff` call is skipped — when the band is only reached via the two
+guild-wide `join_velocity`/`join_cluster_similarity` correlation signals rather than
+the member's own attributes, since that scenario (a coordinated join burst) is
+`RaidDetector`'s own sweep-cycle notification's responsibility; notifying per-member
+there would recreate the notification-storm problem `_has_open_incident_of_kind`
+exists to prevent for the other four detectors. Only the sweep-cycle detectors
+(`RaidDetector`, `SpamWaveDetector`, `WebhookAbuseDetector`, `PermissionRiskDetector`)
+and this new member-join path ever produce an `Incident`/staff notification.
 
 ### Gap 2: Two in-memory, per-process detector caches lose all state on restart
 

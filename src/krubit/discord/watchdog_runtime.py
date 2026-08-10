@@ -80,9 +80,10 @@ from krubit.domain.watchdog import (
     IncidentKind,
     RiskBand,
     RiskSignal,
+    evaluate_risk_band,
 )
 from krubit.services.entry_sniff import EntrySniffService
-from krubit.services.raid_detection import RaidDetector, SpamWaveDetector
+from krubit.services.raid_detection import EvidencePacketBuilder, RaidDetector, SpamWaveDetector
 from krubit.services.watch_window import InspectableMessage, WatchWindowService
 from krubit.services.webhook_and_permission_risk import (
     PermissionRiskDetector,
@@ -100,6 +101,31 @@ _MEMBER_INCIDENT_RECOMMENDED_ACTION = (
     "manual verification, timeout, or removal if warranted. No automatic "
     "action has been taken."
 )
+
+# The two guild-wide, cross-member correlation signals in `watchdog_events.py` --
+# unlike every other Entry Sniff signal, these are not about the joining member's own
+# attributes at all, they are computed from *other* recent joiners. Their high tiers
+# alone (4.2 + 4.5 = 8.7 effective weight) clear `_INCIDENT_THRESHOLD` (6.0) with zero
+# contribution from the member's own account age, avatar, or any other individual
+# signal -- which, during an actual raid, means every participant past roughly the
+# 10th-11th join independently reaches INCIDENT band from these two signals alone,
+# producing a notification storm that duplicates (and races ahead of) the single RAID
+# incident `RaidDetector.evaluate` already owns on its next sweep cycle. See
+# `_reaches_incident_without_raid_correlation`.
+_RAID_CORRELATED_SIGNAL_NAMES = frozenset({"join_velocity", "join_cluster_similarity"})
+
+
+def _reaches_incident_without_raid_correlation(signals: tuple[RiskSignal, ...]) -> bool:
+    """Whether `signals`, with the two guild-wide raid-correlation signals
+    (`join_velocity`/`join_cluster_similarity`) excluded, would still independently
+    reach `RiskBand.INCIDENT` -- i.e. whether the member's OWN attributes (not a
+    guild-wide join-pattern correlation, which `RaidDetector`'s own sweep-cycle
+    notification already owns) are what actually drove the band. Used to decide
+    whether an immediate per-member notification is warranted.
+    """
+    own_signals = tuple(s for s in signals if s.name not in _RAID_CORRELATED_SIGNAL_NAMES)
+    band, _ = evaluate_risk_band(own_signals)
+    return band is RiskBand.INCIDENT
 
 
 def _default_evidence_builder(
@@ -157,8 +183,7 @@ class WatchdogRuntime:
         webhook_abuse_detector: WebhookAbuseDetector | None = None,
         permission_risk_detector: PermissionRiskDetector | None = None,
         now: Callable[[], datetime] | None = None,
-        evidence_builder: Callable[[int, tuple[RiskSignal, ...], datetime], str]
-        | None = None,
+        evidence_builder: EvidencePacketBuilder | None = None,
     ) -> None:
         self._store = store
         self._watchdog_enabled = watchdog_enabled
@@ -200,17 +225,30 @@ class WatchdogRuntime:
 
     async def on_member_join(self, member: discord.Member, now: datetime) -> None:
         """Assess a fresh join, open a bounded watch window when warranted, and --
-        new in this task -- record a durable `Incident` and notify staff
+        new in this task -- record a durable `Incident` and (usually) notify staff
         immediately when the assessment reaches `RiskBand.INCIDENT`.
 
         Exactly Task 4's original two calls, in order, unchanged: `EntrySniffService.
         assess_join` produces the one durable per-join assessment, then
         `WatchWindowService.open_if_warranted` opens a window for anything above
         `RiskBand.CLEAR`. The new third step is strictly additive and never skips or
-        reorders either original call. No same-kind dedup is applied here (unlike the
+        reorders either original call, and is isolated in its own try/except (mirroring
+        `_sweep_guild`'s per-detector isolation) so a failure while recording or
+        notifying an incident can never block this join's activity-ledger ingest or
+        membership-announcement siblings in `KrubitBot.on_member_join`.
+
+        No same-kind dedup is applied to the *recording* of an incident (unlike the
         four sweep-cycle detectors' `_has_open_incident_of_kind` cooldown) -- each
         `INCIDENT`-band join is an independent member and independent evidence, so
-        every one gets its own `Incident` and its own notification.
+        every one gets its own durable `Incident`. The *notification*, however, is
+        suppressed when the `INCIDENT` band was only reached via the guild-wide
+        `join_velocity`/`join_cluster_similarity` correlation signals rather than the
+        member's own attributes -- see `_reaches_incident_without_raid_correlation` --
+        since that scenario is `RaidDetector`'s own sweep-cycle notification's
+        responsibility, and notifying per-member there would recreate the exact
+        notification-storm problem `_has_open_incident_of_kind` exists to prevent for
+        the other four detectors. A lone risky join (block-listed, very-new account,
+        default avatar, etc.) still notifies immediately, unchanged.
         """
         if not self._watchdog_enabled:
             return
@@ -220,7 +258,15 @@ class WatchdogRuntime:
         if window is not None:
             self._watched_members[window.guild_id].add(window.member_id)
         if assessment.band is RiskBand.INCIDENT:
-            await self._record_member_incident(assessment, now)
+            try:
+                await self._record_member_incident(assessment, now)
+            except Exception:
+                _logger.exception(
+                    "WatchdogRuntime.on_member_join: unhandled exception recording/"
+                    "notifying incident for member %s in guild %s; continuing",
+                    assessment.member_id,
+                    assessment.guild_id,
+                )
 
     async def _record_member_incident(
         self, assessment: EntrySniffAssessment, now: datetime
@@ -230,7 +276,7 @@ class WatchdogRuntime:
         )
         incident = Incident(
             guild_id=assessment.guild_id,
-            incident_id=f"member:{uuid4().hex}",
+            incident_id=f"member:{assessment.member_id}:{uuid4().hex}",
             kind=IncidentKind.MEMBER,
             band=RiskBand.INCIDENT,
             opened_at=now,
@@ -251,7 +297,8 @@ class WatchdogRuntime:
             detail=detail,
             created_at=now,
         )
-        await self.notify_staff(saved)
+        if _reaches_incident_without_raid_correlation(assessment.signals):
+            await self.notify_staff(saved)
 
     async def on_message(self, message: InspectableMessage, now: datetime) -> None:
         """Feed a guild message into watch-window inspection and spam-wave correlation.
