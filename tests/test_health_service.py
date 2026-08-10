@@ -410,6 +410,34 @@ def test_integration_health_flags_expired_connector_authorization() -> None:
     assert matching[0].severity == "warning"
 
 
+def test_integration_health_flags_expired_authorization_still_marked_active() -> None:
+    # `status` can still read "active" after `expires_at` has passed -- nothing
+    # currently flips the status column on expiry. Severity must key off the
+    # actual expiry, not the stale status string, or staff see "healthy" for an
+    # authorization that `CredentialResolvingConnector` already treats as
+    # poll-blocking.
+    authorizations = (
+        ConnectorAuthorizationStatus(
+            platform="instagram",
+            capability="content",
+            status="active",
+            expires_at=datetime(2026, 8, 5, tzinfo=UTC),
+        ),
+    )
+    report = HealthService().integration_health(
+        snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC)),
+        connector_authorizations=authorizations,
+    )
+
+    matching = [
+        finding
+        for finding in report.findings
+        if finding.code == "connector_authorization_instagram_content_active"
+    ]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+
+
 def test_integration_health_omits_connector_authorization_findings_when_none_supplied() -> None:
     report = HealthService().integration_health(
         snapshot_with(captured_at=datetime(2026, 8, 6, tzinfo=UTC))

@@ -145,6 +145,7 @@ def _watchdog_findings(facts: WatchdogHealthFacts | None) -> list[HealthFinding]
 
 def _connector_authorization_findings(
     authorizations: tuple[ConnectorAuthorizationStatus, ...] | None,
+    now: datetime,
 ) -> list[HealthFinding]:
     """Factual per-platform authorization status -- never the sealed secret or
     either identifier column, only what `ConnectorAuthorizationStatus` (the
@@ -157,7 +158,8 @@ def _connector_authorization_findings(
         return []
     findings: list[HealthFinding] = []
     for auth in authorizations:
-        severity = "healthy" if auth.status == "active" else "warning"
+        is_unexpired = auth.expires_at is None or auth.expires_at > now
+        severity = "healthy" if auth.status == "active" and is_unexpired else "warning"
         expiry_text = f", expires {auth.expires_at.isoformat()}" if auth.expires_at else ""
         findings.append(
             HealthFinding(
@@ -364,7 +366,9 @@ class HealthService:
         findings = _integration_findings(snapshot)
         findings.extend(_watchdog_findings(watchdog))
         findings.extend(_activity_ledger_findings(activity_ledger))
-        findings.extend(_connector_authorization_findings(connector_authorizations))
+        findings.extend(
+            _connector_authorization_findings(connector_authorizations, snapshot.captured_at)
+        )
         return _report(findings, snapshot.captured_at)
 
     def creator_health(

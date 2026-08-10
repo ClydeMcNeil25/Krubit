@@ -229,3 +229,38 @@ async def test_health_reports_authorization_required_without_fetching_when_no_au
     health = await bridge.health(_account(account_id))
 
     assert health.state.value == "authorization_required"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_raises_authorization_failure_when_secret_ref_is_not_validly_sealed(
+    store: SQLiteStore, vault: CredentialVault
+) -> None:
+    # An operator rotating KRUBIT_CREDENTIAL_ENCRYPTION_KEY (or storage
+    # corruption) leaves a stored secret_ref that fails to unseal.
+    # CredentialVaultError must be translated into this platform's own
+    # authorization-failure error shape, not escape unguarded.
+    account_id = creator_account_id(Platform.INSTAGRAM, "ig-external-id")
+    await store.save_creator_account(_account(account_id))
+    other_vault = CredentialVault.from_env_key("a-completely-different-vault-key")
+    secret_ref = other_vault.seal_json(
+        {"access_token": "tok-123", "refresh_token": None, "expires_at": None}
+    )
+    await store.save_connector_authorization(
+        guild_id=GUILD_ID,
+        account_id=account_id,
+        capability=Capability.SOCIAL.value,
+        secret_ref=secret_ref,
+        provider_resource_id="ig-external-id",
+        authorization_subject_id="ig-external-id",
+        status="active",
+        expires_at=None,
+        now=NOW,
+    )
+    bridge = _bridge(store, vault)
+
+    with pytest.raises(_FakeInnerConnectorError) as exc_info:
+        await bridge.fetch_page(_account(account_id), cursor=None)
+    assert exc_info.value.failure.kind.value == "authorization"
+
+    health = await bridge.health(_account(account_id))
+    assert health.state.value == "authorization_required"

@@ -17,13 +17,21 @@ from krubit.discord.content_commands import (
     ContentCommandService,
     GuildLike,
 )
-from krubit.discord.content_runtime import ContentRuntime, delivery_id_for
+from krubit.discord.content_runtime import ConnectorScheduler, ContentRuntime, delivery_id_for
 from krubit.domain.creator_signals import (
     Capability,
     ContentKind,
+    CreatorAccount,
     CreatorRoute,
     Platform,
 )
+from krubit.integrations.base import (
+    ConnectorAccount,
+    ConnectorFailure,
+    ConnectorHealth,
+    ConnectorPage,
+)
+from krubit.integrations.catalog import CATALOG
 from krubit.services.content_signals import ContentSignalService
 from krubit.storage.sqlite import CreatorRegistryReceipt, SQLiteStore
 
@@ -701,6 +709,75 @@ async def test_verify_card_discloses_it_is_a_static_platform_baseline(
     assert any(
         field.name == "This account's monitoring state" for field in result.card.fields
     )
+
+
+# -- show: surfaces poll health ---------------------------------------------------------
+
+
+class _AuthorizationRequiredError(RuntimeError):
+    """Mimics a real connector's `*ConnectorError`: a plain exception carrying a
+    `.failure: ConnectorFailure` attribute, the shape `ConnectorScheduler`'s
+    `_classify_scheduler_failure` duck-types against."""
+
+    def __init__(self, failure: ConnectorFailure) -> None:
+        super().__init__(failure.kind.value)
+        self.failure = failure
+
+
+class _AlwaysAuthorizationRequiredConnector:
+    """A fake connector standing in for `CredentialResolvingConnector` when the
+    stored authorization can't be used -- every `fetch_page` call raises the same
+    authorization failure a real connector would raise."""
+
+    def __init__(self, platform: Platform) -> None:
+        self.descriptor = CATALOG[platform]
+
+    async def resolve_account(self, recognized: object) -> ConnectorAccount:  # pragma: no cover
+        raise NotImplementedError
+
+    async def fetch_page(self, account: CreatorAccount, *, cursor: str | None) -> ConnectorPage:
+        raise _AuthorizationRequiredError(
+            ConnectorFailure.authorization("stored authorization could not be unsealed")
+        )
+
+    async def health(
+        self, account: CreatorAccount | None = None
+    ) -> ConnectorHealth:  # pragma: no cover
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_creator_show_reflects_authorization_required_after_a_scheduler_poll_cycle(
+    store: SQLiteStore, commands: ContentCommandService
+) -> None:
+    added = await commands.creator_add(
+        actor=creator_member(), owner=creator_member(), url=INSTAGRAM_URL, confirm=True
+    )
+    account_id = added.detail["account_id"]
+    assert isinstance(account_id, str)
+    # A freshly added account starts paused; the scheduler only ever polls
+    # non-paused accounts, so it must be resumed first.
+    resumed = await commands.creator_resume(
+        actor=creator_member(), account_id=account_id, confirm=True
+    )
+    assert resumed.status is CommandStatus.SUCCEEDED
+
+    scheduler = ConnectorScheduler(
+        store,
+        {Platform.INSTAGRAM: _AlwaysAuthorizationRequiredConnector(Platform.INSTAGRAM)},
+        guild_ids=lambda: [GUILD_ID],
+        now=lambda: NOW,
+    )
+    await scheduler.run_cycle()
+
+    result = await commands.creator_show(actor=creator_member(), account_id=account_id)
+
+    assert result.status is CommandStatus.SUCCEEDED
+    assert result.card is not None
+    poll_status = next(field for field in result.card.fields if field.name == "Poll status")
+    # `safe_detail` is a fixed, per-kind string -- never the raw detail text a
+    # connector passed in -- so this is the only text this state can render.
+    assert poll_status.value == "Needs re-authorization (authorization failed or expired)"
 
 
 # -- notification preview: zero side effects ------------------------------------------

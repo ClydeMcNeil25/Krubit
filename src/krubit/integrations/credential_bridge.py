@@ -43,7 +43,7 @@ from krubit.integrations.base import (
     ConnectorPage,
 )
 from krubit.integrations.catalog import CATALOG, ConnectorDescriptor
-from krubit.security.credential_vault import CredentialVault
+from krubit.security.credential_vault import CredentialVault, CredentialVaultError
 from krubit.storage.sqlite import SQLiteStore
 
 
@@ -98,7 +98,12 @@ class CredentialResolvingConnector:
             raise self._error_type(
                 ConnectorFailure.authorization("stored authorization has expired")
             )
-        grant = self._vault.open_json(authorization.secret_ref)
+        try:
+            grant = self._vault.open_json(authorization.secret_ref)
+        except CredentialVaultError as exc:
+            raise self._error_type(
+                ConnectorFailure.authorization("stored authorization could not be unsealed")
+            ) from exc
         access_token = grant.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise self._error_type(

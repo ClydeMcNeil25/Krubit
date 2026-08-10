@@ -43,6 +43,7 @@ from krubit.discord.content_cards import (
 from krubit.discord.content_runtime import ContentRuntime, parse_delivery_id
 from krubit.domain.creator_signals import (
     Capability,
+    CapabilityState,
     ContentEvent,
     ContentKind,
     ContentState,
@@ -56,7 +57,7 @@ from krubit.services.creator_analytics import CreatorAnalyticsService
 from krubit.services.creator_registry import CreatorAuthorityError, CreatorRegistry
 from krubit.services.creator_registry import require_creator_authority as _require_authority
 from krubit.services.notification_policy import MentionBudgetState, NotificationPolicy
-from krubit.storage.sqlite import CreatorBootstrap, SQLiteStore
+from krubit.storage.sqlite import ContentScheduleState, CreatorBootstrap, SQLiteStore
 
 if TYPE_CHECKING:
     from krubit.discord.bot import FetchCommands
@@ -155,6 +156,31 @@ def _confirmation(*, title: str, description: str, **fields: str) -> Card:
 
 def _denied(exc: CreatorAuthorityError) -> CommandResult:
     return CommandResult(CommandStatus.DENIED, detail={"reason": str(exc)})
+
+
+_POLL_STATUS_LABELS: dict[CapabilityState, str] = {
+    CapabilityState.READY: "Healthy",
+    CapabilityState.UNCONFIGURED: "Not yet polled",
+    CapabilityState.AUTHORIZATION_REQUIRED: "Needs re-authorization",
+    CapabilityState.APPROVAL_REQUIRED: "Needs approval",
+    CapabilityState.DEGRADED: "Degraded",
+    CapabilityState.QUOTA_LIMITED: "Quota limited",
+    CapabilityState.UNSUPPORTED: "Unsupported",
+}
+
+
+def _poll_status_text(schedule: ContentScheduleState | None) -> str:
+    """Renders the account's most recent poll outcome (`content_schedule.last_state`/
+    `last_detail`, already written every poll cycle by `_poll_once`/
+    `save_content_schedule`) for staff-facing display -- the only values used here
+    are the `CapabilityState`/`safe_detail` values this pipeline already produces,
+    nothing new is invented."""
+    if schedule is None:
+        return "Not yet polled"
+    label = _POLL_STATUS_LABELS.get(schedule.last_state, schedule.last_state.value)
+    if schedule.last_detail:
+        return f"{label} ({schedule.last_detail})"
+    return label
 
 
 class ContentCommandService:
@@ -577,6 +603,9 @@ class ContentCommandService:
         if report is None:
             return CommandResult(CommandStatus.FAILED, detail={"reason": "account_not_found"})
         counts = report.delivery_counts
+        schedule = await self._store.get_content_schedule(
+            actor.guild_id, account_id, report.account.platform
+        )
         card = Card(
             "fetched",
             f"Fetched: {report.account.handle}",
@@ -584,6 +613,7 @@ class ContentCommandService:
             f"{'paused' if report.account.paused else 'active'}",
             fields=(
                 CardField("Platform", report.account.platform.value, True),
+                CardField("Poll status", _poll_status_text(schedule), True),
                 CardField(
                     "Delivered / Pending / Failed / Cancelled",
                     f"{counts.delivered} / {counts.pending} / {counts.failed} / {counts.cancelled}",
