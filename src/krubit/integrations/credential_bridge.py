@@ -42,6 +42,7 @@ from krubit.integrations.base import (
     ConnectorHealth,
     ConnectorPage,
 )
+from krubit.integrations.catalog import CATALOG, ConnectorDescriptor
 from krubit.security.credential_vault import CredentialVault
 from krubit.storage.sqlite import SQLiteStore
 
@@ -72,6 +73,12 @@ class CredentialResolvingConnector:
         self._inner_connector_factory = inner_connector_factory
         self._error_type = error_type
         self._now = now or _utc_now
+        # Satisfies `Connector`'s structural protocol with this instance's own
+        # platform's static catalog entry -- the same descriptor the real
+        # per-use connector this bridge wraps would report for that platform,
+        # since `CredentialResolvingConnector` is a stand-in for it, not a
+        # distinct platform of its own.
+        self.descriptor: ConnectorDescriptor = CATALOG[platform]
 
     async def _resolve_inner(self, account: CreatorAccount) -> Connector:
         authorization = await self._store.get_connector_authorization(

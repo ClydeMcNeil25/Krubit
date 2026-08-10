@@ -19,6 +19,13 @@ from krubit.discord.install import install_url
 from krubit.domain.creator_signals import Platform
 from krubit.integrations.base import Connector
 from krubit.integrations.bluesky import BlueskyConnector
+from krubit.integrations.credential_bridge import CredentialResolvingConnector
+from krubit.integrations.meta import (
+    InstagramConnector,
+    MetaConnectorError,
+    ThreadsConnector,
+)
+from krubit.integrations.tiktok import TikTokConnector, TikTokConnectorError
 from krubit.integrations.twitch import TwitchHelixClient
 from krubit.integrations.x import XConnector
 from krubit.integrations.youtube import YouTubeConnector
@@ -34,21 +41,24 @@ _logger = logging.getLogger(__name__)
 
 
 def _build_content_connectors(
-    settings: Settings, session: aiohttp.ClientSession
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    store: SQLiteStore,
+    vault: CredentialVault | None,
 ) -> dict[Platform, Connector]:
-    """Build the statically-credentialed connectors `ConnectorScheduler` can poll.
+    """Build the connectors `ConnectorScheduler` can poll.
 
-    Only the platforms with a single bot-wide credential in `Settings` are wired here:
-    YouTube (API key), X (bearer token), and Bluesky (no credential at all). Meta and
-    TikTok connectors need one access token *per enrolled creator account* resolved
-    from `connector_authorizations`/`CredentialVault` at poll time, not one fixed
-    bot-wide token — that per-account credential resolution is a distinct feature this
-    task does not build, so those platforms are intentionally left unscheduled for now
-    rather than wired with a token that cannot be correct for more than one account.
+    YouTube/X/Bluesky use one fixed bot-wide credential each. Instagram/
+    Threads/TikTok each need a different access token per enrolled
+    creator account, resolved at poll time via `CredentialResolvingConnector`
+    -- only wired in when `vault` is present, since without one nothing
+    could ever be unsealed and wiring them in would be pointless dead
+    weight rather than a real capability.
 
-    Callers must gate this on `settings.creator_signals_enabled` themselves (see
-    `_run_bot`) — this function does not check the flag, since `KrubitBot` also enforces
-    it independently for any caller that constructs it directly (for example, a test).
+    Callers must gate this on `settings.creator_signals_enabled` themselves
+    (see `_run_bot`) -- this function does not check the flag, since
+    `KrubitBot` also enforces it independently for any caller that
+    constructs it directly (for example, a test).
     """
     connectors: dict[Platform, Connector] = {}
     if settings.youtube_api_key is not None:
@@ -56,6 +66,31 @@ def _build_content_connectors(
     if settings.x_bearer_token is not None:
         connectors[Platform.X] = XConnector(session, settings.x_bearer_token)
     connectors[Platform.BLUESKY] = BlueskyConnector(session)
+    if vault is not None:
+        connectors[Platform.INSTAGRAM] = CredentialResolvingConnector(
+            session,
+            store,
+            vault,
+            platform=Platform.INSTAGRAM,
+            inner_connector_factory=InstagramConnector,
+            error_type=MetaConnectorError,
+        )
+        connectors[Platform.THREADS] = CredentialResolvingConnector(
+            session,
+            store,
+            vault,
+            platform=Platform.THREADS,
+            inner_connector_factory=ThreadsConnector,
+            error_type=MetaConnectorError,
+        )
+        connectors[Platform.TIKTOK] = CredentialResolvingConnector(
+            session,
+            store,
+            vault,
+            platform=Platform.TIKTOK,
+            inner_connector_factory=TikTokConnector,
+            error_type=TikTokConnectorError,
+        )
     return connectors
 
 
@@ -141,19 +176,21 @@ async def _run_bot(settings: Settings) -> int:
         # the unified content ledger without ever re-sending anything already
         # delivered. The Phase 2A tables themselves are never mutated by this.
         await migrate_all_twitch_content(store)
-        content_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
-        content_session = aiohttp.ClientSession(connector=content_tcp_connector)
-        content_connectors = (
-            _build_content_connectors(settings, content_session)
-            if settings.creator_signals_enabled
-            else {}
-        )
 
         vault = (
             CredentialVault.from_env_key(settings.credential_encryption_key)
             if settings.credential_encryption_key is not None
             else None
         )
+
+        content_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
+        content_session = aiohttp.ClientSession(connector=content_tcp_connector)
+        content_connectors = (
+            _build_content_connectors(settings, content_session, store, vault)
+            if settings.creator_signals_enabled
+            else {}
+        )
+
         oauth_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         oauth_session = aiohttp.ClientSession(connector=oauth_tcp_connector)
         callback_routes = build_callback_routes(settings, store, vault, oauth_session)
