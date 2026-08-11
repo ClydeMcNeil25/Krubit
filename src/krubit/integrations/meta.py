@@ -41,10 +41,17 @@ each platform's content shape:
   is a quote post (`is_quote_post`) or a reply (a truthy `root_post`), surfacing only
   the member's own original posts.
 
-Every connector resolves its own account via `/me` (Instagram/Facebook) or
-`/me` on the Threads Graph host, never an arbitrary handle lookup: the whole point of
-OAuth-gated Meta access is that Krubit only ever reads the account that authorized
-it, not an arbitrary public profile.
+Every connector resolves its own account from the authorizing member's own grant,
+never an arbitrary handle lookup: the whole point of OAuth-gated Meta access is that
+Krubit only ever reads the account that authorized it, not an arbitrary public
+profile. `FacebookPageConnector` and `FacebookProfileConnector` resolve via `/me` on
+`graph.facebook.com`, and `ThreadsConnector` resolves via `/me` on its own dedicated
+Threads Graph host -- both are genuinely the authorizing account on those hosts.
+`InstagramConnector` is different: an Instagram OAuth grant authenticates the
+member's *Facebook* identity, not an Instagram user directly, so it resolves via
+`/me/accounts` (the Facebook Pages the member manages) and reads the
+`instagram_business_account` field off the linked Page to find the actual Instagram
+Business Account -- see `InstagramConnector._resolve_business_account`.
 """
 
 from __future__ import annotations
@@ -552,6 +559,7 @@ class MetaIdentity:
 # --------------------------------------------------------------------------------
 
 _IG_MEDIA_FIELDS = "id,caption,media_type,media_product_type,permalink,timestamp,is_live_now"
+_IG_BUSINESS_ACCOUNT_FIELDS = "id,username,name"
 
 
 class InstagramConnector:
@@ -577,13 +585,44 @@ class InstagramConnector:
         self._now = now
         self._last_failure: ConnectorFailure | None = None
 
+    async def _resolve_business_account(self) -> Mapping[str, object]:
+        """Resolve the Instagram Business Account linked to a Facebook Page the
+        authorizing member manages.
+
+        Unlike Threads (its own dedicated Graph host resolves `/me` directly to
+        the authorizing account), an Instagram OAuth grant authenticates the
+        member's *Facebook* identity -- `/me` on `graph.facebook.com` returns
+        that Facebook user, which has no meaningful `username` and is not the
+        Instagram account content should be read from. The Instagram Business
+        Account must be found by walking `/me/accounts` (the Pages the member
+        manages) and reading the `instagram_business_account` field each Page
+        object carries when linked. The first linked account found is used.
+        """
+        payload = await self._get(
+            f"{GRAPH_BASE}/me/accounts",
+            {"fields": f"id,name,instagram_business_account{{{_IG_BUSINESS_ACCOUNT_FIELDS}}}"},
+        )
+        for entry in _list(payload.get("data")) or []:
+            page = _mapping(entry)
+            if page is None:
+                continue
+            business_account = _mapping(page.get("instagram_business_account"))
+            if business_account is not None:
+                return business_account
+        raise self._fail(
+            ConnectorFailure.authorization(
+                "no Instagram Business account is linked to a Facebook Page the "
+                "authorizing member manages"
+            )
+        )
+
     async def resolve_account(self, recognized: RecognizedAccountUrl) -> ConnectorAccount:
-        payload = await self._get(f"{GRAPH_BASE}/me", {"fields": "id,username,name"})
-        external_id = payload.get("id")
+        business_account = await self._resolve_business_account()
+        external_id = business_account.get("id")
         if not isinstance(external_id, str) or not external_id:
             raise self._fail(ConnectorFailure.invalid_response())
-        username = payload.get("username")
-        name = payload.get("name")
+        username = business_account.get("username")
+        name = business_account.get("name")
         return ConnectorAccount(
             platform=Platform.INSTAGRAM,
             external_id=external_id,
@@ -598,11 +637,11 @@ class InstagramConnector:
         docstring for why `resolve_account`'s own `handle` cannot be used for
         verification.
         """
-        payload = await self._get(f"{GRAPH_BASE}/me", {"fields": "id,username"})
-        external_id = payload.get("id")
+        business_account = await self._resolve_business_account()
+        external_id = business_account.get("id")
         if not isinstance(external_id, str) or not external_id:
             raise self._fail(ConnectorFailure.invalid_response())
-        username = payload.get("username")
+        username = business_account.get("username")
         return MetaIdentity(
             external_id=external_id,
             username=username if isinstance(username, str) and username.strip() else None,

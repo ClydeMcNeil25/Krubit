@@ -279,9 +279,30 @@ async def test_instagram_next_cursor_from_paging_cursors_after() -> None:
 
 
 @pytest.mark.asyncio
-async def test_instagram_resolve_account_uses_me_endpoint() -> None:
+async def test_instagram_resolve_account_uses_me_accounts_endpoint() -> None:
     session = FakeSession(
-        [FakeResponse(200, {"id": "ig-1", "username": "krucialstudios", "name": "Krucial Studios"})]
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": [
+                        {
+                            "id": "page-without-ig",
+                            "name": "Unrelated Page",
+                        },
+                        {
+                            "id": "page-1",
+                            "name": "Krucial Studios Page",
+                            "instagram_business_account": {
+                                "id": "ig-1",
+                                "username": "krucialstudios",
+                                "name": "Krucial Studios",
+                            },
+                        },
+                    ]
+                },
+            )
+        ]
     )
     connector = InstagramConnector(session, "ig-access-token", now=lambda: NOW)
     result = await connector.resolve_account(
@@ -294,9 +315,27 @@ async def test_instagram_resolve_account_uses_me_endpoint() -> None:
     assert result.external_id == "ig-1"
     assert result.display_name == "Krucial Studios"
     url, kwargs = session.requests[0]
-    assert url == "https://graph.facebook.com/v19.0/me"
+    assert url == "https://graph.facebook.com/v19.0/me/accounts"
     params = cast("dict[str, object]", kwargs["params"])
     assert params["access_token"] == "ig-access-token"
+    assert params["fields"] == "id,name,instagram_business_account{id,username,name}"
+
+
+@pytest.mark.asyncio
+async def test_instagram_resolve_account_raises_authorization_when_no_linked_ig_account() -> None:
+    session = FakeSession(
+        [FakeResponse(200, {"data": [{"id": "page-without-ig", "name": "Unrelated Page"}]})]
+    )
+    connector = InstagramConnector(session, "ig-access-token", now=lambda: NOW)
+    with pytest.raises(MetaConnectorError) as excinfo:
+        await connector.resolve_account(
+            RecognizedAccountUrl(
+                platform=Platform.INSTAGRAM,
+                handle="krucialstudios",
+                canonical_url="https://www.instagram.com/krucialstudios",
+            )
+        )
+    assert excinfo.value.failure.kind is ConnectorFailureKind.AUTHORIZATION
 
 
 @pytest.mark.asyncio
