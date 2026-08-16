@@ -1,5 +1,7 @@
 # Krubit Phase Rollout
 
+> **2026-08-16 update:** Reconciled against the "Krubit — Discord Companion Agent Feature & Architecture Handoff" premium-features doc. That doc's philosophy (Detect → Assist → Lightly Act → Escalate) and Ownership Boundaries already match this roadmap's existing design; its net-new asks are folded in below as Phases 5, 7, and 8, and its generalized event/reminder scheduler is folded into Phase 9. Phases 0-4 keep their existing numbers and build-status notes unchanged since they are already implemented.
+
 ## Product Definition
 
 Krubit is Zariya Kessari's non-conversational Discord pet and operational companion. He watches the server, fetches information, publishes functional notification cards, performs routine automation, records evidence, and alerts Zariya when human judgment is needed.
@@ -351,7 +353,31 @@ resolved:
   now-anchored event list are three further, lower-severity gaps documented in the
   operations guide.
 
-## Phase 5: Zariya Companion Bridge and Supervised Protection
+## Phase 5: Configurable Light Management
+
+### Goal
+
+Give Krubit bounded, explicitly configured authority to act on his own detections, without turning Phase 3's evidence-only Watchdog into an unaccountable moderator. This phase exists because, as of 2026-08-16, Krubit performs zero automatic moderation actions by deliberate Phase 3 design — this is the first phase where that changes, and only for actions the server owner has explicitly turned on.
+
+### Deliverables
+
+- Per-guild moderation authority configuration (conceptually: `krubit.moderation.remove_obvious_spam`, `remove_known_malicious_links`, `temporary_timeout.enabled` / `maximum_duration`, `kick_member`, `permanent_ban`, `ambiguous_behavior.action`, `permanent_actions.require_moderator`), defaulting every autonomous power to off.
+- Autonomous removal of high-confidence spam and known-malicious links only above a configured confidence threshold; anything below threshold escalates instead of acting.
+- Short, configurable automatic timeouts for deterministic, repeat, in-progress abuse (flood/mass-mention), bounded by a maximum duration the server owner sets.
+- Kick and permanent ban remain unavailable to autonomous execution in this phase regardless of configuration; they stay staff/Zariya-triggered actions Krubit only executes on explicit command.
+- Every autonomous action produces the same durable, reversible-state receipt already required by Phase 0's audit log, linked to the Phase 3 incident/evidence record that triggered it.
+- Rate limiting and duplicate-action prevention so a single incident cannot trigger repeated autonomous actions.
+- `/fetch moderation-config` (staff-only, read current authority configuration) and an administrator-only command or config surface to change it.
+
+### Zariya overlap handling
+
+Zariya is not required for this phase's autonomous actions to function — they must work from Krubit's own deterministic detections alone (§5/§22 of the handoff doc: Krubit Core must not depend on Zariya). In Krucial Town, Zariya retains override and dismissal authority over any action Krubit takes, and ambiguous cases still escalate to her per Phase 3's existing behavior.
+
+### Exit gate
+
+Advance when every autonomous action is traceable to a specific detection and confidence score, disabling a permission in configuration takes effect immediately with no code change, no autonomous action is irreversible, repeated-action rate limits are proven under test, and kick/ban remain provably unreachable without explicit staff/Zariya authorization.
+
+## Phase 6: Zariya Companion Bridge and Supervised Protection
 
 ### Goal
 
@@ -382,7 +408,44 @@ Make Krubit materially improve Zariya's effectiveness and remove permanent overl
 
 Advance when one event produces one owner and one receipt; Zariya can trace every briefing claim to Krubit evidence; KSHQ rejects stale, mismatched, or unauthorized proposals; reversible protection restores the exact prior state; and disabling Krubit leaves Zariya conversationally available without fabricated monitoring claims.
 
-## Phase 6: Community Operations Automation
+## Phase 7: Personality and Emoji Reaction Engine
+
+### Goal
+
+Give Krubit a recognizable, non-conversational presence, expressed entirely through configurable emoji reactions and behavioral timing rather than generated text. This phase has zero existing code as of 2026-08-16.
+
+### Deliverables
+
+- A reaction engine that maps configured trigger events (impressive attachment posted, suspicious link inspected, incident opened, task completed, milestone reached) to a configured emoji from a per-guild vocabulary.
+- Cooldowns and frequency caps so reactions stay subtle rather than reacting to everything; conservative-by-default configuration.
+- Custom Krubit emoji support where the guild has uploaded them.
+- No open-ended text generation, no conversational replies, and no dependency on an LLM — reaction selection is deterministic rule matching against configured triggers, consistent with §5's "no dedicated LLM" principle.
+- Staff-only command to preview and adjust the reaction vocabulary and trigger mapping.
+
+### Exit gate
+
+Advance when reaction triggers are fully configurable per guild, reaction frequency stays within configured caps under load testing, and disabling the engine leaves every other Krubit capability (detection, cards, `/fetch`) unaffected.
+
+## Phase 8: News, Release Tracking, and Krubit Patrol Presentation
+
+### Goal
+
+Give Krubit an autonomous news and release-tracking capability, plus a presentation layer that turns his existing background monitoring (health checks, Watchdog sweeps, activity ledger) into a legible "patrol" summary for administrators. This phase has zero existing code as of 2026-08-16 beyond the health/summary primitives it builds on.
+
+### Deliverables
+
+- Expandable news category system (gaming, tech, entertainment with music/movies/anime subcategories, sports) with categories and sources configurable per guild rather than hard-coded into the engine.
+- News pipeline: approved-source collection, normalization, duplicate detection, relevance filtering, category classification, source-quality validation, formatting, Discord publishing, and posted-story tracking to prevent re-posting.
+- Administrator controls for enabling/disabling sources, categories, and posting frequency; separate handling for breaking/high-priority stories versus routine posts.
+- Gaming/entertainment release tracking (games, DLC, patches, betas, movies, anime seasons, albums) as a distinct feed from breaking news, feeding future daily/weekly summaries and Discord Scheduled Events.
+- "Krubit Patrol" presentation: a staff/administrator-facing summary (status, last patrol time, detections, automatically-handled counts, escalations, Zariya-review state) built from existing health, Watchdog, and activity-ledger data — public-facing presence stays subtle; verbose patrol detail stays staff-only, consistent with existing access-control patterns.
+- Treat all external news content and URLs as untrusted per the existing Security Principles section.
+
+### Exit gate
+
+Advance when duplicate story posting is proven absent under test, disabled categories/sources produce zero posts, posting frequency stays within configuration, and the Patrol summary reflects only data Krubit already legitimately collected under existing privacy and access rules.
+
+## Phase 9: Community Operations Automation
 
 ### Goal
 
@@ -390,6 +453,7 @@ Extend Krubit from monitoring into non-conversational community logistics that s
 
 ### Deliverables
 
+- A generic scheduling/reminder engine for stream announcements, premieres, community events, game nights, comic releases, and other scheduled announcements — implemented as one configurable engine rather than individually hard-coded event types, extending Phase 2's Discord Scheduled Event synchronization (which today only covers creator live streams) to non-creator event types.
 - Event reminders, attendance, temporary roles/channels, cleanup, and post-event impact reports.
 - Member milestone and join-anniversary qualification.
 - Staff-approved branded recognition cards.
@@ -408,7 +472,7 @@ Zariya designs events, rituals, recognition standards, and engagement strategy. 
 
 Advance when scheduled automation is idempotent, temporary resources always have bounded cleanup, member recognition is reviewable, attribution is reproducible, and experiments can be stopped without corrupting the activity ledger.
 
-## Phase 7: Commercial Beta and General Availability
+## Phase 10: Commercial Beta and General Availability
 
 ### Goal
 
@@ -440,6 +504,8 @@ Krubit is ready for general sale only when external beta servers demonstrate ten
 - Basic live cards.
 - `/fetch live`, `/fetch latest`, and basic health.
 - Short configuration-change history.
+- Default emoji reaction personality (fixed vocabulary, not customizable).
+- One news category.
 
 ### Pro
 
@@ -448,13 +514,16 @@ Krubit is ready for general sale only when external beta servers demonstrate ten
 - Notification controls and analytics.
 - Configuration snapshots and extended history.
 - Milestones, showcase, and basic member-retention reports.
+- Custom emoji reaction vocabulary and trigger configuration.
+- Full news category/source configuration and generalized event/reminder scheduling.
 
 ### Business or Community Operations
 
 - Entry Sniffing and incident evidence.
 - Advanced Member Activity Ledger and retention cohorts.
-- Reversible safety automation.
+- Reversible safety automation, including configurable Light Management autonomous actions.
 - Staff workflows and extended audit retention.
+- Krubit Patrol administrator dashboard.
 - Custom policies, exports, and KSHQ/Zariya-style companion integrations.
 
 Safety essentials should not be deliberately weakened to force an upgrade. Paid differentiation should primarily come from scale, retention depth, workflow sophistication, integrations, customization, and reporting.
