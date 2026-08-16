@@ -34,7 +34,7 @@ from krubit.security.tls import system_ssl_context
 from krubit.services.foundation import FoundationService
 from krubit.services.live_signals import migrate_all_twitch_content
 from krubit.storage.sqlite import SQLiteStore
-from krubit.web.callbacks import CallbackServer
+from krubit.web.callbacks import CallbackServer, build_health_route
 from krubit.web.wiring import build_callback_routes
 
 _logger = logging.getLogger(__name__)
@@ -160,6 +160,7 @@ async def _run_bot(settings: Settings) -> int:
     oauth_session: aiohttp.ClientSession | None = None
     oauth_tcp_connector: aiohttp.TCPConnector | None = None
     callback_server: CallbackServer | None = None
+    health_server: CallbackServer | None = None
     store: SQLiteStore | None = None
     bot: KrubitBot | None = None
     twitch = None
@@ -201,6 +202,20 @@ async def _run_bot(settings: Settings) -> int:
             bind_host=settings.callback_bind_host,
         )
         await callback_server.start()
+
+        # Independent of callback_server above: bound on 0.0.0.0 (not
+        # callback_bind_host) with no public base URL, purely so a platform's
+        # own liveness probe (e.g. Railway's healthcheckPath) can tell "the
+        # process crashed on boot" apart from "the image built fine", which a
+        # build-only deploy status cannot. Does nothing when PORT is unset --
+        # see Settings.health_check_port's docstring.
+        health_server = CallbackServer(
+            public_base_url=None,
+            port=settings.health_check_port,
+            routes=(build_health_route(),),
+            bind_host="0.0.0.0",
+        )
+        await health_server.start()
 
         connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         bot = KrubitBot(
@@ -254,6 +269,7 @@ async def _run_bot(settings: Settings) -> int:
         cleanup_error: BaseException | None = None
         for resource in (
             callback_server,
+            health_server,
             oauth_session,
             oauth_tcp_connector,
             bot,

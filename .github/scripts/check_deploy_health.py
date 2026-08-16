@@ -259,7 +259,17 @@ def main() -> int:
     message = build_discord_message(
         action, status=status, deployment_id=deployment_id, detail=detail
     )
-    post_to_discord(webhook_url, message)
+    try:
+        post_to_discord(webhook_url, message)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # Delivery failing (e.g. Cloudflare 403) must not crash the workflow
+        # step -- that would fire GitHub's own failed-workflow email instead
+        # of the intended Discord alert. State is deliberately left
+        # unwritten so the next poll sees the same transition and retries
+        # the alert, rather than recording an incident as "announced" when
+        # it never actually reached Discord.
+        print(f"failed to post Discord alert, will retry next poll: {exc}", file=sys.stderr)
+        return 0
     write_state(
         _STATE_PATH,
         classification=classification,

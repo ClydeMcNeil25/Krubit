@@ -390,6 +390,41 @@ def test_main_no_op_poll_does_not_write_or_alert(tmp_path, monkeypatch) -> None:
     assert state_path.read_text(encoding="utf-8") == before_content
 
 
+def test_main_discord_post_failure_does_not_crash_and_leaves_state_for_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """A Discord webhook delivery failure (e.g. Cloudflare 403) must not
+    crash the workflow step -- that would fire GitHub's own failed-workflow
+    email instead of the Discord alert, and silently discard the alert.
+    State must be left unwritten so the next poll sees the same transition
+    and retries the alert, rather than recording the incident as "announced"
+    when it never actually reached Discord."""
+    state_path = tmp_path / "state.json"
+    _seed_state(state_path, classification="healthy")
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake")
+    monkeypatch.setattr(check_deploy_health, "_STATE_PATH", state_path)
+
+    mock_error = urllib.error.HTTPError(
+        url="https://discord.com", code=403, msg="Forbidden", hdrs={}, fp=None
+    )
+
+    with patch.object(
+        check_deploy_health,
+        "query_railway_deployment",
+        return_value=("CRASHED", "dep-new", "2026-08-09T00:00:00Z"),
+    ), patch.object(check_deploy_health, "post_to_discord", side_effect=mock_error):
+        result = main()
+
+    assert result == 0
+    state = read_state(state_path)
+    assert state is not None
+    # State must still reflect the last *successfully announced* classification,
+    # not the new one -- since the alert for it never actually got delivered.
+    assert state["classification"] == "healthy"
+
+
 def test_main_real_transition_posts_and_writes_state(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "state.json"
     _seed_state(state_path, classification="healthy")

@@ -267,6 +267,20 @@ def test_missing_social_settings_all_default_to_none_or_disabled() -> None:
     assert settings.credential_encryption_key is None
     assert settings.callback_public_base_url is None
     assert settings.callback_port is None
+    assert settings.health_check_port is None
+
+
+def test_settings_parses_health_check_port_from_platform_injected_port_var() -> None:
+    settings = Settings.from_env({**base_env(), "PORT": "8080"})
+    assert settings.health_check_port == 8080
+
+
+def test_settings_treats_invalid_port_as_absent_rather_than_erroring() -> None:
+    # PORT is platform-injected, not operator-set (unlike KRUBIT_CALLBACK_PORT) --
+    # a malformed value must never crash startup over something the operator has
+    # no config knob to fix. See health_check_port's docstring in config.py.
+    assert Settings.from_env({**base_env(), "PORT": "not-a-port"}).health_check_port is None
+    assert Settings.from_env({**base_env(), "PORT": "70000"}).health_check_port is None
 
 
 def test_settings_parse_configured_social_and_callback_settings() -> None:

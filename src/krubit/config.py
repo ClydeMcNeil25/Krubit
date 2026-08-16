@@ -53,6 +53,13 @@ class Settings:
     callback_public_base_url: str | None = None
     callback_port: int | None = None
     callback_bind_host: str = "127.0.0.1"
+    # Sourced from `PORT`, not a `KRUBIT_`-prefixed name: `PORT` is the
+    # unprefixed variable Railway (and most PaaS platforms) inject automatically
+    # for a service with an exposed port, so a health endpoint can bind without
+    # any Krubit-specific configuration. Bound on 0.0.0.0 (see `_run_bot`), not
+    # `callback_bind_host` -- that setting is for the operator-configured OAuth
+    # callback server, a separate concern from platform liveness probing.
+    health_check_port: int | None = None
     watchdog_enabled: bool = False
     watchdog_notifications_enabled: bool = False
     watchdog_watch_window_hours: int | None = None
@@ -126,6 +133,7 @@ class Settings:
         raw_callback_public_base_url = values.get("KRUBIT_CALLBACK_PUBLIC_BASE_URL", "").strip()
         raw_callback_port = values.get("KRUBIT_CALLBACK_PORT", "").strip()
         raw_callback_bind_host = values.get("KRUBIT_CALLBACK_BIND_HOST", "").strip()
+        raw_health_check_port = values.get("PORT", "").strip()
         raw_watchdog_enabled = values.get("KRUBIT_WATCHDOG_ENABLED", "false").strip()
         raw_watchdog_notifications_enabled = values.get(
             "KRUBIT_WATCHDOG_NOTIFICATIONS_ENABLED", "false"
@@ -166,6 +174,16 @@ class Settings:
                     "KRUBIT_CALLBACK_PORT must be a port number between 1 and 65535"
                 )
             callback_port = int(raw_callback_port)
+
+        # Unlike KRUBIT_CALLBACK_PORT (an operator-set value, invalid input is a
+        # config mistake worth failing loudly over), PORT is injected by the
+        # hosting platform, not chosen by the operator -- a malformed or
+        # out-of-range value here is not something Krubit's operator can fix by
+        # editing their own config, so it must never crash startup. Treat it the
+        # same as absent: the health endpoint just doesn't bind.
+        health_check_port: int | None = None
+        if raw_health_check_port.isdigit() and 1 <= int(raw_health_check_port) <= 65_535:
+            health_check_port = int(raw_health_check_port)
 
         watchdog_enabled = _parse_bool("KRUBIT_WATCHDOG_ENABLED", raw_watchdog_enabled)
         watchdog_notifications_enabled = _parse_bool(
@@ -250,6 +268,7 @@ class Settings:
             callback_public_base_url=raw_callback_public_base_url or None,
             callback_port=callback_port,
             callback_bind_host=raw_callback_bind_host or "127.0.0.1",
+            health_check_port=health_check_port,
             watchdog_enabled=watchdog_enabled,
             watchdog_notifications_enabled=watchdog_notifications_enabled,
             watchdog_watch_window_hours=watchdog_watch_window_hours,

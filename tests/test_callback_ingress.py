@@ -5,7 +5,12 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from krubit.web.callbacks import CallbackRoute, CallbackServer, CallbackServerError
+from krubit.web.callbacks import (
+    CallbackRoute,
+    CallbackServer,
+    CallbackServerError,
+    build_health_route,
+)
 
 
 async def _youtube_handler(request: web.Request) -> web.StreamResponse:
@@ -93,13 +98,19 @@ def test_callback_server_rejects_out_of_range_port() -> None:
         CallbackServer(public_base_url="https://callbacks.example.com", port=65536)
 
 
-def test_callback_server_disabled_without_base_url_and_port() -> None:
+def test_callback_server_disabled_without_a_port() -> None:
     assert CallbackServer(public_base_url=None, port=None).enabled is False
     assert (
         CallbackServer(public_base_url="https://callbacks.example.com", port=None).enabled
         is False
     )
-    assert CallbackServer(public_base_url=None, port=8443).enabled is False
+
+
+def test_callback_server_enabled_with_only_a_port_no_base_url() -> None:
+    # A health-only server has no public base URL at all -- see build_health_route's
+    # docstring. Binding only requires a port; the base URL is validated when present
+    # but is otherwise only needed elsewhere, to construct OAuth redirect URIs.
+    assert CallbackServer(public_base_url=None, port=8443).enabled is True
 
 
 async def test_callback_server_start_is_a_no_op_when_not_fully_configured() -> None:
@@ -107,6 +118,18 @@ async def test_callback_server_start_is_a_no_op_when_not_fully_configured() -> N
     await server.start()
     assert server.enabled is False
     await server.close()
+
+
+async def test_health_route_answers_200_with_no_public_base_url_configured() -> None:
+    server = CallbackServer(public_base_url=None, port=0, routes=(build_health_route(),))
+    app = server.build_app()
+    test_client = TestClient[web.Request, web.Application](TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.get("/health")
+        assert response.status == 200
+    finally:
+        await test_client.close()
 
 
 async def test_callback_server_defaults_to_loopback_bind_host() -> None:

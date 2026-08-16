@@ -1,8 +1,13 @@
 """Minimal aiohttp ingress for platform push/webhook callbacks.
 
-`CallbackServer` binds nothing unless both a public HTTPS base URL and a port are
-configured, so a deployment with no social platform credentials never opens a
-listening socket. Once configured, it enforces an HTTPS public base, a 1 MiB body
+`CallbackServer` binds nothing unless a port is configured, so a deployment with
+no social platform credentials and no health-check port never opens a listening
+socket. A public HTTPS base URL is validated when present but is not itself
+required to bind -- it is only needed to construct OAuth redirect URIs elsewhere
+(see `krubit.web.wiring.build_callback_routes`, which independently gates the
+OAuth/webhook routes on both being set). This split lets `build_health_route`
+below be served on its own port with no public base URL at all. Once bound, it
+enforces an HTTPS public base (when one is configured), a 1 MiB body
 limit per request, one HTTP method per registered route, a request timeout, and
 redacted error responses: unregistered paths return 404, oversized bodies return
 413, and any unhandled handler exception is rendered to the caller as a generic
@@ -123,8 +128,12 @@ class CallbackServer:
 
     @property
     def enabled(self) -> bool:
-        """Whether both a public base URL and a port are configured."""
-        return self._public_base_url is not None and self._port is not None
+        """Whether a port is configured -- the only thing binding requires.
+
+        A public base URL is validated when present (see `__init__`) but is not
+        required to bind: a health-only server has no public base URL at all.
+        """
+        return self._port is not None
 
     def build_app(self) -> web.Application:
         """Build the aiohttp application, independent of whether it is ever bound."""
@@ -158,6 +167,22 @@ class CallbackServer:
             return
         await self._runner.cleanup()
         self._runner = None
+
+
+def build_health_route(path: str = "/health") -> CallbackRoute:
+    """Build a GET route that always answers 200, for a platform's own liveness
+    probe (for example Railway's `healthcheckPath`) -- distinct from Railway's
+    deployment-status field, which only reflects whether the image built and
+    launched, not whether the process inside is still running. Deliberately does
+    no I/O and checks no downstream dependency: its only job is proving the
+    process is alive and the event loop is responsive enough to answer a request,
+    which is exactly the gap a build-only deploy status cannot see.
+    """
+
+    async def handle_get(request: web.Request) -> web.StreamResponse:
+        return web.Response(status=200, text="ok")
+
+    return CallbackRoute(path=path, method="GET", handler=handle_get)
 
 
 @dataclass(frozen=True, slots=True)
