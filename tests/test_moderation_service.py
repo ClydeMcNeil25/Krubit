@@ -188,6 +188,70 @@ async def test_request_human_approval_transitions_case(store: SQLiteStore) -> No
 
 
 @pytest.mark.asyncio
+async def test_submit_action_recommendation_wrong_guild_raises(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.submit_action_recommendation(
+            999,
+            SubmitActionRecommendationRequest.from_dict(
+                {
+                    "case_id": record_response.case_id,
+                    "recommended_action": "24h timeout",
+                    "idempotency_key": "idem:2",
+                }
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_request_human_approval_wrong_guild_raises(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+        ),
+    )
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.request_human_approval(
+            999,
+            RequestHumanApprovalRequest.from_dict(
+                {
+                    "case_id": record_response.case_id,
+                    "review_deadline": "2026-01-02T00:00:00+00:00",
+                    "idempotency_key": "idem:3",
+                }
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_request_human_approval_without_recommendation_raises(store: SQLiteStore) -> None:
     await _seed_incident(store)
     service = ModerationService(store, FakeExecutor())

@@ -118,6 +118,8 @@ class ModerationService:
         case = await self._store.get_moderation_case(request.case_id)
         if case is None:
             raise ValueError(f"unknown case_id {request.case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
         cached = await self._store.get_moderation_idempotency_response(
             case.guild_id, _SUBMIT_ACTION_RECOMMENDATION, request.idempotency_key
         )
@@ -161,6 +163,8 @@ class ModerationService:
         case = await self._store.get_moderation_case(request.case_id)
         if case is None:
             raise ValueError(f"unknown case_id {request.case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
         cached = await self._store.get_moderation_idempotency_response(
             case.guild_id, _REQUEST_HUMAN_APPROVAL, request.idempotency_key
         )
