@@ -432,6 +432,8 @@ def test_settings_repr_never_renders_configured_secret_values() -> None:
         "META_KRUBIT_APP_SECRET": "meta-app-secret-value",
         "TIKTOK_KRUBIT_CLIENT_SECRET": "tiktok-client-secret-value",
         "KRUBIT_CREDENTIAL_ENCRYPTION_KEY": "credential-encryption-key-value",
+        "KRUBIT_MODERATION_ADAPTER_SECRET": "moderation-adapter-secret-value",
+        "KRUBIT_MODERATION_TEST_MODE_SECRET": "moderation-test-mode-secret-value",
     }
     non_secret_values = {
         "TWITCH_KRUBIT_CLIENT_ID": "twitch-client-id-visible",
