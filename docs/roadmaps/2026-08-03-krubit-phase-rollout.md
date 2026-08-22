@@ -355,6 +355,14 @@ resolved:
 
 ## Phase 5: Configurable Light Management
 
+**Implementation status (2026-08-22):** Slice 1 of 4 (shared moderation
+contract — lifecycle state machine and typed request/response types, no
+execution yet) is implemented; see
+[2026-08-22-moderation-contract-design.md](../superpowers/specs/2026-08-22-moderation-contract-design.md).
+This phase and Phase 6 are being built out together per the Zariya–Krubit
+Moderation Integration Handoff, reconciled into these existing roadmap slots
+rather than tracked as separate phases.
+
 ### Goal
 
 Give Krubit bounded, explicitly configured authority to act on his own detections, without turning Phase 3's evidence-only Watchdog into an unaccountable moderator. This phase exists because, as of 2026-08-16, Krubit performs zero automatic moderation actions by deliberate Phase 3 design — this is the first phase where that changes, and only for actions the server owner has explicitly turned on.
@@ -378,6 +386,10 @@ Zariya is not required for this phase's autonomous actions to function — they 
 Advance when every autonomous action is traceable to a specific detection and confidence score, disabling a permission in configuration takes effect immediately with no code change, no autonomous action is irreversible, repeated-action rate limits are proven under test, and kick/ban remain provably unreachable without explicit staff/Zariya authorization.
 
 ## Phase 6: Zariya Companion Bridge and Supervised Protection
+
+**Implementation status (2026-08-22):** See Phase 5's status note above — this
+phase and Phase 5 are being reconciled together against the Zariya–Krubit
+Moderation Integration Handoff, starting with the shared contract slice.
 
 ### Goal
 
