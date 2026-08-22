@@ -16,6 +16,13 @@ from krubit.contracts.moderation import (
     SubmitActionRecommendationRequest,
     SubmitAppealRequest,
 )
+from krubit.contracts.moderation import (
+    GetActionReceiptQuery,
+    GetIncidentQuery,
+    GetIncidentStatusQuery,
+    GetMemberModerationHistoryQuery,
+    GetPendingReviewsQuery,
+)
 from krubit.domain.moderation import (
     ActionReceipt,
     ApprovalDecision,
@@ -463,3 +470,83 @@ async def test_submit_appeal_wrong_guild_raises(store: SQLiteStore) -> None:
                 {"case_id": case_id, "reason": "member disputes the timeout", "idempotency_key": "idem:6"}
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_get_member_moderation_history(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    case_id = await _approved_case(store, service)
+    result = await service.get_member_moderation_history(
+        100, GetMemberModerationHistoryQuery.from_dict({"guild_id": "100", "member_id": "200"})
+    )
+    assert result.cases == (case_id,)
+
+
+@pytest.mark.asyncio
+async def test_get_incident_and_status(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    case_id = await _approved_case(store, service)
+    incident_result = await service.get_incident(
+        100, GetIncidentQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+    )
+    assert incident_result.case_id == case_id
+    status_result = await service.get_incident_status(
+        100, GetIncidentStatusQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+    )
+    assert status_result.status is ModerationStatus.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_get_action_receipt(store: SQLiteStore) -> None:
+    executor = FakeExecutor(succeed=True)
+    service = ModerationService(store, executor)
+    case_id = await _approved_case(store, service)
+    execute_response = await service.execute_approved_action(
+        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+    )
+    result = await service.get_action_receipt(
+        100,
+        GetActionReceiptQuery.from_dict(
+            {"guild_id": "100", "receipt_id": execute_response.receipt_state}
+        ),
+    )
+    assert result.case_id == case_id
+    assert result.succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_get_pending_reviews(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _seed_incident(store)
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    result = await service.get_pending_reviews(
+        100, GetPendingReviewsQuery.from_dict({"guild_id": "100"})
+    )
+    assert result.cases == (record_response.case_id,)

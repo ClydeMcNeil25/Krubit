@@ -16,6 +16,16 @@ from krubit.contracts.moderation import (
     CloseIncidentResponse,
     ExecuteApprovedActionRequest,
     ExecuteApprovedActionResponse,
+    GetActionReceiptQuery,
+    GetActionReceiptResult,
+    GetIncidentQuery,
+    GetIncidentResult,
+    GetIncidentStatusQuery,
+    GetIncidentStatusResult,
+    GetMemberModerationHistoryQuery,
+    GetMemberModerationHistoryResult,
+    GetPendingReviewsQuery,
+    GetPendingReviewsResult,
     RecordIncidentRequest,
     RecordIncidentResponse,
     RequestHumanApprovalRequest,
@@ -397,6 +407,59 @@ class ModerationService:
             case.guild_id, _SUBMIT_APPEAL, request.idempotency_key, response.case_id, response
         )
         return response
+
+    async def get_member_moderation_history(
+        self, guild_id: int, query: GetMemberModerationHistoryQuery
+    ) -> GetMemberModerationHistoryResult:
+        cases = await self._store.list_moderation_cases_for_member(
+            int(query.guild_id), int(query.member_id)
+        )
+        return GetMemberModerationHistoryResult(
+            guild_id=query.guild_id,
+            member_id=query.member_id,
+            cases=tuple(case.case_id for case in cases),
+        )
+
+    async def get_incident(self, guild_id: int, query: GetIncidentQuery) -> GetIncidentResult:
+        case = await self._store.get_moderation_case_by_incident(
+            int(query.guild_id), query.incident_id
+        )
+        if case is None:
+            raise ValueError(f"no case found for incident_id {query.incident_id!r}")
+        return GetIncidentResult(
+            guild_id=query.guild_id, incident_id=query.incident_id, case_id=case.case_id
+        )
+
+    async def get_incident_status(
+        self, guild_id: int, query: GetIncidentStatusQuery
+    ) -> GetIncidentStatusResult:
+        case = await self._store.get_moderation_case_by_incident(
+            int(query.guild_id), query.incident_id
+        )
+        if case is None:
+            raise ValueError(f"no case found for incident_id {query.incident_id!r}")
+        return GetIncidentStatusResult(
+            guild_id=query.guild_id, incident_id=query.incident_id, status=case.status
+        )
+
+    async def get_action_receipt(
+        self, guild_id: int, query: GetActionReceiptQuery
+    ) -> GetActionReceiptResult:
+        found = await self._store.get_action_receipt_by_id(query.receipt_id)
+        if found is None:
+            raise ValueError(f"no receipt found for receipt_id {query.receipt_id!r}")
+        receipt, case_id = found
+        return GetActionReceiptResult(
+            receipt_id=receipt.receipt_id, case_id=case_id, succeeded=receipt.succeeded
+        )
+
+    async def get_pending_reviews(
+        self, guild_id: int, query: GetPendingReviewsQuery
+    ) -> GetPendingReviewsResult:
+        cases = await self._store.list_pending_review_cases(int(query.guild_id))
+        return GetPendingReviewsResult(
+            guild_id=query.guild_id, cases=tuple(case.case_id for case in cases)
+        )
 
     async def _cache_response(
         self, guild_id: int, operation: str, idempotency_key: str, case_id: str, response: object

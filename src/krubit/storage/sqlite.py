@@ -3840,6 +3840,25 @@ class SQLiteStore:
         row = await cursor.fetchone()
         return int(row["total"]) if row is not None else 0
 
+    async def list_moderation_cases_for_member(
+        self, guild_id: int, member_id: int
+    ) -> tuple[ModerationCase, ...]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, case_id, incident_id, member_id, report_timestamp,
+                   offense_number, recommended_action, executed_action, action_expiration,
+                   status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                   close_timestamp
+            FROM moderation_cases
+            WHERE guild_id = ? AND member_id = ?
+            ORDER BY report_timestamp DESC, case_id DESC
+            """,
+            (guild_id, member_id),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(ModerationCase, moderation_case_from_row(row)) for row in rows)
+
     async def list_pending_review_cases(self, guild_id: int) -> tuple[ModerationCase, ...]:
         _require_guild_id(guild_id)
         cursor = await self._connection.execute(
