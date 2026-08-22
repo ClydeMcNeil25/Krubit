@@ -249,3 +249,28 @@ def test_get_pending_reviews_round_trips():
     result = GetPendingReviewsResult.from_dict(result_payload)
     assert result.cases == ("case:1",)
     assert result.to_dict() == result_payload
+
+
+def test_identical_idempotency_key_produces_identical_request_dataclass():
+    payload = {
+        "incident_id": "incident:1",
+        "guild_id": "100",
+        "member_id": "200",
+        "report_timestamp": "2026-01-01T00:00:00+00:00",
+        "idempotency_key": "idem:same",
+    }
+    first = RecordIncidentRequest.from_dict(payload)
+    second = RecordIncidentRequest.from_dict(dict(payload))
+    assert first == second
+
+
+def test_duplicate_response_carries_original_case_id():
+    payload = {
+        "case_id": "case:original",
+        "status": "recorded",
+        "duplicate": True,
+        "receipt_state": None,
+    }
+    response = RecordIncidentResponse.from_dict(payload)
+    assert response.duplicate is True
+    assert response.case_id == "case:original"
