@@ -118,8 +118,10 @@ class ModerationCase:
             )
         if self.executed_action is not None:
             _require_text("executed_action", self.executed_action, limit=_MAX_ACTION_LENGTH)
-            if self.status is not ModerationStatus.EXECUTED:
-                raise ValueError("executed_action may only be set when status is executed")
+            if self.status not in (ModerationStatus.EXECUTED, ModerationStatus.CLOSED):
+                raise ValueError(
+                    "executed_action may only be set when status is executed or closed"
+                )
         if self.action_expiration is not None:
             _require_aware("action_expiration", self.action_expiration)
         if type(self.status) is not ModerationStatus:

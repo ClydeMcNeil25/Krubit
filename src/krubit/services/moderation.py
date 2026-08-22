@@ -8,19 +8,27 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import Protocol
 
 from krubit.contracts.moderation import (
+    CloseIncidentRequest,
+    CloseIncidentResponse,
+    ExecuteApprovedActionRequest,
+    ExecuteApprovedActionResponse,
     RecordIncidentRequest,
     RecordIncidentResponse,
     RequestHumanApprovalRequest,
     RequestHumanApprovalResponse,
     SubmitActionRecommendationRequest,
     SubmitActionRecommendationResponse,
+    SubmitAppealRequest,
+    SubmitAppealResponse,
 )
 from krubit.domain.moderation import (
     ActionReceipt,
     AppealStatus,
+    ApprovalDecision,
     ModerationCase,
     ModerationStatus,
     UnknownIncidentError,
@@ -31,6 +39,9 @@ from krubit.storage.sqlite import SQLiteStore
 _RECORD_INCIDENT = "record_incident"
 _SUBMIT_ACTION_RECOMMENDATION = "submit_action_recommendation"
 _REQUEST_HUMAN_APPROVAL = "request_human_approval"
+_EXECUTE_APPROVED_ACTION = "execute_approved_action"
+_CLOSE_INCIDENT = "close_incident"
+_SUBMIT_APPEAL = "submit_appeal"
 
 
 class ActionExecutor(Protocol):
@@ -198,6 +209,192 @@ class ModerationService:
         )
         await self._cache_response(
             case.guild_id, _REQUEST_HUMAN_APPROVAL, request.idempotency_key, response.case_id, response
+        )
+        return response
+
+    async def record_human_decision(
+        self, case_id: str, *, reviewer_id: int, decision: ApprovalDecision
+    ) -> ModerationCase:
+        """Internal — not part of the 11-operation Zariya contract. Reserved
+        for slice 4's `/fetch admin` approval commands; added now only so
+        this slice's own tests can drive a case through the full lifecycle.
+        """
+        case = await self._store.get_moderation_case(case_id)
+        if case is None:
+            raise ValueError(f"unknown case_id {case_id!r}")
+        target = (
+            ModerationStatus.APPROVED
+            if decision is ApprovalDecision.APPROVED
+            else ModerationStatus.REJECTED
+        )
+        new_status = transition(case.status, target)
+        updated = ModerationCase(
+            case_id=case.case_id,
+            incident_id=case.incident_id,
+            guild_id=case.guild_id,
+            member_id=case.member_id,
+            report_timestamp=case.report_timestamp,
+            offense_number=case.offense_number,
+            recommended_action=case.recommended_action,
+            executed_action=case.executed_action,
+            action_expiration=case.action_expiration,
+            status=new_status,
+            review_deadline=case.review_deadline,
+            reviewer_id=reviewer_id,
+            reviewer_decision=decision,
+            appeal_status=case.appeal_status,
+            close_timestamp=case.close_timestamp,
+        )
+        return await self._store.save_moderation_case(updated)
+
+    async def execute_approved_action(
+        self, guild_id: int, request: ExecuteApprovedActionRequest
+    ) -> ExecuteApprovedActionResponse:
+        case = await self._store.get_moderation_case(request.case_id)
+        if case is None:
+            raise ValueError(f"unknown case_id {request.case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
+        cached = await self._store.get_moderation_idempotency_response(
+            case.guild_id, _EXECUTE_APPROVED_ACTION, request.idempotency_key
+        )
+        if cached is not None:
+            payload = json.loads(cached)
+            return ExecuteApprovedActionResponse.from_dict(payload | {"duplicate": True})
+
+        if case.status is not ModerationStatus.APPROVED:
+            raise ValueError(
+                f"execute_approved_action requires status APPROVED, case is {case.status}"
+            )
+
+        try:
+            receipt = await self._executor.execute(case, request.idempotency_key)
+            new_status = ModerationStatus.EXECUTED
+            executed_action = case.recommended_action
+        except Exception:
+            receipt = ActionReceipt(
+                receipt_id=f"receipt:{uuid.uuid4().hex}", succeeded=False, detail="executor raised"
+            )
+            new_status = ModerationStatus.EXECUTION_FAILED
+            executed_action = None
+
+        transition(case.status, new_status)
+        await self._store.save_action_receipt(case.guild_id, receipt, case.case_id)
+        updated = ModerationCase(
+            case_id=case.case_id,
+            incident_id=case.incident_id,
+            guild_id=case.guild_id,
+            member_id=case.member_id,
+            report_timestamp=case.report_timestamp,
+            offense_number=case.offense_number,
+            recommended_action=case.recommended_action,
+            executed_action=executed_action,
+            action_expiration=case.action_expiration,
+            status=new_status,
+            review_deadline=case.review_deadline,
+            reviewer_id=case.reviewer_id,
+            reviewer_decision=case.reviewer_decision,
+            appeal_status=case.appeal_status,
+            close_timestamp=case.close_timestamp,
+        )
+        await self._store.save_moderation_case(updated)
+        response = ExecuteApprovedActionResponse(
+            case_id=updated.case_id,
+            status=updated.status,
+            duplicate=False,
+            receipt_state=receipt.receipt_id,
+        )
+        await self._cache_response(
+            case.guild_id, _EXECUTE_APPROVED_ACTION, request.idempotency_key, response.case_id, response
+        )
+        return response
+
+    async def close_incident(
+        self, guild_id: int, request: CloseIncidentRequest
+    ) -> CloseIncidentResponse:
+        case = await self._store.get_moderation_case(request.case_id)
+        if case is None:
+            raise ValueError(f"unknown case_id {request.case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
+        cached = await self._store.get_moderation_idempotency_response(
+            case.guild_id, _CLOSE_INCIDENT, request.idempotency_key
+        )
+        if cached is not None:
+            payload = json.loads(cached)
+            return CloseIncidentResponse.from_dict(payload | {"duplicate": True})
+
+        new_status = transition(case.status, ModerationStatus.CLOSED)
+        updated = ModerationCase(
+            case_id=case.case_id,
+            incident_id=case.incident_id,
+            guild_id=case.guild_id,
+            member_id=case.member_id,
+            report_timestamp=case.report_timestamp,
+            offense_number=case.offense_number,
+            recommended_action=case.recommended_action,
+            executed_action=case.executed_action,
+            action_expiration=case.action_expiration,
+            status=new_status,
+            review_deadline=case.review_deadline,
+            reviewer_id=case.reviewer_id,
+            reviewer_decision=case.reviewer_decision,
+            appeal_status=case.appeal_status,
+            close_timestamp=datetime.now(UTC),
+        )
+        await self._store.save_moderation_case(updated)
+        response = CloseIncidentResponse(
+            case_id=updated.case_id, status=updated.status, duplicate=False, receipt_state=None
+        )
+        await self._cache_response(
+            case.guild_id, _CLOSE_INCIDENT, request.idempotency_key, response.case_id, response
+        )
+        return response
+
+    async def submit_appeal(
+        self, guild_id: int, request: SubmitAppealRequest
+    ) -> SubmitAppealResponse:
+        case = await self._store.get_moderation_case(request.case_id)
+        if case is None:
+            raise ValueError(f"unknown case_id {request.case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
+        cached = await self._store.get_moderation_idempotency_response(
+            case.guild_id, _SUBMIT_APPEAL, request.idempotency_key
+        )
+        if cached is not None:
+            payload = json.loads(cached)
+            return SubmitAppealResponse.from_dict(payload | {"duplicate": True})
+
+        if case.appeal_status is not AppealStatus.NONE:
+            raise ValueError("an appeal has already been submitted for this case")
+        if case.status not in (ModerationStatus.EXECUTED, ModerationStatus.CLOSED):
+            raise ValueError(
+                f"submit_appeal requires status EXECUTED or CLOSED, case is {case.status}"
+            )
+        updated = ModerationCase(
+            case_id=case.case_id,
+            incident_id=case.incident_id,
+            guild_id=case.guild_id,
+            member_id=case.member_id,
+            report_timestamp=case.report_timestamp,
+            offense_number=case.offense_number,
+            recommended_action=case.recommended_action,
+            executed_action=case.executed_action,
+            action_expiration=case.action_expiration,
+            status=case.status,
+            review_deadline=case.review_deadline,
+            reviewer_id=case.reviewer_id,
+            reviewer_decision=case.reviewer_decision,
+            appeal_status=AppealStatus.SUBMITTED,
+            close_timestamp=case.close_timestamp,
+        )
+        await self._store.save_moderation_case(updated)
+        response = SubmitAppealResponse(
+            case_id=updated.case_id, appeal_status=updated.appeal_status, duplicate=False
+        )
+        await self._cache_response(
+            case.guild_id, _SUBMIT_APPEAL, request.idempotency_key, response.case_id, response
         )
         return response
 
