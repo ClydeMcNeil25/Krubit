@@ -35,6 +35,16 @@ __all__ = [
     "CloseIncidentResponse",
     "SubmitAppealRequest",
     "SubmitAppealResponse",
+    "GetMemberModerationHistoryQuery",
+    "GetMemberModerationHistoryResult",
+    "GetIncidentQuery",
+    "GetIncidentResult",
+    "GetIncidentStatusQuery",
+    "GetIncidentStatusResult",
+    "GetActionReceiptQuery",
+    "GetActionReceiptResult",
+    "GetPendingReviewsQuery",
+    "GetPendingReviewsResult",
 ]
 
 
@@ -390,3 +400,155 @@ class SubmitAppealResponse:
             "appeal_status": self.appeal_status.value,
             "duplicate": self.duplicate,
         }
+
+
+def _tuple_of_str(payload: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ModerationContractError(f"{key} must be a list of strings")
+    return tuple(value)
+
+
+@dataclass(frozen=True, slots=True)
+class GetMemberModerationHistoryQuery:
+    member_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetMemberModerationHistoryQuery":
+        return cls(member_id=_required_text(payload, "member_id"))
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"member_id": self.member_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetMemberModerationHistoryResult:
+    member_id: str
+    cases: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetMemberModerationHistoryResult":
+        return cls(
+            member_id=_required_text(payload, "member_id"),
+            cases=_tuple_of_str(payload, "cases"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"member_id": self.member_id, "cases": list(self.cases)}
+
+
+@dataclass(frozen=True, slots=True)
+class GetIncidentQuery:
+    incident_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentQuery":
+        return cls(incident_id=_required_text(payload, "incident_id"))
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"incident_id": self.incident_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetIncidentResult:
+    incident_id: str
+    case_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentResult":
+        return cls(
+            incident_id=_required_text(payload, "incident_id"),
+            case_id=_required_text(payload, "case_id"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"incident_id": self.incident_id, "case_id": self.case_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetIncidentStatusQuery:
+    incident_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentStatusQuery":
+        return cls(incident_id=_required_text(payload, "incident_id"))
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"incident_id": self.incident_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetIncidentStatusResult:
+    incident_id: str
+    status: ModerationStatus
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentStatusResult":
+        return cls(
+            incident_id=_required_text(payload, "incident_id"),
+            status=_status(payload),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"incident_id": self.incident_id, "status": self.status.value}
+
+
+@dataclass(frozen=True, slots=True)
+class GetActionReceiptQuery:
+    receipt_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetActionReceiptQuery":
+        return cls(receipt_id=_required_text(payload, "receipt_id"))
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"receipt_id": self.receipt_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetActionReceiptResult:
+    receipt_id: str
+    case_id: str
+    succeeded: bool
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetActionReceiptResult":
+        succeeded = payload.get("succeeded")
+        if not isinstance(succeeded, bool):
+            raise ModerationContractError("succeeded must be a boolean")
+        return cls(
+            receipt_id=_required_text(payload, "receipt_id"),
+            case_id=_required_text(payload, "case_id"),
+            succeeded=succeeded,
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"receipt_id": self.receipt_id, "case_id": self.case_id, "succeeded": self.succeeded}
+
+
+@dataclass(frozen=True, slots=True)
+class GetPendingReviewsQuery:
+    guild_id: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetPendingReviewsQuery":
+        return cls(guild_id=_required_text(payload, "guild_id"))
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"guild_id": self.guild_id}
+
+
+@dataclass(frozen=True, slots=True)
+class GetPendingReviewsResult:
+    guild_id: str
+    cases: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GetPendingReviewsResult":
+        return cls(
+            guild_id=_required_text(payload, "guild_id"),
+            cases=_tuple_of_str(payload, "cases"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"guild_id": self.guild_id, "cases": list(self.cases)}
