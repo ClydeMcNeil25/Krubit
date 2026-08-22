@@ -5,6 +5,21 @@ from datetime import UTC, datetime
 import pytest
 
 from krubit.contracts.moderation import (
+    MODERATION_CONTRACT_SCHEMA,
+    CloseIncidentRequest,
+    CloseIncidentResponse,
+    ExecuteApprovedActionRequest,
+    ExecuteApprovedActionResponse,
+    GetActionReceiptQuery,
+    GetActionReceiptResult,
+    GetIncidentQuery,
+    GetIncidentResult,
+    GetIncidentStatusQuery,
+    GetIncidentStatusResult,
+    GetMemberModerationHistoryQuery,
+    GetMemberModerationHistoryResult,
+    GetPendingReviewsQuery,
+    GetPendingReviewsResult,
     ModerationContractError,
     RecordIncidentRequest,
     RecordIncidentResponse,
@@ -12,10 +27,12 @@ from krubit.contracts.moderation import (
     RequestHumanApprovalResponse,
     SubmitActionRecommendationRequest,
     SubmitActionRecommendationResponse,
+    SubmitAppealRequest,
+    SubmitAppealResponse,
     _required_text,
     _timestamp,
 )
-from krubit.domain.moderation import ModerationStatus
+from krubit.domain.moderation import AppealStatus, ModerationStatus
 
 
 def test_required_text_raises_on_blank():
@@ -121,17 +138,6 @@ def test_request_human_approval_round_trips():
     assert response.to_dict() == response_payload
 
 
-from krubit.contracts.moderation import (
-    CloseIncidentRequest,
-    CloseIncidentResponse,
-    ExecuteApprovedActionRequest,
-    ExecuteApprovedActionResponse,
-    SubmitAppealRequest,
-    SubmitAppealResponse,
-)
-from krubit.domain.moderation import AppealStatus
-
-
 def test_execute_approved_action_round_trips():
     payload = {
         "case_id": "case:1",
@@ -187,20 +193,6 @@ def test_submit_appeal_round_trips():
     response = SubmitAppealResponse.from_dict(response_payload)
     assert response.appeal_status is AppealStatus.SUBMITTED
     assert response.to_dict() == response_payload
-
-
-from krubit.contracts.moderation import (
-    GetActionReceiptQuery,
-    GetActionReceiptResult,
-    GetIncidentQuery,
-    GetIncidentResult,
-    GetIncidentStatusQuery,
-    GetIncidentStatusResult,
-    GetMemberModerationHistoryQuery,
-    GetMemberModerationHistoryResult,
-    GetPendingReviewsQuery,
-    GetPendingReviewsResult,
-)
 
 
 def test_get_member_moderation_history_round_trips():
@@ -274,3 +266,50 @@ def test_duplicate_response_carries_original_case_id():
     response = RecordIncidentResponse.from_dict(payload)
     assert response.duplicate is True
     assert response.case_id == "case:original"
+
+
+def test_moderation_contract_schema_constant_value():
+    assert MODERATION_CONTRACT_SCHEMA == "krubit.moderation-contract.v1"
+
+
+def test_submit_appeal_request_redacts_secret_shaped_reason():
+    payload = {
+        "case_id": "case:1",
+        "reason": "please waive this, api_key=sk-live-abcdef123456",
+        "idempotency_key": "idem:7",
+    }
+    request = SubmitAppealRequest.from_dict(payload)
+    assert "sk-live-abcdef123456" not in request.to_dict()["reason"]
+    assert "[REDACTED]" in request.to_dict()["reason"]
+
+
+def test_close_incident_request_redacts_secret_shaped_decision():
+    payload = {
+        "case_id": "case:1",
+        "decision": "closing, bot_token: abc.def.ghijklmnopqrstuvwxyz012345",
+        "idempotency_key": "idem:8",
+    }
+    request = CloseIncidentRequest.from_dict(payload)
+    assert "abc.def.ghijklmnopqrstuvwxyz012345" not in request.to_dict()["decision"]
+    assert "[REDACTED]" in request.to_dict()["decision"]
+
+
+def test_case_id_over_max_length_raises():
+    payload = {
+        "case_id": "c" * 65,
+        "status": "recorded",
+        "duplicate": False,
+        "receipt_state": None,
+    }
+    with pytest.raises(ModerationContractError, match="case_id"):
+        RecordIncidentResponse.from_dict(payload)
+
+
+def test_recommended_action_over_max_length_raises():
+    payload = {
+        "case_id": "case:1",
+        "recommended_action": "a" * 501,
+        "idempotency_key": "idem:9",
+    }
+    with pytest.raises(ModerationContractError, match="recommended_action"):
+        SubmitActionRecommendationRequest.from_dict(payload)

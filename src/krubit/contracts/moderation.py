@@ -15,10 +15,13 @@ from datetime import UTC, datetime
 from krubit.domain.models import JSONValue
 from krubit.domain.moderation import (
     AppealStatus,
-    ApprovalDecision,
     IllegalTransitionError,
     ModerationStatus,
 )
+from krubit.security.redaction import redact
+
+# Reserved for use starting in a later slice, once from_dict/to_dict validate/emit it.
+MODERATION_CONTRACT_SCHEMA = "krubit.moderation-contract.v1"
 
 __all__ = [
     "IllegalTransitionError",
@@ -59,6 +62,26 @@ def _required_text(payload: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _required_id(payload: Mapping[str, object], key: str) -> str:
+    value = _required_text(payload, key)
+    if len(value) > _MAX_ID_LENGTH:
+        raise ModerationContractError(f"{key} must be at most {_MAX_ID_LENGTH} characters")
+    return value
+
+
+def _required_action_text(payload: Mapping[str, object], key: str) -> str:
+    value = _required_text(payload, key)
+    if len(value) > _MAX_ACTION_LENGTH:
+        raise ModerationContractError(f"{key} must be at most {_MAX_ACTION_LENGTH} characters")
+    return value
+
+
+def _redact_text(value: str) -> str:
+    redacted = redact(value)
+    assert isinstance(redacted, str)
+    return redacted
+
+
 def _timestamp(value: object) -> datetime:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -69,18 +92,8 @@ def _timestamp(value: object) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _optional_timestamp(value: object) -> datetime | None:
-    if value is None:
-        return None
-    return _timestamp(value)
-
-
 def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-
-def _optional_iso(value: datetime | None) -> str | None:
-    return None if value is None else _iso(value)
 
 
 _MAX_ID_LENGTH = 64
@@ -126,7 +139,7 @@ class RecordIncidentRequest:
         if not raw_member_id.isdigit() or int(raw_member_id) <= 0:
             raise ModerationContractError("member_id must be positive numeric text")
         return cls(
-            incident_id=_required_text(payload, "incident_id"),
+            incident_id=_required_id(payload, "incident_id"),
             guild_id=int(raw_guild_id),
             member_id=int(raw_member_id),
             report_timestamp=_timestamp(payload.get("report_timestamp")),
@@ -153,7 +166,7 @@ class RecordIncidentResponse:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> RecordIncidentResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             status=_status(payload),
             duplicate=_duplicate(payload),
             receipt_state=_receipt_state(payload),
@@ -177,8 +190,8 @@ class SubmitActionRecommendationRequest:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> SubmitActionRecommendationRequest:
         return cls(
-            case_id=_required_text(payload, "case_id"),
-            recommended_action=_required_text(payload, "recommended_action"),
+            case_id=_required_id(payload, "case_id"),
+            recommended_action=_required_action_text(payload, "recommended_action"),
             idempotency_key=_required_text(payload, "idempotency_key"),
         )
 
@@ -200,7 +213,7 @@ class SubmitActionRecommendationResponse:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> SubmitActionRecommendationResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             status=_status(payload),
             duplicate=_duplicate(payload),
             receipt_state=_receipt_state(payload),
@@ -224,7 +237,7 @@ class RequestHumanApprovalRequest:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> RequestHumanApprovalRequest:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             review_deadline=_timestamp(payload.get("review_deadline")),
             idempotency_key=_required_text(payload, "idempotency_key"),
         )
@@ -247,7 +260,7 @@ class RequestHumanApprovalResponse:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> RequestHumanApprovalResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             status=_status(payload),
             duplicate=_duplicate(payload),
             receipt_state=_receipt_state(payload),
@@ -276,9 +289,9 @@ class ExecuteApprovedActionRequest:
     idempotency_key: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "ExecuteApprovedActionRequest":
+    def from_dict(cls, payload: Mapping[str, object]) -> ExecuteApprovedActionRequest:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             idempotency_key=_required_text(payload, "idempotency_key"),
         )
 
@@ -294,9 +307,9 @@ class ExecuteApprovedActionResponse:
     receipt_state: str | None
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "ExecuteApprovedActionResponse":
+    def from_dict(cls, payload: Mapping[str, object]) -> ExecuteApprovedActionResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             status=_status(payload),
             duplicate=_duplicate(payload),
             receipt_state=_receipt_state(payload),
@@ -318,17 +331,17 @@ class CloseIncidentRequest:
     idempotency_key: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "CloseIncidentRequest":
+    def from_dict(cls, payload: Mapping[str, object]) -> CloseIncidentRequest:
         return cls(
-            case_id=_required_text(payload, "case_id"),
-            decision=_required_text(payload, "decision"),
+            case_id=_required_id(payload, "case_id"),
+            decision=_required_action_text(payload, "decision"),
             idempotency_key=_required_text(payload, "idempotency_key"),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
             "case_id": self.case_id,
-            "decision": self.decision,
+            "decision": _redact_text(self.decision),
             "idempotency_key": self.idempotency_key,
         }
 
@@ -341,9 +354,9 @@ class CloseIncidentResponse:
     receipt_state: str | None
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "CloseIncidentResponse":
+    def from_dict(cls, payload: Mapping[str, object]) -> CloseIncidentResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             status=_status(payload),
             duplicate=_duplicate(payload),
             receipt_state=_receipt_state(payload),
@@ -365,17 +378,17 @@ class SubmitAppealRequest:
     idempotency_key: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "SubmitAppealRequest":
+    def from_dict(cls, payload: Mapping[str, object]) -> SubmitAppealRequest:
         return cls(
-            case_id=_required_text(payload, "case_id"),
-            reason=_required_text(payload, "reason"),
+            case_id=_required_id(payload, "case_id"),
+            reason=_required_action_text(payload, "reason"),
             idempotency_key=_required_text(payload, "idempotency_key"),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
             "case_id": self.case_id,
-            "reason": self.reason,
+            "reason": _redact_text(self.reason),
             "idempotency_key": self.idempotency_key,
         }
 
@@ -387,9 +400,9 @@ class SubmitAppealResponse:
     duplicate: bool
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "SubmitAppealResponse":
+    def from_dict(cls, payload: Mapping[str, object]) -> SubmitAppealResponse:
         return cls(
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             appeal_status=_appeal_status(payload),
             duplicate=_duplicate(payload),
         )
@@ -414,7 +427,7 @@ class GetMemberModerationHistoryQuery:
     member_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetMemberModerationHistoryQuery":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetMemberModerationHistoryQuery:
         return cls(member_id=_required_text(payload, "member_id"))
 
     def to_dict(self) -> dict[str, JSONValue]:
@@ -427,7 +440,7 @@ class GetMemberModerationHistoryResult:
     cases: tuple[str, ...]
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetMemberModerationHistoryResult":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetMemberModerationHistoryResult:
         return cls(
             member_id=_required_text(payload, "member_id"),
             cases=_tuple_of_str(payload, "cases"),
@@ -442,8 +455,8 @@ class GetIncidentQuery:
     incident_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentQuery":
-        return cls(incident_id=_required_text(payload, "incident_id"))
+    def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentQuery:
+        return cls(incident_id=_required_id(payload, "incident_id"))
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {"incident_id": self.incident_id}
@@ -455,10 +468,10 @@ class GetIncidentResult:
     case_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentResult":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentResult:
         return cls(
-            incident_id=_required_text(payload, "incident_id"),
-            case_id=_required_text(payload, "case_id"),
+            incident_id=_required_id(payload, "incident_id"),
+            case_id=_required_id(payload, "case_id"),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
@@ -470,8 +483,8 @@ class GetIncidentStatusQuery:
     incident_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentStatusQuery":
-        return cls(incident_id=_required_text(payload, "incident_id"))
+    def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentStatusQuery:
+        return cls(incident_id=_required_id(payload, "incident_id"))
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {"incident_id": self.incident_id}
@@ -483,9 +496,9 @@ class GetIncidentStatusResult:
     status: ModerationStatus
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetIncidentStatusResult":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentStatusResult:
         return cls(
-            incident_id=_required_text(payload, "incident_id"),
+            incident_id=_required_id(payload, "incident_id"),
             status=_status(payload),
         )
 
@@ -498,7 +511,7 @@ class GetActionReceiptQuery:
     receipt_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetActionReceiptQuery":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetActionReceiptQuery:
         return cls(receipt_id=_required_text(payload, "receipt_id"))
 
     def to_dict(self) -> dict[str, JSONValue]:
@@ -512,13 +525,13 @@ class GetActionReceiptResult:
     succeeded: bool
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetActionReceiptResult":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetActionReceiptResult:
         succeeded = payload.get("succeeded")
         if not isinstance(succeeded, bool):
             raise ModerationContractError("succeeded must be a boolean")
         return cls(
             receipt_id=_required_text(payload, "receipt_id"),
-            case_id=_required_text(payload, "case_id"),
+            case_id=_required_id(payload, "case_id"),
             succeeded=succeeded,
         )
 
@@ -531,7 +544,7 @@ class GetPendingReviewsQuery:
     guild_id: str
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetPendingReviewsQuery":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetPendingReviewsQuery:
         return cls(guild_id=_required_text(payload, "guild_id"))
 
     def to_dict(self) -> dict[str, JSONValue]:
@@ -544,7 +557,7 @@ class GetPendingReviewsResult:
     cases: tuple[str, ...]
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> "GetPendingReviewsResult":
+    def from_dict(cls, payload: Mapping[str, object]) -> GetPendingReviewsResult:
         return cls(
             guild_id=_required_text(payload, "guild_id"),
             cases=_tuple_of_str(payload, "cases"),

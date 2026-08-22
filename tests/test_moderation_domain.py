@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from krubit.domain.moderation import (
+    AppealStatus,
+    ApprovalDecision,
     IllegalTransitionError,
+    ModerationCase,
     ModerationStatus,
     transition,
 )
@@ -57,15 +62,6 @@ def test_legal_transitions_succeed(current, target):
 def test_illegal_transitions_raise(current, target):
     with pytest.raises(IllegalTransitionError):
         transition(current, target)
-
-
-from datetime import UTC, datetime
-
-from krubit.domain.moderation import (
-    ApprovalDecision,
-    AppealStatus,
-    ModerationCase,
-)
 
 
 def _case(**overrides):
