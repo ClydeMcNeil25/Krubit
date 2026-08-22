@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -624,3 +625,55 @@ async def test_get_pending_reviews_guild_id_mismatch_raises(store: SQLiteStore) 
         await service.get_pending_reviews(
             999, GetPendingReviewsQuery.from_dict({"guild_id": "100"})
         )
+
+
+@pytest.mark.asyncio
+async def test_same_idempotency_key_across_two_operations_does_not_collide(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    shared_key = "idem:shared"
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": shared_key,
+            }
+        ),
+    )
+    recommend_response = await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": shared_key,
+            }
+        ),
+    )
+    assert recommend_response.duplicate is False
+    assert recommend_response.case_id == record_response.case_id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_key_requests_produce_one_case(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    request = RecordIncidentRequest.from_dict(
+        {
+            "incident_id": "incident:1",
+            "guild_id": "100",
+            "member_id": "200",
+            "report_timestamp": "2026-01-01T00:00:00+00:00",
+            "idempotency_key": "idem:concurrent",
+        }
+    )
+    results = await asyncio.gather(
+        service.record_incident(100, request), service.record_incident(100, request)
+    )
+    assert results[0].case_id == results[1].case_id
+    cases = await store.list_moderation_cases_for_member(100, 200)
+    assert len(cases) == 1
