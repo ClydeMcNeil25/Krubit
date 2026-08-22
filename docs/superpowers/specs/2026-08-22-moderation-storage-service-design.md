@@ -219,9 +219,11 @@ None`.
 - `record_incident` against an unknown `incident_id`: raises
   `UnknownIncidentError`, no case created.
 - Second `record_incident` for an already-cased `incident_id` (different
-  idempotency key): rejected by the `UNIQUE(guild_id, incident_id)`
-  constraint, surfaced as a clear service-level error, not a raw SQLite
-  exception.
+  idempotency key): the `UNIQUE(guild_id, incident_id)` constraint prevents a
+  second row, but the service treats this as an idempotent success rather
+  than an error — it returns the existing case with `duplicate=True`, the
+  same shape a repeated idempotency key produces. This is judged better
+  behavior for an idempotent API than surfacing a service-level error.
 - `get_action_receipt` for an existing and a missing `receipt_id`.
 - `execute_approved_action` success and failure paths against the fake
   executor, confirming `execution_key` equals the request's

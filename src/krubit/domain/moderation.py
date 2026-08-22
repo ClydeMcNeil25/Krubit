@@ -113,9 +113,7 @@ class ModerationCase:
         if self.offense_number < 1:
             raise ValueError("offense_number must be at least 1")
         if self.recommended_action is not None:
-            _require_text(
-                "recommended_action", self.recommended_action, limit=_MAX_ACTION_LENGTH
-            )
+            _require_text("recommended_action", self.recommended_action, limit=_MAX_ACTION_LENGTH)
         if self.executed_action is not None:
             _require_text("executed_action", self.executed_action, limit=_MAX_ACTION_LENGTH)
             if self.status not in (ModerationStatus.EXECUTED, ModerationStatus.CLOSED):

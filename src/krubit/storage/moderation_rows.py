@@ -38,9 +38,7 @@ def moderation_case_from_row(row: aiosqlite.Row | None) -> ModerationCase | None
         recommended_action=(
             None if row["recommended_action"] is None else str(row["recommended_action"])
         ),
-        executed_action=(
-            None if row["executed_action"] is None else str(row["executed_action"])
-        ),
+        executed_action=(None if row["executed_action"] is None else str(row["executed_action"])),
         action_expiration=_optional_datetime(row["action_expiration"]),
         status=ModerationStatus(str(row["status"])),
         review_deadline=_optional_datetime(row["review_deadline"]),

@@ -521,7 +521,11 @@ class GetIncidentStatusResult:
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"guild_id": self.guild_id, "incident_id": self.incident_id, "status": self.status.value}
+        return {
+            "guild_id": self.guild_id,
+            "incident_id": self.incident_id,
+            "status": self.status.value,
+        }
 
 
 @dataclass(frozen=True, slots=True)

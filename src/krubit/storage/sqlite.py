@@ -46,8 +46,8 @@ from krubit.domain.live_signals import (
     TwitchStream,
 )
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
-from krubit.domain.moderation import ModerationCase, ModerationStatus
 from krubit.domain.moderation import ActionReceipt as ModerationActionReceipt
+from krubit.domain.moderation import ModerationCase, ModerationStatus
 from krubit.domain.watchdog import (
     AllowBlockEntry,
     EntrySniffAssessment,
@@ -1978,9 +1978,7 @@ class SQLiteStore:
             raise RuntimeError("saved creator account could not be read")
         return saved
 
-    async def save_migrated_creator_account(
-        self, account: CreatorAccount
-    ) -> CreatorAccount | None:
+    async def save_migrated_creator_account(self, account: CreatorAccount) -> CreatorAccount | None:
         """Idempotently link one Phase 2A-derived creator account without ever
         clobbering an operator's later decisions about it.
 
@@ -2293,8 +2291,15 @@ class SQLiteStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
-                    state_hash, guild_id, member_id, account_id, platform,
-                    capability, redirect_uri, now.isoformat(), expires_at.isoformat(),
+                    state_hash,
+                    guild_id,
+                    member_id,
+                    account_id,
+                    platform,
+                    capability,
+                    redirect_uri,
+                    now.isoformat(),
+                    expires_at.isoformat(),
                 ),
             )
         return token
@@ -2390,8 +2395,13 @@ class SQLiteStore:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    guild_id, account_id, capability, secret_ref,
-                    provider_resource_id, authorization_subject_id, status,
+                    guild_id,
+                    account_id,
+                    capability,
+                    secret_ref,
+                    provider_resource_id,
+                    authorization_subject_id,
+                    status,
                     expires_at.isoformat() if expires_at is not None else None,
                     now.isoformat(),
                 ),
@@ -2454,8 +2464,11 @@ class SQLiteStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row.guild_id, uuid4().hex, row.account_id,
-                        "connector_deauthorized", 0,
+                        row.guild_id,
+                        uuid4().hex,
+                        row.account_id,
+                        "connector_deauthorized",
+                        0,
                         json.dumps(
                             {"platform_capability": row.capability, "account_id": row.account_id},
                             sort_keys=True,
@@ -3749,51 +3762,56 @@ class SQLiteStore:
         """Insert or replace one moderation case. Identity is `(guild_id, case_id)`."""
         _require_guild_id(case.guild_id)
         async with self._write_transaction():
-            await self._connection.execute(
-                """
-                INSERT INTO moderation_cases (
-                    guild_id, case_id, incident_id, member_id, report_timestamp,
-                    offense_number, recommended_action, executed_action, action_expiration,
-                    status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
-                    close_timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(guild_id, case_id) DO UPDATE SET
-                    incident_id = excluded.incident_id,
-                    member_id = excluded.member_id,
-                    report_timestamp = excluded.report_timestamp,
-                    offense_number = excluded.offense_number,
-                    recommended_action = excluded.recommended_action,
-                    executed_action = excluded.executed_action,
-                    action_expiration = excluded.action_expiration,
-                    status = excluded.status,
-                    review_deadline = excluded.review_deadline,
-                    reviewer_id = excluded.reviewer_id,
-                    reviewer_decision = excluded.reviewer_decision,
-                    appeal_status = excluded.appeal_status,
-                    close_timestamp = excluded.close_timestamp
-                """,
-                (
-                    case.guild_id,
-                    case.case_id,
-                    case.incident_id,
-                    case.member_id,
-                    case.report_timestamp.isoformat(),
-                    case.offense_number,
-                    case.recommended_action,
-                    case.executed_action,
-                    case.action_expiration.isoformat() if case.action_expiration else None,
-                    case.status.value,
-                    case.review_deadline.isoformat() if case.review_deadline else None,
-                    case.reviewer_id,
-                    case.reviewer_decision.value if case.reviewer_decision else None,
-                    case.appeal_status.value,
-                    case.close_timestamp.isoformat() if case.close_timestamp else None,
-                ),
-            )
+            await self._save_moderation_case_locked(case)
         saved = await self.get_moderation_case(case.case_id)
         if saved is None:
             raise RuntimeError("saved moderation case could not be read")
         return saved
+
+    async def _save_moderation_case_locked(self, case: ModerationCase) -> None:
+        """Insert or replace one moderation case. Caller must already hold the write lock
+        (i.e. be inside a `_write_transaction()` block)."""
+        await self._connection.execute(
+            """
+            INSERT INTO moderation_cases (
+                guild_id, case_id, incident_id, member_id, report_timestamp,
+                offense_number, recommended_action, executed_action, action_expiration,
+                status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                close_timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, case_id) DO UPDATE SET
+                incident_id = excluded.incident_id,
+                member_id = excluded.member_id,
+                report_timestamp = excluded.report_timestamp,
+                offense_number = excluded.offense_number,
+                recommended_action = excluded.recommended_action,
+                executed_action = excluded.executed_action,
+                action_expiration = excluded.action_expiration,
+                status = excluded.status,
+                review_deadline = excluded.review_deadline,
+                reviewer_id = excluded.reviewer_id,
+                reviewer_decision = excluded.reviewer_decision,
+                appeal_status = excluded.appeal_status,
+                close_timestamp = excluded.close_timestamp
+            """,
+            (
+                case.guild_id,
+                case.case_id,
+                case.incident_id,
+                case.member_id,
+                case.report_timestamp.isoformat(),
+                case.offense_number,
+                case.recommended_action,
+                case.executed_action,
+                case.action_expiration.isoformat() if case.action_expiration else None,
+                case.status.value,
+                case.review_deadline.isoformat() if case.review_deadline else None,
+                case.reviewer_id,
+                case.reviewer_decision.value if case.reviewer_decision else None,
+                case.appeal_status.value,
+                case.close_timestamp.isoformat() if case.close_timestamp else None,
+            ),
+        )
 
     async def get_moderation_case(self, case_id: str) -> ModerationCase | None:
         cursor = await self._connection.execute(
@@ -3881,21 +3899,27 @@ class SQLiteStore:
     ) -> None:
         _require_guild_id(guild_id)
         async with self._write_transaction():
-            await self._connection.execute(
-                """
-                INSERT INTO moderation_action_receipts (
-                    guild_id, receipt_id, case_id, succeeded, detail, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id,
-                    receipt.receipt_id,
-                    case_id,
-                    1 if receipt.succeeded else 0,
-                    receipt.detail,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
+            await self._save_action_receipt_locked(guild_id, receipt, case_id)
+
+    async def _save_action_receipt_locked(
+        self, guild_id: int, receipt: ModerationActionReceipt, case_id: str
+    ) -> None:
+        """Caller must already hold the write lock (inside a `_write_transaction()`)."""
+        await self._connection.execute(
+            """
+            INSERT INTO moderation_action_receipts (
+                guild_id, receipt_id, case_id, succeeded, detail, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                receipt.receipt_id,
+                case_id,
+                1 if receipt.succeeded else 0,
+                receipt.detail,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
 
     async def get_action_receipt_by_id(
         self, receipt_id: str
@@ -3933,14 +3957,57 @@ class SQLiteStore:
     ) -> None:
         _require_guild_id(guild_id)
         async with self._write_transaction():
-            await self._connection.execute(
-                """
-                INSERT INTO moderation_idempotency_keys (
-                    guild_id, operation, idempotency_key, case_id, response_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (guild_id, operation, idempotency_key, case_id, response_json, datetime.now(UTC).isoformat()),
+            await self._save_moderation_idempotency_response_locked(
+                guild_id, operation, idempotency_key, case_id, response_json
             )
+
+    async def _save_moderation_idempotency_response_locked(
+        self,
+        guild_id: int,
+        operation: str,
+        idempotency_key: str,
+        case_id: str,
+        response_json: str,
+    ) -> None:
+        """Caller must already hold the write lock (inside a `_write_transaction()`)."""
+        await self._connection.execute(
+            """
+            INSERT INTO moderation_idempotency_keys (
+                guild_id, operation, idempotency_key, case_id, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                operation,
+                idempotency_key,
+                case_id,
+                response_json,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+
+    async def save_execution_outcome(
+        self,
+        case: ModerationCase,
+        receipt: ModerationActionReceipt,
+        operation: str,
+        idempotency_key: str,
+        response_json: str,
+    ) -> ModerationCase:
+        """Atomically persist the action receipt, the updated case, and the
+        idempotency-cache entry from `execute_approved_action` in one transaction, so a
+        crash between the three writes can never leave them partially committed."""
+        _require_guild_id(case.guild_id)
+        async with self._write_transaction():
+            await self._save_action_receipt_locked(case.guild_id, receipt, case.case_id)
+            await self._save_moderation_case_locked(case)
+            await self._save_moderation_idempotency_response_locked(
+                case.guild_id, operation, idempotency_key, case.case_id, response_json
+            )
+        saved = await self.get_moderation_case(case.case_id)
+        if saved is None:
+            raise RuntimeError("saved moderation case could not be read")
+        return saved
 
     async def save_allow_block_entry(self, entry: AllowBlockEntry) -> AllowBlockEntry:
         """Insert or replace one guild-configured allow/block entry for a Discord user.
@@ -4276,9 +4343,7 @@ class SQLiteStore:
                 return candidate
         raise RuntimeError("saved milestone could not be read")
 
-    async def list_milestones(
-        self, guild_id: int, *, member_id: int
-    ) -> tuple[Milestone, ...]:
+    async def list_milestones(self, guild_id: int, *, member_id: int) -> tuple[Milestone, ...]:
         _require_guild_id(guild_id)
         cursor = await self._connection.execute(
             """
@@ -4492,14 +4557,15 @@ class SQLiteStore:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    confirmation_code, authorization_subject_id, platform,
-                    requested_at.isoformat(), rows_deleted,
+                    confirmation_code,
+                    authorization_subject_id,
+                    platform,
+                    requested_at.isoformat(),
+                    rows_deleted,
                 ),
             )
 
-    async def get_data_deletion_request(
-        self, confirmation_code: str
-    ) -> DataDeletionRequest | None:
+    async def get_data_deletion_request(self, confirmation_code: str) -> DataDeletionRequest | None:
         cursor = await self._connection.execute(
             """
             SELECT confirmation_code, authorization_subject_id, platform,
@@ -4552,8 +4618,6 @@ def _row_to_connector_authorization(row: aiosqlite.Row) -> ConnectorAuthorizatio
         authorization_subject_id=str(row["authorization_subject_id"]),
         status=str(row["status"]),
         expires_at=(
-            datetime.fromisoformat(row["expires_at"])
-            if row["expires_at"] is not None
-            else None
+            datetime.fromisoformat(row["expires_at"]) if row["expires_at"] is not None else None
         ),
     )

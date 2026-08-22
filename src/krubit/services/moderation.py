@@ -6,9 +6,12 @@ real SQLite storage. No Discord or HTTP knowledge — matches
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import sqlite3
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -37,6 +40,7 @@ from krubit.contracts.moderation import (
     SubmitAppealResponse,
 )
 from krubit.domain.moderation import (
+    _MAX_ACTION_LENGTH,
     ActionReceipt,
     AppealStatus,
     ApprovalDecision,
@@ -46,6 +50,8 @@ from krubit.domain.moderation import (
     transition,
 )
 from krubit.storage.sqlite import SQLiteStore
+
+logger = logging.getLogger(__name__)
 
 _RECORD_INCIDENT = "record_incident"
 _SUBMIT_ACTION_RECOMMENDATION = "submit_action_recommendation"
@@ -131,7 +137,11 @@ class ModerationService:
             existing_case = await self._store.get_moderation_case_by_incident(
                 guild_id, request.incident_id
             )
-            assert existing_case is not None
+            if existing_case is None:
+                raise RuntimeError(
+                    "case row missing immediately after a unique-constraint conflict "
+                    "on the same key"
+                ) from None
             response = RecordIncidentResponse(
                 case_id=existing_case.case_id,
                 status=existing_case.status,
@@ -169,29 +179,17 @@ class ModerationService:
             raise ValueError(
                 f"submit_action_recommendation requires status RECORDED, case is {case.status}"
             )
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=request.recommended_action,
-            executed_action=case.executed_action,
-            action_expiration=case.action_expiration,
-            status=case.status,
-            review_deadline=case.review_deadline,
-            reviewer_id=case.reviewer_id,
-            reviewer_decision=case.reviewer_decision,
-            appeal_status=case.appeal_status,
-            close_timestamp=case.close_timestamp,
-        )
+        updated = replace(case, recommended_action=request.recommended_action)
         await self._store.save_moderation_case(updated)
         response = SubmitActionRecommendationResponse(
             case_id=updated.case_id, status=updated.status, duplicate=False, receipt_state=None
         )
         await self._cache_response(
-            case.guild_id, _SUBMIT_ACTION_RECOMMENDATION, request.idempotency_key, response.case_id, response
+            case.guild_id,
+            _SUBMIT_ACTION_RECOMMENDATION,
+            request.idempotency_key,
+            response.case_id,
+            response,
         )
         return response
 
@@ -213,34 +211,22 @@ class ModerationService:
         if case.recommended_action is None:
             raise ValueError("recommended_action must be set before requesting approval")
         new_status = transition(case.status, ModerationStatus.APPROVAL_REQUIRED)
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=case.recommended_action,
-            executed_action=case.executed_action,
-            action_expiration=case.action_expiration,
-            status=new_status,
-            review_deadline=request.review_deadline,
-            reviewer_id=case.reviewer_id,
-            reviewer_decision=case.reviewer_decision,
-            appeal_status=case.appeal_status,
-            close_timestamp=case.close_timestamp,
-        )
+        updated = replace(case, status=new_status, review_deadline=request.review_deadline)
         await self._store.save_moderation_case(updated)
         response = RequestHumanApprovalResponse(
             case_id=updated.case_id, status=updated.status, duplicate=False, receipt_state=None
         )
         await self._cache_response(
-            case.guild_id, _REQUEST_HUMAN_APPROVAL, request.idempotency_key, response.case_id, response
+            case.guild_id,
+            _REQUEST_HUMAN_APPROVAL,
+            request.idempotency_key,
+            response.case_id,
+            response,
         )
         return response
 
     async def record_human_decision(
-        self, case_id: str, *, reviewer_id: int, decision: ApprovalDecision
+        self, guild_id: int, case_id: str, *, reviewer_id: int, decision: ApprovalDecision
     ) -> ModerationCase:
         """Internal — not part of the 11-operation Zariya contract. Reserved
         for slice 4's `/fetch admin` approval commands; added now only so
@@ -249,28 +235,16 @@ class ModerationService:
         case = await self._store.get_moderation_case(case_id)
         if case is None:
             raise ValueError(f"unknown case_id {case_id!r}")
+        if case.guild_id != guild_id:
+            raise ValueError("request does not belong to the authenticated guild_id")
         target = (
             ModerationStatus.APPROVED
             if decision is ApprovalDecision.APPROVED
             else ModerationStatus.REJECTED
         )
         new_status = transition(case.status, target)
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=case.recommended_action,
-            executed_action=case.executed_action,
-            action_expiration=case.action_expiration,
-            status=new_status,
-            review_deadline=case.review_deadline,
-            reviewer_id=reviewer_id,
-            reviewer_decision=decision,
-            appeal_status=case.appeal_status,
-            close_timestamp=case.close_timestamp,
+        updated = replace(
+            case, status=new_status, reviewer_id=reviewer_id, reviewer_decision=decision
         )
         return await self._store.save_moderation_case(updated)
 
@@ -295,44 +269,42 @@ class ModerationService:
             )
 
         try:
-            receipt = await self._executor.execute(case, request.idempotency_key)
-            new_status = ModerationStatus.EXECUTED
-            executed_action = case.recommended_action
-        except Exception:
+            raw_receipt = await self._executor.execute(case, request.idempotency_key)
+            new_status = (
+                ModerationStatus.EXECUTED
+                if raw_receipt.succeeded
+                else ModerationStatus.EXECUTION_FAILED
+            )
+            executed_action = case.recommended_action if raw_receipt.succeeded else None
             receipt = ActionReceipt(
-                receipt_id=f"receipt:{uuid.uuid4().hex}", succeeded=False, detail="executor raised"
+                receipt_id=f"receipt:{uuid.uuid4().hex}",
+                succeeded=raw_receipt.succeeded,
+                detail=raw_receipt.detail,
+            )
+        except Exception as exc:
+            logger.exception("ActionExecutor.execute raised for case %s", case.case_id)
+            receipt = ActionReceipt(
+                receipt_id=f"receipt:{uuid.uuid4().hex}",
+                succeeded=False,
+                detail=f"executor raised: {exc!r}"[:_MAX_ACTION_LENGTH],
             )
             new_status = ModerationStatus.EXECUTION_FAILED
             executed_action = None
 
-        transition(case.status, new_status)
-        await self._store.save_action_receipt(case.guild_id, receipt, case.case_id)
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=case.recommended_action,
-            executed_action=executed_action,
-            action_expiration=case.action_expiration,
-            status=new_status,
-            review_deadline=case.review_deadline,
-            reviewer_id=case.reviewer_id,
-            reviewer_decision=case.reviewer_decision,
-            appeal_status=case.appeal_status,
-            close_timestamp=case.close_timestamp,
-        )
-        await self._store.save_moderation_case(updated)
+        new_status = transition(case.status, new_status)
+        updated = replace(case, executed_action=executed_action, status=new_status)
         response = ExecuteApprovedActionResponse(
             case_id=updated.case_id,
             status=updated.status,
             duplicate=False,
             receipt_state=receipt.receipt_id,
         )
-        await self._cache_response(
-            case.guild_id, _EXECUTE_APPROVED_ACTION, request.idempotency_key, response.case_id, response
+        await self._store.save_execution_outcome(
+            updated,
+            receipt,
+            _EXECUTE_APPROVED_ACTION,
+            request.idempotency_key,
+            json.dumps(response.to_dict()),
         )
         return response
 
@@ -352,23 +324,7 @@ class ModerationService:
             return CloseIncidentResponse.from_dict(payload | {"duplicate": True})
 
         new_status = transition(case.status, ModerationStatus.CLOSED)
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=case.recommended_action,
-            executed_action=case.executed_action,
-            action_expiration=case.action_expiration,
-            status=new_status,
-            review_deadline=case.review_deadline,
-            reviewer_id=case.reviewer_id,
-            reviewer_decision=case.reviewer_decision,
-            appeal_status=case.appeal_status,
-            close_timestamp=datetime.now(UTC),
-        )
+        updated = replace(case, status=new_status, close_timestamp=datetime.now(UTC))
         await self._store.save_moderation_case(updated)
         response = CloseIncidentResponse(
             case_id=updated.case_id, status=updated.status, duplicate=False, receipt_state=None
@@ -399,23 +355,7 @@ class ModerationService:
             raise ValueError(
                 f"submit_appeal requires status EXECUTED or CLOSED, case is {case.status}"
             )
-        updated = ModerationCase(
-            case_id=case.case_id,
-            incident_id=case.incident_id,
-            guild_id=case.guild_id,
-            member_id=case.member_id,
-            report_timestamp=case.report_timestamp,
-            offense_number=case.offense_number,
-            recommended_action=case.recommended_action,
-            executed_action=case.executed_action,
-            action_expiration=case.action_expiration,
-            status=case.status,
-            review_deadline=case.review_deadline,
-            reviewer_id=case.reviewer_id,
-            reviewer_decision=case.reviewer_decision,
-            appeal_status=AppealStatus.SUBMITTED,
-            close_timestamp=case.close_timestamp,
-        )
+        updated = replace(case, appeal_status=AppealStatus.SUBMITTED)
         await self._store.save_moderation_case(updated)
         response = SubmitAppealResponse(
             case_id=updated.case_id, appeal_status=updated.appeal_status, duplicate=False
@@ -494,12 +434,14 @@ class ModerationService:
     async def _cache_response(
         self, guild_id: int, operation: str, idempotency_key: str, case_id: str, response: object
     ) -> None:
-        try:
+        # A concurrent request for the same (guild, operation, idempotency_key) may
+        # already have cached its response first; that cached entry is equivalent to
+        # this one, so there is nothing further to do.
+        with contextlib.suppress(sqlite3.IntegrityError):
             await self._store.save_moderation_idempotency_response(
-                guild_id, operation, idempotency_key, case_id, json.dumps(response.to_dict())  # type: ignore[attr-defined]
+                guild_id,
+                operation,
+                idempotency_key,
+                case_id,
+                json.dumps(response.to_dict()),  # type: ignore[attr-defined]
             )
-        except sqlite3.IntegrityError:
-            # A concurrent request for the same (guild, operation, idempotency_key)
-            # already cached its response first; that cached entry is equivalent
-            # to this one, so there is nothing further to do.
-            pass

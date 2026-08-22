@@ -28,9 +28,7 @@ async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
 
 
 async def _table_names(store: SQLiteStore) -> set[str]:
-    cursor = await store._connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table'"
-    )
+    cursor = await store._connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     rows = await cursor.fetchall()
     return {str(row["name"]) for row in rows}
 

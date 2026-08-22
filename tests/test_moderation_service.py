@@ -12,17 +12,15 @@ import pytest
 from krubit.contracts.moderation import (
     CloseIncidentRequest,
     ExecuteApprovedActionRequest,
-    RecordIncidentRequest,
-    RequestHumanApprovalRequest,
-    SubmitActionRecommendationRequest,
-    SubmitAppealRequest,
-)
-from krubit.contracts.moderation import (
     GetActionReceiptQuery,
     GetIncidentQuery,
     GetIncidentStatusQuery,
     GetMemberModerationHistoryQuery,
     GetPendingReviewsQuery,
+    RecordIncidentRequest,
+    RequestHumanApprovalRequest,
+    SubmitActionRecommendationRequest,
+    SubmitAppealRequest,
 )
 from krubit.domain.moderation import (
     ActionReceipt,
@@ -48,18 +46,30 @@ async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
 
 
 class FakeExecutor:
-    def __init__(self, *, succeed: bool = True) -> None:
+    def __init__(self, *, succeed: bool = True, fail_mode: str = "raise") -> None:
+        """`fail_mode` controls how a non-`succeed` executor reports failure:
+        `"raise"` (default) raises an exception; `"return"` returns a well-behaved
+        `ActionReceipt(succeeded=False, ...)` instead, matching a real executor that
+        never raises on ordinary Discord failures.
+        """
         self.succeed = succeed
+        self.fail_mode = fail_mode
         self.calls: list[tuple[str, str]] = []
 
     async def execute(self, case: object, execution_key: str) -> ActionReceipt:
         self.calls.append((case.case_id, execution_key))  # type: ignore[attr-defined]
         if not self.succeed:
-            raise RuntimeError("simulated executor failure")
+            if self.fail_mode == "raise":
+                raise RuntimeError("simulated executor failure")
+            return ActionReceipt(
+                receipt_id="receipt:fake", succeeded=False, detail="simulated executor failure"
+            )
         return ActionReceipt(receipt_id="receipt:fake", succeeded=True, detail="ok")
 
 
-async def _seed_incident(store: SQLiteStore, *, guild_id: int = 100, incident_id: str = "incident:1") -> None:
+async def _seed_incident(
+    store: SQLiteStore, *, guild_id: int = 100, incident_id: str = "incident:1"
+) -> None:
     # Phase 3 never persists a full EvidencePacket to storage (a known,
     # documented build gap) — `Incident.evidence_packet_id` is just a text
     # reference, not a foreign key to real packet storage. So seeding an
@@ -187,7 +197,11 @@ async def test_request_human_approval_transitions_case(store: SQLiteStore) -> No
     await service.submit_action_recommendation(
         100,
         SubmitActionRecommendationRequest.from_dict(
-            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
         ),
     )
     response = await service.request_human_approval(
@@ -251,7 +265,11 @@ async def test_request_human_approval_wrong_guild_raises(store: SQLiteStore) -> 
     await service.submit_action_recommendation(
         100,
         SubmitActionRecommendationRequest.from_dict(
-            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
         ),
     )
     with pytest.raises(ValueError, match="guild_id"):
@@ -313,7 +331,11 @@ async def _approved_case(store: SQLiteStore, service: ModerationService) -> str:
     await service.submit_action_recommendation(
         100,
         SubmitActionRecommendationRequest.from_dict(
-            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
         ),
     )
     await service.request_human_approval(
@@ -327,7 +349,7 @@ async def _approved_case(store: SQLiteStore, service: ModerationService) -> str:
         ),
     )
     await service.record_human_decision(
-        record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
+        100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
     )
     return record_response.case_id
 
@@ -348,10 +370,14 @@ async def test_execute_approved_action_success(store: SQLiteStore) -> None:
     service = ModerationService(store, executor)
     case_id = await _approved_case(store, service)
     response = await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     assert response.status is ModerationStatus.EXECUTED
-    assert response.receipt_state == "receipt:fake"
+    # receipt_id is always service-generated (Finding 5), not trusted from the executor.
+    assert response.receipt_state is not None
+    assert response.receipt_state.startswith("receipt:")
+    assert response.receipt_state != "receipt:fake"
     assert executor.calls == [(case_id, "idem:4")]
 
 
@@ -361,7 +387,8 @@ async def test_execute_approved_action_failure(store: SQLiteStore) -> None:
     service = ModerationService(store, executor)
     case_id = await _approved_case(store, service)
     response = await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     assert response.status is ModerationStatus.EXECUTION_FAILED
     case = await store.get_moderation_case(case_id)
@@ -375,7 +402,10 @@ async def test_execute_approved_action_wrong_guild_raises(store: SQLiteStore) ->
     case_id = await _approved_case(store, service)
     with pytest.raises(ValueError, match="guild_id"):
         await service.execute_approved_action(
-            999, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+            999,
+            ExecuteApprovedActionRequest.from_dict(
+                {"case_id": case_id, "idempotency_key": "idem:4"}
+            ),
         )
 
 
@@ -384,7 +414,8 @@ async def test_close_incident_from_executed(store: SQLiteStore) -> None:
     service = ModerationService(store, FakeExecutor(succeed=True))
     case_id = await _approved_case(store, service)
     await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     response = await service.close_incident(
         100,
@@ -427,7 +458,8 @@ async def test_close_incident_wrong_guild_raises(store: SQLiteStore) -> None:
     service = ModerationService(store, FakeExecutor(succeed=True))
     case_id = await _approved_case(store, service)
     await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     with pytest.raises(ValueError, match="guild_id"):
         await service.close_incident(
@@ -443,12 +475,17 @@ async def test_submit_appeal_sets_appeal_status(store: SQLiteStore) -> None:
     service = ModerationService(store, FakeExecutor(succeed=True))
     case_id = await _approved_case(store, service)
     await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     response = await service.submit_appeal(
         100,
         SubmitAppealRequest.from_dict(
-            {"case_id": case_id, "reason": "member disputes the timeout", "idempotency_key": "idem:6"}
+            {
+                "case_id": case_id,
+                "reason": "member disputes the timeout",
+                "idempotency_key": "idem:6",
+            }
         ),
     )
     assert response.appeal_status.value == "submitted"
@@ -462,13 +499,18 @@ async def test_submit_appeal_wrong_guild_raises(store: SQLiteStore) -> None:
     service = ModerationService(store, FakeExecutor(succeed=True))
     case_id = await _approved_case(store, service)
     await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     with pytest.raises(ValueError, match="guild_id"):
         await service.submit_appeal(
             999,
             SubmitAppealRequest.from_dict(
-                {"case_id": case_id, "reason": "member disputes the timeout", "idempotency_key": "idem:6"}
+                {
+                    "case_id": case_id,
+                    "reason": "member disputes the timeout",
+                    "idempotency_key": "idem:6",
+                }
             ),
         )
 
@@ -503,7 +545,8 @@ async def test_get_action_receipt(store: SQLiteStore) -> None:
     service = ModerationService(store, executor)
     case_id = await _approved_case(store, service)
     execute_response = await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     result = await service.get_action_receipt(
         100,
@@ -534,7 +577,11 @@ async def test_get_pending_reviews(store: SQLiteStore) -> None:
     await service.submit_action_recommendation(
         100,
         SubmitActionRecommendationRequest.from_dict(
-            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
         ),
     )
     await service.request_human_approval(
@@ -559,7 +606,8 @@ async def test_get_action_receipt_cross_tenant_raises(store: SQLiteStore) -> Non
     service = ModerationService(store, executor)
     case_id = await _approved_case(store, service)
     execute_response = await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     with pytest.raises(ValueError):
         await service.get_action_receipt(
@@ -606,7 +654,8 @@ async def test_get_action_receipt_guild_id_mismatch_raises(store: SQLiteStore) -
     service = ModerationService(store, executor)
     case_id = await _approved_case(store, service)
     execute_response = await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
     )
     with pytest.raises(ValueError, match="guild_id"):
         await service.get_action_receipt(
@@ -628,7 +677,9 @@ async def test_get_pending_reviews_guild_id_mismatch_raises(store: SQLiteStore) 
 
 
 @pytest.mark.asyncio
-async def test_same_idempotency_key_across_two_operations_does_not_collide(store: SQLiteStore) -> None:
+async def test_same_idempotency_key_across_two_operations_does_not_collide(
+    store: SQLiteStore,
+) -> None:
     await _seed_incident(store)
     service = ModerationService(store, FakeExecutor())
     shared_key = "idem:shared"
@@ -656,6 +707,228 @@ async def test_same_idempotency_key_across_two_operations_does_not_collide(store
     )
     assert recommend_response.duplicate is False
     assert recommend_response.case_id == record_response.case_id
+
+
+@pytest.mark.asyncio
+async def test_execute_approved_action_executor_returns_failed_receipt(store: SQLiteStore) -> None:
+    """A well-behaved executor that RETURNS `ActionReceipt(succeeded=False, ...)` rather
+    than raising must still land the case in EXECUTION_FAILED (Finding 1)."""
+    executor = FakeExecutor(succeed=False, fail_mode="return")
+    service = ModerationService(store, executor)
+    case_id = await _approved_case(store, service)
+    response = await service.execute_approved_action(
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
+    )
+    assert response.status is ModerationStatus.EXECUTION_FAILED
+    case = await store.get_moderation_case(case_id)
+    assert case is not None
+    assert case.status is ModerationStatus.EXECUTION_FAILED
+    assert case.executed_action is None
+
+
+@pytest.mark.asyncio
+async def test_record_human_decision_wrong_guild_raises(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.record_human_decision(
+            999, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_human_decision_rejected_transitions_case(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    case = await service.record_human_decision(
+        100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.REJECTED
+    )
+    assert case.status is ModerationStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_execute_approved_action_idempotent_does_not_reexecute(store: SQLiteStore) -> None:
+    executor = FakeExecutor(succeed=True)
+    service = ModerationService(store, executor)
+    case_id = await _approved_case(store, service)
+    request = ExecuteApprovedActionRequest.from_dict(
+        {"case_id": case_id, "idempotency_key": "idem:4"}
+    )
+    first = await service.execute_approved_action(100, request)
+    second = await service.execute_approved_action(100, request)
+    assert second.duplicate is True
+    assert second.receipt_state == first.receipt_state
+    assert executor.calls == [(case_id, "idem:4")]
+
+
+@pytest.mark.asyncio
+async def test_get_action_receipt_missing_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    with pytest.raises(ValueError):
+        await service.get_action_receipt(
+            100,
+            GetActionReceiptQuery.from_dict({"guild_id": "100", "receipt_id": "receipt:missing"}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_submit_action_recommendation_illegal_status_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    case_id = await _approved_case(store, service)
+    with pytest.raises(ValueError):
+        await service.submit_action_recommendation(
+            100,
+            SubmitActionRecommendationRequest.from_dict(
+                {
+                    "case_id": case_id,
+                    "recommended_action": "24h timeout",
+                    "idempotency_key": "idem:new",
+                }
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_approved_action_illegal_status_raises(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    with pytest.raises(ValueError):
+        await service.execute_approved_action(
+            100,
+            ExecuteApprovedActionRequest.from_dict(
+                {"case_id": record_response.case_id, "idempotency_key": "idem:4"}
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_submit_appeal_twice_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor(succeed=True))
+    case_id = await _approved_case(store, service)
+    await service.execute_approved_action(
+        100,
+        ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"}),
+    )
+    await service.submit_appeal(
+        100,
+        SubmitAppealRequest.from_dict(
+            {
+                "case_id": case_id,
+                "reason": "member disputes the timeout",
+                "idempotency_key": "idem:6",
+            }
+        ),
+    )
+    with pytest.raises(ValueError):
+        await service.submit_appeal(
+            100,
+            SubmitAppealRequest.from_dict(
+                {"case_id": case_id, "reason": "second appeal", "idempotency_key": "idem:7"}
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_incident_second_time_for_cased_incident_returns_duplicate(
+    store: SQLiteStore,
+) -> None:
+    """A second `record_incident` for an already-cased `incident_id`, using a *different*
+    idempotency key (not a literal duplicate request), returns the existing case with
+    `duplicate=True` rather than erroring — see Finding 10."""
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    request_kwargs = {
+        "incident_id": "incident:1",
+        "guild_id": "100",
+        "member_id": "200",
+        "report_timestamp": "2026-01-01T00:00:00+00:00",
+    }
+    first = await service.record_incident(
+        100, RecordIncidentRequest.from_dict({**request_kwargs, "idempotency_key": "idem:1"})
+    )
+    second = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict({**request_kwargs, "idempotency_key": "idem:different"}),
+    )
+    assert second.case_id == first.case_id
+    assert second.duplicate is True
 
 
 @pytest.mark.asyncio

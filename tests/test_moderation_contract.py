@@ -196,9 +196,7 @@ def test_submit_appeal_round_trips():
 
 
 def test_get_member_moderation_history_round_trips():
-    query = GetMemberModerationHistoryQuery.from_dict(
-        {"guild_id": "100", "member_id": "200"}
-    )
+    query = GetMemberModerationHistoryQuery.from_dict({"guild_id": "100", "member_id": "200"})
     assert query.to_dict() == {"guild_id": "100", "member_id": "200"}
 
     result_payload = {"guild_id": "100", "member_id": "200", "cases": ["case:1", "case:2"]}
