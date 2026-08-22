@@ -7,6 +7,7 @@ real SQLite storage. No Discord or HTTP knowledge — matches
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import Protocol
@@ -124,7 +125,23 @@ class ModerationService:
             appeal_status=AppealStatus.NONE,
             close_timestamp=None,
         )
-        await self._store.save_moderation_case(case)
+        try:
+            await self._store.save_moderation_case(case)
+        except sqlite3.IntegrityError:
+            existing_case = await self._store.get_moderation_case_by_incident(
+                guild_id, request.incident_id
+            )
+            assert existing_case is not None
+            response = RecordIncidentResponse(
+                case_id=existing_case.case_id,
+                status=existing_case.status,
+                duplicate=True,
+                receipt_state=None,
+            )
+            await self._cache_response(
+                guild_id, _RECORD_INCIDENT, request.idempotency_key, response.case_id, response
+            )
+            return response
         response = RecordIncidentResponse(
             case_id=case.case_id, status=case.status, duplicate=False, receipt_state=None
         )
@@ -477,6 +494,12 @@ class ModerationService:
     async def _cache_response(
         self, guild_id: int, operation: str, idempotency_key: str, case_id: str, response: object
     ) -> None:
-        await self._store.save_moderation_idempotency_response(
-            guild_id, operation, idempotency_key, case_id, json.dumps(response.to_dict())  # type: ignore[attr-defined]
-        )
+        try:
+            await self._store.save_moderation_idempotency_response(
+                guild_id, operation, idempotency_key, case_id, json.dumps(response.to_dict())  # type: ignore[attr-defined]
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent request for the same (guild, operation, idempotency_key)
+            # already cached its response first; that cached entry is equivalent
+            # to this one, so there is nothing further to do.
+            pass
