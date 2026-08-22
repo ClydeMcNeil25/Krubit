@@ -550,3 +550,77 @@ async def test_get_pending_reviews(store: SQLiteStore) -> None:
         100, GetPendingReviewsQuery.from_dict({"guild_id": "100"})
     )
     assert result.cases == (record_response.case_id,)
+
+
+@pytest.mark.asyncio
+async def test_get_action_receipt_cross_tenant_raises(store: SQLiteStore) -> None:
+    executor = FakeExecutor(succeed=True)
+    service = ModerationService(store, executor)
+    case_id = await _approved_case(store, service)
+    execute_response = await service.execute_approved_action(
+        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+    )
+    with pytest.raises(ValueError):
+        await service.get_action_receipt(
+            999,
+            GetActionReceiptQuery.from_dict(
+                {"guild_id": "999", "receipt_id": execute_response.receipt_state}
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_member_moderation_history_guild_id_mismatch_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _approved_case(store, service)
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.get_member_moderation_history(
+            999, GetMemberModerationHistoryQuery.from_dict({"guild_id": "100", "member_id": "200"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_incident_guild_id_mismatch_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _approved_case(store, service)
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.get_incident(
+            999, GetIncidentQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_incident_status_guild_id_mismatch_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _approved_case(store, service)
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.get_incident_status(
+            999, GetIncidentStatusQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_action_receipt_guild_id_mismatch_raises(store: SQLiteStore) -> None:
+    executor = FakeExecutor(succeed=True)
+    service = ModerationService(store, executor)
+    case_id = await _approved_case(store, service)
+    execute_response = await service.execute_approved_action(
+        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+    )
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.get_action_receipt(
+            999,
+            GetActionReceiptQuery.from_dict(
+                {"guild_id": "100", "receipt_id": execute_response.receipt_state}
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_pending_reviews_guild_id_mismatch_raises(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    with pytest.raises(ValueError, match="guild_id"):
+        await service.get_pending_reviews(
+            999, GetPendingReviewsQuery.from_dict({"guild_id": "100"})
+        )

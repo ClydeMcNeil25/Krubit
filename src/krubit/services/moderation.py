@@ -411,6 +411,8 @@ class ModerationService:
     async def get_member_moderation_history(
         self, guild_id: int, query: GetMemberModerationHistoryQuery
     ) -> GetMemberModerationHistoryResult:
+        if guild_id != int(query.guild_id):
+            raise ValueError("guild_id does not match the authenticated guild_id")
         cases = await self._store.list_moderation_cases_for_member(
             int(query.guild_id), int(query.member_id)
         )
@@ -421,6 +423,8 @@ class ModerationService:
         )
 
     async def get_incident(self, guild_id: int, query: GetIncidentQuery) -> GetIncidentResult:
+        if guild_id != int(query.guild_id):
+            raise ValueError("guild_id does not match the authenticated guild_id")
         case = await self._store.get_moderation_case_by_incident(
             int(query.guild_id), query.incident_id
         )
@@ -433,6 +437,8 @@ class ModerationService:
     async def get_incident_status(
         self, guild_id: int, query: GetIncidentStatusQuery
     ) -> GetIncidentStatusResult:
+        if guild_id != int(query.guild_id):
+            raise ValueError("guild_id does not match the authenticated guild_id")
         case = await self._store.get_moderation_case_by_incident(
             int(query.guild_id), query.incident_id
         )
@@ -445,10 +451,15 @@ class ModerationService:
     async def get_action_receipt(
         self, guild_id: int, query: GetActionReceiptQuery
     ) -> GetActionReceiptResult:
+        if guild_id != int(query.guild_id):
+            raise ValueError("guild_id does not match the authenticated guild_id")
         found = await self._store.get_action_receipt_by_id(query.receipt_id)
         if found is None:
             raise ValueError(f"no receipt found for receipt_id {query.receipt_id!r}")
         receipt, case_id = found
+        case = await self._store.get_moderation_case(case_id)
+        if case is None or case.guild_id != int(query.guild_id):
+            raise ValueError(f"no receipt found for receipt_id {query.receipt_id!r}")
         return GetActionReceiptResult(
             receipt_id=receipt.receipt_id, case_id=case_id, succeeded=receipt.succeeded
         )
@@ -456,6 +467,8 @@ class ModerationService:
     async def get_pending_reviews(
         self, guild_id: int, query: GetPendingReviewsQuery
     ) -> GetPendingReviewsResult:
+        if guild_id != int(query.guild_id):
+            raise ValueError("guild_id does not match the authenticated guild_id")
         cases = await self._store.list_pending_review_cases(int(query.guild_id))
         return GetPendingReviewsResult(
             guild_id=query.guild_id, cases=tuple(case.case_id for case in cases)
