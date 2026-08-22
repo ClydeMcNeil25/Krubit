@@ -87,6 +87,9 @@ class Settings:
     # those commands fall back to a documented 14-day default instead of having no
     # effect.
     activity_ledger_inactivity_threshold_days: int | None = None
+    moderation_adapter_secret: str | None = field(default=None, repr=False)
+    moderation_test_mode: bool = False
+    moderation_test_mode_secret: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -155,6 +158,14 @@ class Settings:
         ).strip()
         raw_activity_ledger_inactivity_threshold_days = values.get(
             "KRUBIT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS", ""
+        ).strip()
+        raw_moderation_adapter_secret = values.get(
+            "KRUBIT_MODERATION_ADAPTER_SECRET", ""
+        ).strip()
+        raw_moderation_test_mode = values.get("KRUBIT_MODERATION_TEST_MODE", "false").strip()
+        moderation_test_mode = _parse_bool("KRUBIT_MODERATION_TEST_MODE", raw_moderation_test_mode)
+        raw_moderation_test_mode_secret = values.get(
+            "KRUBIT_MODERATION_TEST_MODE_SECRET", ""
         ).strip()
 
         creator_signals_enabled = _parse_bool(
@@ -277,6 +288,9 @@ class Settings:
             activity_ledger_excluded_channel_ids=activity_ledger_excluded_channel_ids,
             activity_ledger_retention_days=activity_ledger_retention_days,
             activity_ledger_inactivity_threshold_days=activity_ledger_inactivity_threshold_days,
+            moderation_adapter_secret=raw_moderation_adapter_secret or None,
+            moderation_test_mode=moderation_test_mode,
+            moderation_test_mode_secret=raw_moderation_test_mode_secret or None,
         )
 
     def require_token(self) -> str:

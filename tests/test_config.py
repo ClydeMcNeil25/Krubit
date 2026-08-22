@@ -60,6 +60,21 @@ _UNREAD_FIELD_EXEMPTIONS: dict[str, str] = {
         "pre-existing forward declaration for a not-yet-built Watchdog-to-Zariya "
         "escalation bridge integration."
     ),
+    "moderation_adapter_secret": (
+        "forward declaration for the not-yet-wired moderation HTTP transport "
+        "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
+        "HTTP handler that reads it lands in a later task of this slice."
+    ),
+    "moderation_test_mode": (
+        "forward declaration for the not-yet-wired moderation HTTP transport "
+        "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
+        "HTTP handler that reads it lands in a later task of this slice."
+    ),
+    "moderation_test_mode_secret": (
+        "forward declaration for the not-yet-wired moderation HTTP transport "
+        "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
+        "HTTP handler that reads it lands in a later task of this slice."
+    ),
 }
 
 
@@ -433,3 +448,34 @@ def test_settings_repr_never_renders_configured_secret_values() -> None:
     # selectively to secrets, not blanket-removed from every field.
     for non_secret_value in non_secret_values.values():
         assert non_secret_value in rendered
+
+
+def test_moderation_adapter_secret_defaults_to_none() -> None:
+    settings = Settings.from_env(base_env())
+    assert settings.moderation_adapter_secret is None
+    assert settings.moderation_test_mode is False
+    assert settings.moderation_test_mode_secret is None
+
+
+def test_moderation_adapter_secret_can_be_set() -> None:
+    settings = Settings.from_env(
+        {**base_env(), "KRUBIT_MODERATION_ADAPTER_SECRET": "secret-value"}
+    )
+    assert settings.moderation_adapter_secret == "secret-value"
+
+
+def test_moderation_test_mode_parses_bool() -> None:
+    settings = Settings.from_env({**base_env(), "KRUBIT_MODERATION_TEST_MODE": "true"})
+    assert settings.moderation_test_mode is True
+
+
+def test_moderation_test_mode_invalid_value_raises() -> None:
+    with pytest.raises(SettingsError, match="KRUBIT_MODERATION_TEST_MODE"):
+        Settings.from_env({**base_env(), "KRUBIT_MODERATION_TEST_MODE": "yes"})
+
+
+def test_moderation_test_mode_secret_can_be_set() -> None:
+    settings = Settings.from_env(
+        {**base_env(), "KRUBIT_MODERATION_TEST_MODE_SECRET": "test-mode-secret-value"}
+    )
+    assert settings.moderation_test_mode_secret == "test-mode-secret-value"
