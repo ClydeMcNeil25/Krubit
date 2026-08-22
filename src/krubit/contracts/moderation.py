@@ -424,98 +424,120 @@ def _tuple_of_str(payload: Mapping[str, object], key: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class GetMemberModerationHistoryQuery:
+    guild_id: str
     member_id: str
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetMemberModerationHistoryQuery:
-        return cls(member_id=_required_text(payload, "member_id"))
+        return cls(
+            guild_id=_required_text(payload, "guild_id"),
+            member_id=_required_text(payload, "member_id"),
+        )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"member_id": self.member_id}
+        return {"guild_id": self.guild_id, "member_id": self.member_id}
 
 
 @dataclass(frozen=True, slots=True)
 class GetMemberModerationHistoryResult:
+    guild_id: str
     member_id: str
     cases: tuple[str, ...]
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetMemberModerationHistoryResult:
         return cls(
+            guild_id=_required_text(payload, "guild_id"),
             member_id=_required_text(payload, "member_id"),
             cases=_tuple_of_str(payload, "cases"),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"member_id": self.member_id, "cases": list(self.cases)}
+        return {"guild_id": self.guild_id, "member_id": self.member_id, "cases": list(self.cases)}
 
 
 @dataclass(frozen=True, slots=True)
 class GetIncidentQuery:
+    guild_id: str
     incident_id: str
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentQuery:
-        return cls(incident_id=_required_id(payload, "incident_id"))
+        return cls(
+            guild_id=_required_text(payload, "guild_id"),
+            incident_id=_required_id(payload, "incident_id"),
+        )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"incident_id": self.incident_id}
+        return {"guild_id": self.guild_id, "incident_id": self.incident_id}
 
 
 @dataclass(frozen=True, slots=True)
 class GetIncidentResult:
+    guild_id: str
     incident_id: str
     case_id: str
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentResult:
         return cls(
+            guild_id=_required_text(payload, "guild_id"),
             incident_id=_required_id(payload, "incident_id"),
             case_id=_required_id(payload, "case_id"),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"incident_id": self.incident_id, "case_id": self.case_id}
+        return {"guild_id": self.guild_id, "incident_id": self.incident_id, "case_id": self.case_id}
 
 
 @dataclass(frozen=True, slots=True)
 class GetIncidentStatusQuery:
+    guild_id: str
     incident_id: str
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentStatusQuery:
-        return cls(incident_id=_required_id(payload, "incident_id"))
+        return cls(
+            guild_id=_required_text(payload, "guild_id"),
+            incident_id=_required_id(payload, "incident_id"),
+        )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"incident_id": self.incident_id}
+        return {"guild_id": self.guild_id, "incident_id": self.incident_id}
 
 
 @dataclass(frozen=True, slots=True)
 class GetIncidentStatusResult:
+    guild_id: str
     incident_id: str
     status: ModerationStatus
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetIncidentStatusResult:
         return cls(
+            guild_id=_required_text(payload, "guild_id"),
             incident_id=_required_id(payload, "incident_id"),
             status=_status(payload),
         )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"incident_id": self.incident_id, "status": self.status.value}
+        return {"guild_id": self.guild_id, "incident_id": self.incident_id, "status": self.status.value}
 
 
 @dataclass(frozen=True, slots=True)
 class GetActionReceiptQuery:
+    guild_id: str
     receipt_id: str
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GetActionReceiptQuery:
-        return cls(receipt_id=_required_text(payload, "receipt_id"))
+        return cls(
+            guild_id=_required_text(payload, "guild_id"),
+            receipt_id=_required_text(payload, "receipt_id"),
+        )
 
     def to_dict(self) -> dict[str, JSONValue]:
-        return {"receipt_id": self.receipt_id}
+        return {"guild_id": self.guild_id, "receipt_id": self.receipt_id}
 
 
 @dataclass(frozen=True, slots=True)

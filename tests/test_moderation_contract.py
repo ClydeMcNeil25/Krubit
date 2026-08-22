@@ -196,37 +196,39 @@ def test_submit_appeal_round_trips():
 
 
 def test_get_member_moderation_history_round_trips():
-    query = GetMemberModerationHistoryQuery.from_dict({"member_id": "200"})
-    assert query.to_dict() == {"member_id": "200"}
+    query = GetMemberModerationHistoryQuery.from_dict(
+        {"guild_id": "100", "member_id": "200"}
+    )
+    assert query.to_dict() == {"guild_id": "100", "member_id": "200"}
 
-    result_payload = {"member_id": "200", "cases": ["case:1", "case:2"]}
+    result_payload = {"guild_id": "100", "member_id": "200", "cases": ["case:1", "case:2"]}
     result = GetMemberModerationHistoryResult.from_dict(result_payload)
     assert result.cases == ("case:1", "case:2")
     assert result.to_dict() == result_payload
 
 
 def test_get_incident_round_trips():
-    query = GetIncidentQuery.from_dict({"incident_id": "incident:1"})
-    assert query.to_dict() == {"incident_id": "incident:1"}
+    query = GetIncidentQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+    assert query.to_dict() == {"guild_id": "100", "incident_id": "incident:1"}
 
-    result_payload = {"incident_id": "incident:1", "case_id": "case:1"}
+    result_payload = {"guild_id": "100", "incident_id": "incident:1", "case_id": "case:1"}
     result = GetIncidentResult.from_dict(result_payload)
     assert result.to_dict() == result_payload
 
 
 def test_get_incident_status_round_trips():
-    query = GetIncidentStatusQuery.from_dict({"incident_id": "incident:1"})
-    assert query.to_dict() == {"incident_id": "incident:1"}
+    query = GetIncidentStatusQuery.from_dict({"guild_id": "100", "incident_id": "incident:1"})
+    assert query.to_dict() == {"guild_id": "100", "incident_id": "incident:1"}
 
-    result_payload = {"incident_id": "incident:1", "status": "closed"}
+    result_payload = {"guild_id": "100", "incident_id": "incident:1", "status": "closed"}
     result = GetIncidentStatusResult.from_dict(result_payload)
     assert result.status.value == "closed"
     assert result.to_dict() == result_payload
 
 
 def test_get_action_receipt_round_trips():
-    query = GetActionReceiptQuery.from_dict({"receipt_id": "receipt:1"})
-    assert query.to_dict() == {"receipt_id": "receipt:1"}
+    query = GetActionReceiptQuery.from_dict({"guild_id": "100", "receipt_id": "receipt:1"})
+    assert query.to_dict() == {"guild_id": "100", "receipt_id": "receipt:1"}
 
     result_payload = {"receipt_id": "receipt:1", "case_id": "case:1", "succeeded": True}
     result = GetActionReceiptResult.from_dict(result_payload)
