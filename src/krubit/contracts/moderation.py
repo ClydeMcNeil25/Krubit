@@ -29,6 +29,12 @@ __all__ = [
     "SubmitActionRecommendationResponse",
     "RequestHumanApprovalRequest",
     "RequestHumanApprovalResponse",
+    "ExecuteApprovedActionRequest",
+    "ExecuteApprovedActionResponse",
+    "CloseIncidentRequest",
+    "CloseIncidentResponse",
+    "SubmitAppealRequest",
+    "SubmitAppealResponse",
 ]
 
 
@@ -243,4 +249,144 @@ class RequestHumanApprovalResponse:
             "status": self.status.value,
             "duplicate": self.duplicate,
             "receipt_state": self.receipt_state,
+        }
+
+
+def _appeal_status(payload: Mapping[str, object]) -> AppealStatus:
+    raw = _required_text(payload, "appeal_status")
+    try:
+        return AppealStatus(raw)
+    except ValueError as exc:
+        raise ModerationContractError(f"unknown appeal_status: {raw!r}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteApprovedActionRequest:
+    case_id: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ExecuteApprovedActionRequest":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            idempotency_key=_required_text(payload, "idempotency_key"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {"case_id": self.case_id, "idempotency_key": self.idempotency_key}
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteApprovedActionResponse:
+    case_id: str
+    status: ModerationStatus
+    duplicate: bool
+    receipt_state: str | None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ExecuteApprovedActionResponse":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            status=_status(payload),
+            duplicate=_duplicate(payload),
+            receipt_state=_receipt_state(payload),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "case_id": self.case_id,
+            "status": self.status.value,
+            "duplicate": self.duplicate,
+            "receipt_state": self.receipt_state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CloseIncidentRequest:
+    case_id: str
+    decision: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "CloseIncidentRequest":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            decision=_required_text(payload, "decision"),
+            idempotency_key=_required_text(payload, "idempotency_key"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "case_id": self.case_id,
+            "decision": self.decision,
+            "idempotency_key": self.idempotency_key,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CloseIncidentResponse:
+    case_id: str
+    status: ModerationStatus
+    duplicate: bool
+    receipt_state: str | None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "CloseIncidentResponse":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            status=_status(payload),
+            duplicate=_duplicate(payload),
+            receipt_state=_receipt_state(payload),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "case_id": self.case_id,
+            "status": self.status.value,
+            "duplicate": self.duplicate,
+            "receipt_state": self.receipt_state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitAppealRequest:
+    case_id: str
+    reason: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "SubmitAppealRequest":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            reason=_required_text(payload, "reason"),
+            idempotency_key=_required_text(payload, "idempotency_key"),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "case_id": self.case_id,
+            "reason": self.reason,
+            "idempotency_key": self.idempotency_key,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitAppealResponse:
+    case_id: str
+    appeal_status: AppealStatus
+    duplicate: bool
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "SubmitAppealResponse":
+        return cls(
+            case_id=_required_text(payload, "case_id"),
+            appeal_status=_appeal_status(payload),
+            duplicate=_duplicate(payload),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "case_id": self.case_id,
+            "appeal_status": self.appeal_status.value,
+            "duplicate": self.duplicate,
         }

@@ -119,3 +119,71 @@ def test_request_human_approval_round_trips():
     response = RequestHumanApprovalResponse.from_dict(response_payload)
     assert response.duplicate is True
     assert response.to_dict() == response_payload
+
+
+from krubit.contracts.moderation import (
+    CloseIncidentRequest,
+    CloseIncidentResponse,
+    ExecuteApprovedActionRequest,
+    ExecuteApprovedActionResponse,
+    SubmitAppealRequest,
+    SubmitAppealResponse,
+)
+from krubit.domain.moderation import AppealStatus
+
+
+def test_execute_approved_action_round_trips():
+    payload = {
+        "case_id": "case:1",
+        "idempotency_key": "idem:4",
+    }
+    request = ExecuteApprovedActionRequest.from_dict(payload)
+    assert request.to_dict() == payload
+
+    response_payload = {
+        "case_id": "case:1",
+        "status": "executed",
+        "duplicate": False,
+        "receipt_state": "receipt:1",
+    }
+    response = ExecuteApprovedActionResponse.from_dict(response_payload)
+    assert response.receipt_state == "receipt:1"
+    assert response.to_dict() == response_payload
+
+
+def test_close_incident_round_trips():
+    payload = {
+        "case_id": "case:1",
+        "decision": "resolved, no further action",
+        "idempotency_key": "idem:5",
+    }
+    request = CloseIncidentRequest.from_dict(payload)
+    assert request.to_dict() == payload
+
+    response_payload = {
+        "case_id": "case:1",
+        "status": "closed",
+        "duplicate": False,
+        "receipt_state": None,
+    }
+    response = CloseIncidentResponse.from_dict(response_payload)
+    assert response.to_dict() == response_payload
+
+
+def test_submit_appeal_round_trips():
+    payload = {
+        "case_id": "case:1",
+        "reason": "member disputes the timeout",
+        "idempotency_key": "idem:6",
+    }
+    request = SubmitAppealRequest.from_dict(payload)
+    assert request.to_dict() == payload
+
+    response_payload = {
+        "case_id": "case:1",
+        "appeal_status": "submitted",
+        "duplicate": False,
+    }
+    response = SubmitAppealResponse.from_dict(response_payload)
+    assert response.appeal_status is AppealStatus.SUBMITTED
+    assert response.to_dict() == response_payload
