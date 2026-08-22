@@ -835,6 +835,63 @@ class SQLiteStore:
 
             CREATE INDEX IF NOT EXISTS idx_activity_receipts_guild_created
                 ON activity_receipts (guild_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS moderation_cases (
+                guild_id INTEGER NOT NULL,
+                case_id TEXT NOT NULL,
+                incident_id TEXT NOT NULL,
+                member_id INTEGER NOT NULL,
+                report_timestamp TEXT NOT NULL,
+                offense_number INTEGER NOT NULL,
+                recommended_action TEXT,
+                executed_action TEXT,
+                action_expiration TEXT,
+                status TEXT NOT NULL,
+                review_deadline TEXT,
+                reviewer_id INTEGER,
+                reviewer_decision TEXT,
+                appeal_status TEXT NOT NULL,
+                close_timestamp TEXT,
+                PRIMARY KEY (guild_id, case_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_cases_case_id
+                ON moderation_cases (case_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_cases_guild_incident
+                ON moderation_cases (guild_id, incident_id);
+
+            CREATE INDEX IF NOT EXISTS idx_moderation_cases_guild_member
+                ON moderation_cases (guild_id, member_id);
+
+            CREATE INDEX IF NOT EXISTS idx_moderation_cases_guild_status
+                ON moderation_cases (guild_id, status);
+
+            CREATE TABLE IF NOT EXISTS moderation_action_receipts (
+                guild_id INTEGER NOT NULL,
+                receipt_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                succeeded INTEGER NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, receipt_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_action_receipts_receipt_id
+                ON moderation_action_receipts (receipt_id);
+
+            CREATE INDEX IF NOT EXISTS idx_moderation_action_receipts_case
+                ON moderation_action_receipts (guild_id, case_id);
+
+            CREATE TABLE IF NOT EXISTS moderation_idempotency_keys (
+                guild_id INTEGER NOT NULL,
+                operation TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, operation, idempotency_key)
+            );
             """
         )
         columns_cursor = await self._connection.execute("PRAGMA table_info(live_signal_deliveries)")
