@@ -45,6 +45,18 @@ async def test_build_callback_routes_returns_nothing_when_signals_disabled(tmp_p
     await store.close()
 
 
+async def test_moderation_route_registers_even_when_creator_signals_disabled(tmp_path):
+    store = await _store(tmp_path)
+    vault = CredentialVault.from_env_key("a" * 32)
+    routes = build_callback_routes(
+        _settings(creator_signals_enabled=False, moderation_adapter_secret="secret"),
+        store, vault, object(),
+    )
+    assert len(routes) == 1
+    assert routes[0].path == "/moderation/adapter"
+    await store.close()
+
+
 async def test_build_callback_routes_returns_nothing_without_callback_config(tmp_path):
     store = await _store(tmp_path)
     vault = CredentialVault.from_env_key("a" * 32)

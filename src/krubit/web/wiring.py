@@ -23,6 +23,7 @@ from krubit.config import Settings
 from krubit.domain.creator_signals import Platform, RecognizedAccountUrl
 from krubit.integrations import meta, tiktok
 from krubit.security.credential_vault import CredentialVault
+from krubit.services.moderation import ModerationService
 from krubit.storage.sqlite import ConnectorAuthorization, SQLiteStore
 from krubit.web.callbacks import (
     CallbackRoute,
@@ -31,6 +32,7 @@ from krubit.web.callbacks import (
     build_oauth_redirect_route,
     build_signed_form_route,
 )
+from krubit.web.moderation_adapter import NoOpActionExecutor, build_moderation_adapter_route
 
 # The data_deletion_requests freshness window: a repeat request for the same
 # authorization_subject_id within this window reuses the existing confirmation
@@ -55,12 +57,26 @@ def build_callback_routes(
     vault: CredentialVault | None,
     oauth_session: object,
 ) -> tuple[CallbackRoute, ...]:
-    if not settings.creator_signals_enabled:
-        return ()
     if settings.callback_public_base_url is None or settings.callback_port is None:
         return ()
 
     routes: list[CallbackRoute] = []
+
+    if settings.moderation_adapter_secret is not None:
+        moderation_service = ModerationService(store, NoOpActionExecutor())
+        routes.append(
+            build_moderation_adapter_route(
+                path="/moderation/adapter",
+                header_name="X-Krubit-Moderation-Signature",
+                secret=settings.moderation_adapter_secret,
+                service=moderation_service,
+                test_mode_enabled=settings.moderation_test_mode,
+                test_secret=settings.moderation_test_mode_secret,
+            )
+        )
+
+    if not settings.creator_signals_enabled:
+        return tuple(routes)
 
     if (
         settings.tiktok_client_key is not None
