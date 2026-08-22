@@ -11,6 +11,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
@@ -75,10 +76,25 @@ def _new_case_id() -> str:
     return f"case:{uuid.uuid4().hex}"
 
 
+def _new_receipt_id() -> str:
+    return f"receipt:{uuid.uuid4().hex}"
+
+
 class ModerationService:
-    def __init__(self, store: SQLiteStore, executor: ActionExecutor) -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        executor: ActionExecutor,
+        *,
+        id_factory: Callable[[], str] = _new_case_id,
+        receipt_id_factory: Callable[[], str] = _new_receipt_id,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
         self._store = store
         self._executor = executor
+        self._id_factory = id_factory
+        self._receipt_id_factory = receipt_id_factory
+        self._clock = clock
 
     async def record_incident(
         self, guild_id: int, request: RecordIncidentRequest
@@ -115,7 +131,7 @@ class ModerationService:
             guild_id, request.member_id
         )
         case = ModerationCase(
-            case_id=_new_case_id(),
+            case_id=self._id_factory(),
             incident_id=request.incident_id,
             guild_id=guild_id,
             member_id=request.member_id,
@@ -277,14 +293,14 @@ class ModerationService:
             )
             executed_action = case.recommended_action if raw_receipt.succeeded else None
             receipt = ActionReceipt(
-                receipt_id=f"receipt:{uuid.uuid4().hex}",
+                receipt_id=self._receipt_id_factory(),
                 succeeded=raw_receipt.succeeded,
                 detail=raw_receipt.detail,
             )
         except Exception as exc:
             logger.exception("ActionExecutor.execute raised for case %s", case.case_id)
             receipt = ActionReceipt(
-                receipt_id=f"receipt:{uuid.uuid4().hex}",
+                receipt_id=self._receipt_id_factory(),
                 succeeded=False,
                 detail=f"executor raised: {exc!r}"[:_MAX_ACTION_LENGTH],
             )
@@ -324,7 +340,7 @@ class ModerationService:
             return CloseIncidentResponse.from_dict(payload | {"duplicate": True})
 
         new_status = transition(case.status, ModerationStatus.CLOSED)
-        updated = replace(case, status=new_status, close_timestamp=datetime.now(UTC))
+        updated = replace(case, status=new_status, close_timestamp=self._clock())
         await self._store.save_moderation_case(updated)
         response = CloseIncidentResponse(
             case_id=updated.case_id, status=updated.status, duplicate=False, receipt_state=None

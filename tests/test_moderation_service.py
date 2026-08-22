@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -950,3 +951,44 @@ async def test_concurrent_identical_key_requests_produce_one_case(store: SQLiteS
     assert results[0].case_id == results[1].case_id
     cases = await store.list_moderation_cases_for_member(100, 200)
     assert len(cases) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_incident_uses_injected_id_factory(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    counter = itertools.count(1)
+    service = ModerationService(
+        store, FakeExecutor(), id_factory=lambda: f"case:test-{next(counter)}"
+    )
+    response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    assert response.case_id == "case:test-1"
+
+
+@pytest.mark.asyncio
+async def test_close_incident_uses_injected_clock(store: SQLiteStore) -> None:
+    fixed_time = datetime(2026, 6, 1, tzinfo=UTC)
+    service = ModerationService(store, FakeExecutor(succeed=True), clock=lambda: fixed_time)
+    case_id = await _approved_case(store, service)
+    await service.execute_approved_action(
+        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+    )
+    await service.close_incident(
+        100,
+        CloseIncidentRequest.from_dict(
+            {"case_id": case_id, "decision": "resolved", "idempotency_key": "idem:5"}
+        ),
+    )
+    case = await store.get_moderation_case(case_id)
+    assert case is not None
+    assert case.close_timestamp == fixed_time
