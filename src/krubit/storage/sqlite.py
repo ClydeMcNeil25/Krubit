@@ -46,6 +46,8 @@ from krubit.domain.live_signals import (
     TwitchStream,
 )
 from krubit.domain.models import ActionReceipt, GuildEvent, JSONValue
+from krubit.domain.moderation import ModerationCase, ModerationStatus
+from krubit.domain.moderation import ActionReceipt as ModerationActionReceipt
 from krubit.domain.watchdog import (
     AllowBlockEntry,
     EntrySniffAssessment,
@@ -69,6 +71,7 @@ from krubit.storage.creator_rows import (
     creator_profile_from_row,
     creator_route_from_row,
 )
+from krubit.storage.moderation_rows import action_receipt_from_row, moderation_case_from_row
 from krubit.storage.watchdog_rows import (
     allow_block_entry_from_row,
     entry_sniff_assessment_from_row,
@@ -3741,6 +3744,184 @@ class SQLiteStore:
         )
         rows = await cursor.fetchall()
         return tuple(cast(Incident, incident_from_row(row)) for row in rows)
+
+    async def save_moderation_case(self, case: ModerationCase) -> ModerationCase:
+        """Insert or replace one moderation case. Identity is `(guild_id, case_id)`."""
+        _require_guild_id(case.guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO moderation_cases (
+                    guild_id, case_id, incident_id, member_id, report_timestamp,
+                    offense_number, recommended_action, executed_action, action_expiration,
+                    status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                    close_timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, case_id) DO UPDATE SET
+                    incident_id = excluded.incident_id,
+                    member_id = excluded.member_id,
+                    report_timestamp = excluded.report_timestamp,
+                    offense_number = excluded.offense_number,
+                    recommended_action = excluded.recommended_action,
+                    executed_action = excluded.executed_action,
+                    action_expiration = excluded.action_expiration,
+                    status = excluded.status,
+                    review_deadline = excluded.review_deadline,
+                    reviewer_id = excluded.reviewer_id,
+                    reviewer_decision = excluded.reviewer_decision,
+                    appeal_status = excluded.appeal_status,
+                    close_timestamp = excluded.close_timestamp
+                """,
+                (
+                    case.guild_id,
+                    case.case_id,
+                    case.incident_id,
+                    case.member_id,
+                    case.report_timestamp.isoformat(),
+                    case.offense_number,
+                    case.recommended_action,
+                    case.executed_action,
+                    case.action_expiration.isoformat() if case.action_expiration else None,
+                    case.status.value,
+                    case.review_deadline.isoformat() if case.review_deadline else None,
+                    case.reviewer_id,
+                    case.reviewer_decision.value if case.reviewer_decision else None,
+                    case.appeal_status.value,
+                    case.close_timestamp.isoformat() if case.close_timestamp else None,
+                ),
+            )
+        saved = await self.get_moderation_case(case.case_id)
+        if saved is None:
+            raise RuntimeError("saved moderation case could not be read")
+        return saved
+
+    async def get_moderation_case(self, case_id: str) -> ModerationCase | None:
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, case_id, incident_id, member_id, report_timestamp,
+                   offense_number, recommended_action, executed_action, action_expiration,
+                   status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                   close_timestamp
+            FROM moderation_cases
+            WHERE case_id = ?
+            """,
+            (case_id,),
+        )
+        row = await cursor.fetchone()
+        return moderation_case_from_row(row)
+
+    async def get_moderation_case_by_incident(
+        self, guild_id: int, incident_id: str
+    ) -> ModerationCase | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, case_id, incident_id, member_id, report_timestamp,
+                   offense_number, recommended_action, executed_action, action_expiration,
+                   status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                   close_timestamp
+            FROM moderation_cases
+            WHERE guild_id = ? AND incident_id = ?
+            """,
+            (guild_id, incident_id),
+        )
+        row = await cursor.fetchone()
+        return moderation_case_from_row(row)
+
+    async def count_moderation_cases_for_member(self, guild_id: int, member_id: int) -> int:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT COUNT(*) AS total FROM moderation_cases
+            WHERE guild_id = ? AND member_id = ? AND appeal_status != 'overturned'
+            """,
+            (guild_id, member_id),
+        )
+        row = await cursor.fetchone()
+        return int(row["total"]) if row is not None else 0
+
+    async def list_pending_review_cases(self, guild_id: int) -> tuple[ModerationCase, ...]:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            """
+            SELECT guild_id, case_id, incident_id, member_id, report_timestamp,
+                   offense_number, recommended_action, executed_action, action_expiration,
+                   status, review_deadline, reviewer_id, reviewer_decision, appeal_status,
+                   close_timestamp
+            FROM moderation_cases
+            WHERE guild_id = ? AND status = ?
+            ORDER BY report_timestamp DESC, case_id DESC
+            """,
+            (guild_id, ModerationStatus.APPROVAL_REQUIRED.value),
+        )
+        rows = await cursor.fetchall()
+        return tuple(cast(ModerationCase, moderation_case_from_row(row)) for row in rows)
+
+    async def save_action_receipt(
+        self, guild_id: int, receipt: ModerationActionReceipt, case_id: str
+    ) -> None:
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO moderation_action_receipts (
+                    guild_id, receipt_id, case_id, succeeded, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    receipt.receipt_id,
+                    case_id,
+                    1 if receipt.succeeded else 0,
+                    receipt.detail,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    async def get_action_receipt_by_id(
+        self, receipt_id: str
+    ) -> tuple[ModerationActionReceipt, str] | None:
+        cursor = await self._connection.execute(
+            "SELECT receipt_id, case_id, succeeded, detail FROM moderation_action_receipts "
+            "WHERE receipt_id = ?",
+            (receipt_id,),
+        )
+        row = await cursor.fetchone()
+        receipt = action_receipt_from_row(row)
+        if receipt is None or row is None:
+            return None
+        return receipt, str(row["case_id"])
+
+    async def get_moderation_idempotency_response(
+        self, guild_id: int, operation: str, idempotency_key: str
+    ) -> str | None:
+        _require_guild_id(guild_id)
+        cursor = await self._connection.execute(
+            "SELECT response_json FROM moderation_idempotency_keys "
+            "WHERE guild_id = ? AND operation = ? AND idempotency_key = ?",
+            (guild_id, operation, idempotency_key),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else str(row["response_json"])
+
+    async def save_moderation_idempotency_response(
+        self,
+        guild_id: int,
+        operation: str,
+        idempotency_key: str,
+        case_id: str,
+        response_json: str,
+    ) -> None:
+        _require_guild_id(guild_id)
+        async with self._write_transaction():
+            await self._connection.execute(
+                """
+                INSERT INTO moderation_idempotency_keys (
+                    guild_id, operation, idempotency_key, case_id, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (guild_id, operation, idempotency_key, case_id, response_json, datetime.now(UTC).isoformat()),
+            )
 
     async def save_allow_block_entry(self, entry: AllowBlockEntry) -> AllowBlockEntry:
         """Insert or replace one guild-configured allow/block entry for a Discord user.
