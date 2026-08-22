@@ -5,11 +5,13 @@ from datetime import UTC, datetime
 import pytest
 
 from krubit.domain.moderation import (
+    ActionReceipt,
     AppealStatus,
     ApprovalDecision,
     IllegalTransitionError,
     ModerationCase,
     ModerationStatus,
+    UnknownIncidentError,
     transition,
 )
 
@@ -138,3 +140,22 @@ def test_executed_action_allowed_when_executed():
 def test_naive_report_timestamp_rejected():
     with pytest.raises(ValueError, match="timezone"):
         _case(report_timestamp=datetime(2026, 1, 1))
+
+
+def test_case_without_recommended_action_constructs():
+    case = _case(recommended_action=None)
+    assert case.recommended_action is None
+
+
+def test_case_with_recommended_action_still_validates_length():
+    with pytest.raises(ValueError, match="recommended_action"):
+        _case(recommended_action="x" * 501)
+
+
+def test_action_receipt_constructs():
+    receipt = ActionReceipt(receipt_id="receipt:1", succeeded=True, detail="applied 24h timeout")
+    assert receipt.succeeded is True
+
+
+def test_unknown_incident_error_is_value_error():
+    assert issubclass(UnknownIncidentError, ValueError)

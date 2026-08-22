@@ -94,7 +94,7 @@ class ModerationCase:
     member_id: int
     report_timestamp: datetime
     offense_number: int
-    recommended_action: str
+    recommended_action: str | None
     executed_action: str | None
     action_expiration: datetime | None
     status: ModerationStatus
@@ -112,7 +112,10 @@ class ModerationCase:
         _require_aware("report_timestamp", self.report_timestamp)
         if self.offense_number < 1:
             raise ValueError("offense_number must be at least 1")
-        _require_text("recommended_action", self.recommended_action, limit=_MAX_ACTION_LENGTH)
+        if self.recommended_action is not None:
+            _require_text(
+                "recommended_action", self.recommended_action, limit=_MAX_ACTION_LENGTH
+            )
         if self.executed_action is not None:
             _require_text("executed_action", self.executed_action, limit=_MAX_ACTION_LENGTH)
             if self.status is not ModerationStatus.EXECUTED:
@@ -133,3 +136,27 @@ class ModerationCase:
             _require_aware("close_timestamp", self.close_timestamp)
             if self.status is not ModerationStatus.CLOSED:
                 raise ValueError("close_timestamp may only be set when status is closed")
+
+
+class UnknownIncidentError(ValueError):
+    """Raised when `record_incident` references an `incident_id` that has no
+    matching Phase 3 `krubit.domain.watchdog.Incident` row."""
+
+
+@dataclass(frozen=True, slots=True)
+class ActionReceipt:
+    """The outcome of one `ActionExecutor.execute()` call.
+
+    `succeeded=False` still produces a receipt — a failed execution attempt
+    is itself evidence, not an absence of one. Only a crash between the
+    executor returning and this receipt being persisted leaves
+    `receipt_state` null on the case, per the design doc.
+    """
+
+    receipt_id: str
+    succeeded: bool
+    detail: str
+
+    def __post_init__(self) -> None:
+        _require_text("receipt_id", self.receipt_id, limit=_MAX_ID_LENGTH)
+        _require_text("detail", self.detail, limit=_MAX_ACTION_LENGTH)
