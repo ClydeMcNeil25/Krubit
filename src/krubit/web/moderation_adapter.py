@@ -11,10 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import itertools
 import json
 import logging
+import os
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -36,6 +41,7 @@ from krubit.contracts.moderation import (
 )
 from krubit.domain.moderation import ActionReceipt, IllegalTransitionError, UnknownIncidentError
 from krubit.services.moderation import ActionExecutor, ModerationService
+from krubit.storage.sqlite import SQLiteStore
 from krubit.web.callbacks import CallbackRoute
 
 _logger = logging.getLogger(__name__)
@@ -172,9 +178,40 @@ async def _handle(
 
 
 def build_moderation_adapter_route(
-    *, path: str, header_name: str, secret: str, service: ModerationService
+    *,
+    path: str,
+    header_name: str,
+    secret: str,
+    service: ModerationService,
+    test_header_name: str = "X-Krubit-Test-Mode",
+    test_mode_enabled: bool = False,
+    test_secret: str | None = None,
 ) -> CallbackRoute:
     async def handler(request: web.Request) -> web.StreamResponse:
-        return await _handle(request, header_name=header_name, secret=secret, service=service)
+        test_mode_requested = request.headers.get(test_header_name) == "1"
+        if test_mode_enabled and test_mode_requested and test_secret is not None:
+            active_secret = test_secret
+            active_service = await _build_test_mode_service()
+        else:
+            active_secret = secret
+            active_service = service
+        return await _handle(
+            request, header_name=header_name, secret=active_secret, service=active_service
+        )
 
     return CallbackRoute(path=path, method="POST", handler=handler)
+
+
+async def _build_test_mode_service() -> ModerationService:
+    fd, path_str = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    store = await SQLiteStore.open(Path(path_str))
+    await store.initialize()
+    counter = itertools.count(1)
+    fixed_time = datetime(2026, 1, 1, tzinfo=UTC)
+    return ModerationService(
+        store,
+        NoOpActionExecutor(),
+        id_factory=lambda: f"case:test-{next(counter)}",
+        clock=lambda: fixed_time,
+    )
