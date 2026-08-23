@@ -23,7 +23,7 @@ from krubit.config import Settings
 from krubit.domain.creator_signals import Platform, RecognizedAccountUrl
 from krubit.integrations import meta, tiktok
 from krubit.security.credential_vault import CredentialVault
-from krubit.services.moderation import ModerationService
+from krubit.services.moderation import ActionExecutor, ModerationService
 from krubit.storage.sqlite import ConnectorAuthorization, SQLiteStore
 from krubit.web.callbacks import (
     CallbackRoute,
@@ -56,6 +56,8 @@ def build_callback_routes(
     store: SQLiteStore,
     vault: CredentialVault | None,
     oauth_session: object,
+    *,
+    executor: ActionExecutor | None = None,
 ) -> tuple[CallbackRoute, ...]:
     if settings.callback_public_base_url is None or settings.callback_port is None:
         return ()
@@ -63,7 +65,7 @@ def build_callback_routes(
     routes: list[CallbackRoute] = []
 
     if settings.moderation_adapter_secret:
-        moderation_service = ModerationService(store, NoOpActionExecutor())
+        moderation_service = ModerationService(store, executor or NoOpActionExecutor())
         routes.append(
             build_moderation_adapter_route(
                 path="/moderation/adapter",

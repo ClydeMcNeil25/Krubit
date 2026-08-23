@@ -16,6 +16,7 @@ import discord
 from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
 from krubit.discord.install import install_url
+from krubit.discord.moderation_executor import LazyDiscordActionExecutor
 from krubit.domain.creator_signals import Platform
 from krubit.integrations.base import Connector
 from krubit.integrations.bluesky import BlueskyConnector
@@ -194,7 +195,10 @@ async def _run_bot(settings: Settings) -> int:
 
         oauth_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         oauth_session = aiohttp.ClientSession(connector=oauth_tcp_connector)
-        callback_routes = build_callback_routes(settings, store, vault, oauth_session)
+        moderation_executor = LazyDiscordActionExecutor()
+        callback_routes = build_callback_routes(
+            settings, store, vault, oauth_session, executor=moderation_executor
+        )
         callback_server = CallbackServer(
             public_base_url=settings.callback_public_base_url,
             port=settings.callback_port,
@@ -225,6 +229,7 @@ async def _run_bot(settings: Settings) -> int:
             twitch=twitch,
             content_connectors=content_connectors,
         )
+        moderation_executor.bind(bot)
         try:
             await bot.start(settings.require_token())
         except discord.PrivilegedIntentsRequired:
@@ -261,6 +266,7 @@ async def _run_bot(settings: Settings) -> int:
                 content_connectors=content_connectors,
                 request_message_content_intent=False,
             )
+            moderation_executor.bind(bot)
             await bot.start(settings.require_token())
     except BaseException as exc:
         primary_error = exc
