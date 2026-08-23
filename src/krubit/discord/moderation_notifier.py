@@ -56,12 +56,12 @@ class ModerationNotifier:
         self._guild_lookup = guild_lookup
 
     async def notify_pending_review(self, case: ModerationCase) -> None:
-        await self._send(case.guild_id, _pending_review_card(case))
+        await self._send(case.guild_id, case.case_id, _pending_review_card(case))
 
     async def notify_outcome(self, case: ModerationCase, succeeded: bool) -> None:
-        await self._send(case.guild_id, _outcome_card(case, succeeded))
+        await self._send(case.guild_id, case.case_id, _outcome_card(case, succeeded))
 
-    async def _send(self, guild_id: int, card: Card) -> None:
+    async def _send(self, guild_id: int, case_id: str, card: Card) -> None:
         if self._channel_id is None or self._guild_lookup is None:
             return
         guild = self._guild_lookup(guild_id)
@@ -85,7 +85,7 @@ class ModerationNotifier:
         except (discord.HTTPException, discord.Forbidden, discord.NotFound):
             _logger.exception(
                 "ModerationNotifier: failed to deliver notification for case %s in guild %s",
-                card.title,
+                case_id,
                 guild_id,
             )
 
