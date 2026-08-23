@@ -115,6 +115,7 @@ async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
     value = await SQLiteStore.open(tmp_path / "krubit.db")
     await value.initialize()
     await value.set_guild_enabled(GUILD_ID, True)
+    await value.set_guild_enabled(100, True)
     for suffix in ("1", "2"):
         await value.record_incident(
             Incident(
@@ -128,6 +129,19 @@ async def store(tmp_path: Path) -> AsyncIterator[SQLiteStore]:
                 acknowledged_by=None,
             )
         )
+    # Seed incident for guild_id 100 (used by test_full_chain_approve_calls_discord_timeout_and_notifies)
+    await value.record_incident(
+        Incident(
+            guild_id=100,
+            incident_id="incident:1",
+            kind=IncidentKind.MEMBER,
+            band=RiskBand.INCIDENT,
+            opened_at=NOW,
+            evidence_packet_id="incident:1",
+            recommended_action="review",
+            acknowledged_by=None,
+        )
+    )
     try:
         yield value
     finally:
@@ -535,3 +549,83 @@ async def test_approve_duration_hours_is_a_bounded_integer_range(store: SQLiteSt
     assert parameter.type is discord.AppCommandOptionType.integer
     assert parameter.min_value == 1
     assert parameter.max_value == 672
+
+
+@pytest.mark.asyncio
+async def test_full_chain_approve_calls_discord_timeout_and_notifies(store: SQLiteStore) -> None:
+    """record_incident -> submit_action_recommendation -> request_human_approval
+    -> record_human_decision (approve) -> execute_approved_action, using the
+    REAL DiscordActionExecutor (mocked discord.Client) instead of FakeExecutor,
+    proving the full chain reaches member.timeout() and the notifier fires.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from krubit.contracts.moderation import RequestHumanApprovalRequest, SubmitActionRecommendationRequest
+    from krubit.discord.moderation_executor import DiscordActionExecutor
+    from krubit.discord.moderation_notifier import ModerationNotifier
+    from krubit.domain.moderation import ApprovalDecision
+    from datetime import timedelta
+
+    member = MagicMock()
+    member.timeout = AsyncMock()
+    guild = MagicMock()
+    guild.get_member.return_value = member
+    bot = MagicMock()
+    bot.get_guild.return_value = guild
+
+    executor = DiscordActionExecutor(bot)
+    service = ModerationService(store, executor)
+
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    case = await service.record_human_decision(
+        100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED,
+        timeout_duration=timedelta(hours=24),
+    )
+    execute_response = await service.execute_approved_action(
+        100,
+        ExecuteApprovedActionRequest.from_dict(
+            {"case_id": record_response.case_id, "idempotency_key": "idem:4"}
+        ),
+    )
+    assert execute_response.status.value == "executed"
+    member.timeout.assert_awaited_once()
+
+    notify_guild = MagicMock()
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    channel.permissions_for.return_value = MagicMock(
+        view_channel=True, send_messages=True, embed_links=True
+    )
+    notify_guild.get_channel.return_value = channel
+    notify_guild.me = MagicMock()
+    notifier = ModerationNotifier(channel_id=555)
+    notifier.bind(lambda gid: notify_guild)
+    await notifier.notify_outcome(case, succeeded=True)
+    channel.send.assert_awaited_once()
