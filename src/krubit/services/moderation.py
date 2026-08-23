@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from krubit.contracts.moderation import (
@@ -242,11 +242,16 @@ class ModerationService:
         return response
 
     async def record_human_decision(
-        self, guild_id: int, case_id: str, *, reviewer_id: int, decision: ApprovalDecision
+        self,
+        guild_id: int,
+        case_id: str,
+        *,
+        reviewer_id: int,
+        decision: ApprovalDecision,
+        timeout_duration: timedelta | None = None,
     ) -> ModerationCase:
         """Internal — not part of the 11-operation Zariya contract. Reserved
-        for slice 4's `/fetch admin` approval commands; added now only so
-        this slice's own tests can drive a case through the full lifecycle.
+        for slice 4's `/fetch moderation` approval commands.
         """
         case = await self._store.get_moderation_case(case_id)
         if case is None:
@@ -258,9 +263,18 @@ class ModerationService:
             if decision is ApprovalDecision.APPROVED
             else ModerationStatus.REJECTED
         )
+        if target is ModerationStatus.APPROVED and timeout_duration is None:
+            raise ValueError("timeout_duration is required when approving a case")
         new_status = transition(case.status, target)
+        action_expiration = (
+            self._clock() + timeout_duration if target is ModerationStatus.APPROVED else None
+        )
         updated = replace(
-            case, status=new_status, reviewer_id=reviewer_id, reviewer_decision=decision
+            case,
+            status=new_status,
+            reviewer_id=reviewer_id,
+            reviewer_decision=decision,
+            action_expiration=action_expiration,
         )
         return await self._store.save_moderation_case(updated)
 
@@ -446,6 +460,14 @@ class ModerationService:
         return GetPendingReviewsResult(
             guild_id=query.guild_id, cases=tuple(case.case_id for case in cases)
         )
+
+    async def get_case(self, guild_id: int, case_id: str) -> ModerationCase | None:
+        case = await self._store.get_moderation_case(case_id)
+        if case is None:
+            return None
+        if case.guild_id != guild_id:
+            return None
+        return case
 
     async def _cache_response(
         self, guild_id: int, operation: str, idempotency_key: str, case_id: str, response: object

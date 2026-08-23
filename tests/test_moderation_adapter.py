@@ -8,7 +8,7 @@ import json
 import tempfile
 import unittest.mock
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -556,7 +556,11 @@ async def _build_approved_case(
 
     service = ModerationService(store, FakeExecutor())
     await service.record_human_decision(
-        100, case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
+        100,
+        case_id,
+        reviewer_id=999,
+        decision=ApprovalDecision.APPROVED,
+        timeout_duration=timedelta(hours=24),
     )
     return case_id
 

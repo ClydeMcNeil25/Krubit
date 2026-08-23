@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -350,7 +350,11 @@ async def _approved_case(store: SQLiteStore, service: ModerationService) -> str:
         ),
     )
     await service.record_human_decision(
-        100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
+        100,
+        record_response.case_id,
+        reviewer_id=999,
+        decision=ApprovalDecision.APPROVED,
+        timeout_duration=timedelta(hours=24),
     )
     return record_response.case_id
 
@@ -995,3 +999,167 @@ async def test_close_incident_uses_injected_clock(store: SQLiteStore) -> None:
     case = await store.get_moderation_case(case_id)
     assert case is not None
     assert case.close_timestamp == fixed_time
+
+
+@pytest.mark.asyncio
+async def test_record_human_decision_approve_sets_action_expiration(store: SQLiteStore) -> None:
+    fixed_time = datetime(2026, 6, 1, tzinfo=UTC)
+    service = ModerationService(store, FakeExecutor(), clock=lambda: fixed_time)
+    await _seed_incident(store)
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            }
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    updated = await service.record_human_decision(
+        100,
+        record_response.case_id,
+        reviewer_id=999,
+        decision=ApprovalDecision.APPROVED,
+        timeout_duration=timedelta(hours=24),
+    )
+    assert updated.action_expiration == fixed_time + timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_record_human_decision_approve_without_duration_raises(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _seed_incident(store)
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="timeout_duration"):
+        await service.record_human_decision(
+            100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.APPROVED
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_human_decision_reject_ignores_duration(store: SQLiteStore) -> None:
+    service = ModerationService(store, FakeExecutor())
+    await _seed_incident(store)
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {"case_id": record_response.case_id, "recommended_action": "24h timeout", "idempotency_key": "idem:2"}
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    updated = await service.record_human_decision(
+        100, record_response.case_id, reviewer_id=999, decision=ApprovalDecision.REJECTED
+    )
+    assert updated.action_expiration is None
+    assert updated.status is ModerationStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_get_case_returns_full_record(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    case = await service.get_case(100, record_response.case_id)
+    assert case is not None
+    assert case.member_id == 200
+
+
+@pytest.mark.asyncio
+async def test_get_case_wrong_guild_returns_none(store: SQLiteStore) -> None:
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor())
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    assert await service.get_case(999, record_response.case_id) is None
