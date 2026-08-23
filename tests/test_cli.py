@@ -15,6 +15,8 @@ from krubit.config import Settings
 from krubit.discord.bot import AdminCommands, FetchCommands, KrubitBot
 from krubit.discord.content_commands import NotificationCommands
 from krubit.discord.membership_announcements import WELCOME_CHANNEL_NAME
+from krubit.discord.moderation_executor import LazyDiscordActionExecutor
+from krubit.discord.moderation_notifier import ModerationNotifier
 from krubit.domain.creator_signals import CreatorAccount, Platform
 from krubit.integrations.base import ConnectorAccount, ConnectorHealth, ConnectorPage
 from krubit.integrations.catalog import CATALOG
@@ -521,6 +523,178 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
     # own connector; `callback_server` itself is a real `CallbackServer` here
     # (not faked) and its `close()` is a no-op since it was never enabled/started.
     assert closed == ["session", "connector", "bot", "store", "connector", "session", "connector"]
+
+
+class _ModerationWiringHarness:
+    """Shared scaffolding for the two `_run_bot` moderation-wiring tests.
+
+    Records the moderation executor/notifier objects `_run_bot` hands to
+    `build_callback_routes` and to every `KrubitBot(...)` construction, so a
+    test can prove the same instances are threaded to both *and* that
+    `bind(...)` was actually called on them afterwards. Without this, deleting
+    any of the four wiring lines in `__main__.py` leaves the whole suite green.
+    """
+
+    def __init__(self) -> None:
+        self.route_kwargs: dict[str, object] = {}
+        self.bot_kwargs: list[dict[str, object]] = []
+        self.bots: list[object] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, bot_class: type) -> None:
+        class FakeStore:
+            async def initialize(self) -> None:
+                return None
+
+            async def list_live_signal_guild_ids(self) -> list[int]:
+                return []
+
+            async def close(self) -> None:
+                return None
+
+        class FakeConnector:
+            async def close(self) -> None:
+                return None
+
+        class FakeSession:
+            def __init__(self, *, connector: FakeConnector) -> None:
+                self.connector = connector
+
+            async def close(self) -> None:
+                return None
+
+        async def open_store(path: Path) -> FakeStore:
+            return FakeStore()
+
+        def connector_factory(**kwargs: object) -> FakeConnector:
+            return FakeConnector()
+
+        def spy_routes(*args: object, **kwargs: object) -> tuple[object, ...]:
+            self.route_kwargs = kwargs
+            return ()
+
+        harness = self
+
+        class RecordingBot(bot_class):  # pyright: ignore[reportUntypedBaseClass]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)  # pyright: ignore[reportUnknownMemberType]
+                harness.bot_kwargs.append(kwargs)
+                harness.bots.append(self)
+
+        monkeypatch.setattr(cli.SQLiteStore, "open", open_store)
+        monkeypatch.setattr(cli.aiohttp, "TCPConnector", connector_factory)
+        monkeypatch.setattr(cli.aiohttp, "ClientSession", FakeSession)
+        monkeypatch.setattr(cli, "build_callback_routes", spy_routes)
+        monkeypatch.setattr(cli, "KrubitBot", RecordingBot)
+
+
+@pytest.mark.asyncio
+async def test_run_bot_threads_and_binds_the_moderation_executor_and_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`__main__.py` must hand the *same* `LazyDiscordActionExecutor` and
+    `ModerationNotifier` instances to both `build_callback_routes` and
+    `KrubitBot`, then `bind(...)` both to the live bot -- otherwise the HTTP
+    adapter and the `/fetch moderation` commands silently diverge, or the
+    notifier stays a permanent no-op with no test noticing."""
+    harness = _ModerationWiringHarness()
+
+    class FakeBot:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def get_guild(self, guild_id: int) -> None:
+            return None
+
+        async def start(self, token: str) -> None:
+            raise RuntimeError("stop before real Discord connect")
+
+        async def close(self) -> None:
+            return None
+
+    harness.install(monkeypatch, FakeBot)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        moderation_channel_id=555,
+    )
+
+    with pytest.raises(RuntimeError, match="stop before real Discord connect"):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    executor = harness.route_kwargs["executor"]
+    notifier = harness.route_kwargs["notifier"]
+    assert isinstance(executor, LazyDiscordActionExecutor)
+    assert isinstance(notifier, ModerationNotifier)
+
+    # The very same objects must reach KrubitBot -- not fresh ones.
+    assert len(harness.bot_kwargs) == 1
+    assert harness.bot_kwargs[0]["moderation_executor"] is executor
+    assert harness.bot_kwargs[0]["moderation_notifier"] is notifier
+
+    # ...and both must actually have been bound to the constructed bot.
+    bot = harness.bots[0]
+    assert executor._bot is bot  # pyright: ignore[reportPrivateUsage]
+    assert notifier._guild_lookup is not None  # pyright: ignore[reportPrivateUsage]
+    assert notifier._guild_lookup == bot.get_guild  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_run_bot_rebinds_moderation_wiring_on_the_privileged_intent_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `PrivilegedIntentsRequired` fallback constructs a *second*
+    `KrubitBot`. Both the executor and the notifier must be re-bound to that
+    replacement -- a bind left pointing at the discarded first bot would leave
+    moderation actions and #mod-room posts silently dead after a fallback."""
+    harness = _ModerationWiringHarness()
+
+    class FakeBot:
+        def __init__(
+            self,
+            *args: object,
+            request_message_content_intent: bool | None = None,
+            **kwargs: object,
+        ) -> None:
+            self.request_message_content_intent = request_message_content_intent
+
+        def get_guild(self, guild_id: int) -> None:
+            return None
+
+        async def start(self, token: str) -> None:
+            if self.request_message_content_intent is not False:
+                raise discord.PrivilegedIntentsRequired(shard_id=None)
+            raise RuntimeError("stop after the fallback reconnect")
+
+        async def close(self) -> None:
+            return None
+
+    harness.install(monkeypatch, FakeBot)
+    settings = Settings(
+        application_id=123,
+        database_path=tmp_path / "krubit.db",
+        bot_token="token",
+        moderation_channel_id=555,
+        watchdog_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after the fallback reconnect"):
+        await cli._run_bot(settings)  # pyright: ignore[reportPrivateUsage]
+
+    executor = harness.route_kwargs["executor"]
+    notifier = harness.route_kwargs["notifier"]
+
+    # Two constructions, both handed the same shared instances.
+    assert len(harness.bot_kwargs) == 2
+    for kwargs in harness.bot_kwargs:
+        assert kwargs["moderation_executor"] is executor
+        assert kwargs["moderation_notifier"] is notifier
+
+    # Bound to the *replacement* bot, not the discarded first one.
+    fallback_bot = harness.bots[1]
+    assert harness.bots[0] is not fallback_bot
+    assert executor._bot is fallback_bot  # pyright: ignore[reportPrivateUsage]
+    assert notifier._guild_lookup == fallback_bot.get_guild  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
 
 @pytest.mark.asyncio

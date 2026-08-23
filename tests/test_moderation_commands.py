@@ -314,6 +314,72 @@ async def test_approve_reports_execution_failure_without_raising(
 
 
 @pytest.mark.asyncio
+async def test_approve_still_answers_when_execute_approved_action_raises(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`approve` is the one command where an irreversible Discord action
+    precedes the response. If anything after `record_human_decision` raises,
+    the staff member must still get an answer -- never a deferred ephemeral
+    response left spinning on "thinking" forever."""
+    commands = _commands(store)
+    group = _group(commands)
+    case_id = await _seed_pending_case(commands._moderation_service)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    async def boom(*args: object, **kwargs: object) -> object:
+        raise ValueError("case status changed concurrently")
+
+    monkeypatch.setattr(
+        commands._moderation_service,  # pyright: ignore[reportPrivateUsage]
+        "execute_approved_action",
+        boom,
+    )
+
+    interaction = _FakeInteraction(_FakeMember(STAFF_ID, can_manage_guild=True))
+    await _subcommand(group, "approve").callback(group, interaction, case_id, 24)
+
+    assert interaction.edited_embed is None
+    assert interaction.edited_content is not None
+    assert case_id in interaction.edited_content
+    assert "case status changed concurrently" in interaction.edited_content
+    # The message must not claim the timeout definitely did or did not land.
+    assert "may or may not" in interaction.edited_content
+    # The decision itself was already recorded before the failure.
+    stored = await store.get_moderation_case(case_id)
+    assert stored is not None
+    assert stored.status is ModerationStatus.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_approve_still_answers_when_notify_outcome_raises(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = _commands(store)
+    group = _group(commands)
+    case_id = await _seed_pending_case(commands._moderation_service)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("notifier exploded past its own guard")
+
+    monkeypatch.setattr(
+        commands._moderation_notifier,  # pyright: ignore[reportPrivateUsage]
+        "notify_outcome",
+        boom,
+    )
+
+    interaction = _FakeInteraction(_FakeMember(STAFF_ID, can_manage_guild=True))
+    await _subcommand(group, "approve").callback(group, interaction, case_id, 24)
+
+    assert interaction.edited_content is not None
+    assert "notifier exploded past its own guard" in interaction.edited_content
+    # The action itself genuinely executed -- only the announcement failed.
+    stored = await store.get_moderation_case(case_id)
+    assert stored is not None
+    assert stored.status is ModerationStatus.EXECUTED
+
+
+@pytest.mark.asyncio
 async def test_approve_reports_unknown_case_as_plain_text(
     store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

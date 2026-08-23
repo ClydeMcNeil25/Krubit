@@ -1133,20 +1133,54 @@ class ModerationCommands(app_commands.Group):
         except ValueError as exc:
             await interaction.edit_original_response(content=str(exc))
             return
-        # A fresh idempotency key per invocation: two deliberate staff approvals
-        # of the same case must each be attempted, not silently collapsed into
-        # one cached response by the service's replay cache.
-        execute_response = await self._parent._moderation_service.execute_approved_action(
-            guild.id,
-            ExecuteApprovedActionRequest.from_dict(
-                {"case_id": case_id, "idempotency_key": f"admin-approve:{case_id}:{uuid4().hex}"}
-            ),
-        )
-        succeeded = execute_response.status is ModerationStatus.EXECUTED
-        # Re-read rather than reusing the pre-execution `case`, so the announced
-        # status is the post-execution one staff actually need to see.
-        executed_case = await self._parent._moderation_service.get_case(guild.id, case_id) or case
-        await self._parent._moderation_notifier.notify_outcome(executed_case, succeeded=succeeded)
+        # Past this point the case is already APPROVED and a real, irreversible
+        # Discord timeout may already have been applied, so *nothing* here may
+        # escape without answering the staff member: an unhandled exception
+        # would leave their deferred ephemeral response spinning on "thinking"
+        # forever with no receipt written, and no way to tell whether the
+        # timeout landed. Same blanket-guard reasoning as
+        # `krubit.web.moderation_adapter._notify_pending_review`, except that
+        # here the guard must also *reply*, not merely log.
+        try:
+            # A fresh idempotency key per invocation: two deliberate staff
+            # approvals of the same case must each be attempted, not silently
+            # collapsed into one cached response by the service's replay cache.
+            execute_response = await self._parent._moderation_service.execute_approved_action(
+                guild.id,
+                ExecuteApprovedActionRequest.from_dict(
+                    {
+                        "case_id": case_id,
+                        "idempotency_key": f"admin-approve:{case_id}:{uuid4().hex}",
+                    }
+                ),
+            )
+            succeeded = execute_response.status is ModerationStatus.EXECUTED
+            # Re-read rather than reusing the pre-execution `case`, so the
+            # announced status is the post-execution one staff actually need.
+            executed_case = (
+                await self._parent._moderation_service.get_case(guild.id, case_id) or case
+            )
+            await self._parent._moderation_notifier.notify_outcome(
+                executed_case, succeeded=succeeded
+            )
+        except Exception as exc:
+            _logger.exception(
+                "fetch_moderation_approve: post-decision failure for case %s in guild %s",
+                case_id,
+                guild.id,
+            )
+            # Deliberately does not claim the action did or did not land -- the
+            # failure may have come before or after the executor ran. Saying so
+            # plainly is what stops a staff member re-approving a case whose
+            # timeout is already active.
+            await interaction.edit_original_response(
+                content=(
+                    f"Case `{case_id}` was approved, but completing the action failed: "
+                    f"{type(exc).__name__}: {exc}. The timeout may or may not have been "
+                    f"applied -- check `/fetch moderation case {case_id}` before retrying."
+                )
+            )
+            return
         card = Card(
             kind="fetched" if succeeded else "failed",
             title="Moderation Case Approved",
