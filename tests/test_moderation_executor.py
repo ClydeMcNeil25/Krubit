@@ -54,6 +54,11 @@ async def test_execute_succeeds_and_calls_member_timeout() -> None:
 
     assert receipt.succeeded is True
     member.timeout.assert_awaited_once_with(EXPIRY, reason="Krubit moderation case case:1")
+    # `member` is a `MagicMock`, so a future accidental addition of a kick/ban
+    # call inside `execute()` would otherwise be silently recorded and never
+    # fail this test -- these two assertions make that addition fail loudly.
+    member.kick.assert_not_called()
+    member.ban.assert_not_called()
 
 
 @pytest.mark.asyncio

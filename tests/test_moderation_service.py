@@ -387,6 +387,77 @@ async def test_execute_approved_action_success(store: SQLiteStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_approved_action_records_actual_timeout_not_recommended_action(
+    store: SQLiteStore,
+) -> None:
+    """`executed_action` must reflect what was actually applied (the real,
+    staff-approved timeout expiration), never Zariya's free-text
+    `recommended_action` -- that text is untrusted HTTP input a staff member
+    may have overridden entirely (e.g. Zariya recommends "permanent ban" but
+    staff approve only a 1-hour timeout). Recording the recommendation would
+    make the audit trail lie about what actually happened.
+    """
+    await _seed_incident(store)
+    service = ModerationService(store, FakeExecutor(succeed=True))
+    record_response = await service.record_incident(
+        100,
+        RecordIncidentRequest.from_dict(
+            {
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            }
+        ),
+    )
+    await service.submit_action_recommendation(
+        100,
+        SubmitActionRecommendationRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                # Deliberately disagrees with the 1-hour duration staff actually
+                # approve below.
+                "recommended_action": "permanent ban",
+                "idempotency_key": "idem:2",
+            }
+        ),
+    )
+    await service.request_human_approval(
+        100,
+        RequestHumanApprovalRequest.from_dict(
+            {
+                "case_id": record_response.case_id,
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            }
+        ),
+    )
+    case_after_decision = await service.record_human_decision(
+        100,
+        record_response.case_id,
+        reviewer_id=999,
+        decision=ApprovalDecision.APPROVED,
+        timeout_duration=timedelta(hours=1),
+    )
+    assert case_after_decision.action_expiration is not None
+    expected_expiration = case_after_decision.action_expiration.isoformat()
+
+    await service.execute_approved_action(
+        100,
+        ExecuteApprovedActionRequest.from_dict(
+            {"case_id": record_response.case_id, "idempotency_key": "idem:4"}
+        ),
+    )
+    case = await store.get_moderation_case(record_response.case_id)
+    assert case is not None
+    assert case.status is ModerationStatus.EXECUTED
+    assert case.executed_action == f"timeout until {expected_expiration}"
+    assert case.executed_action is not None
+    assert "permanent ban" not in case.executed_action
+
+
+@pytest.mark.asyncio
 async def test_execute_approved_action_failure(store: SQLiteStore) -> None:
     executor = FakeExecutor(succeed=False)
     service = ModerationService(store, executor)

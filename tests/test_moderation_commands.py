@@ -434,6 +434,82 @@ async def test_reject_records_the_rejection(
 
 
 @pytest.mark.asyncio
+async def test_reject_with_very_long_reason_answers_cleanly(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reason` is unbounded staff free text. discord.py's embed field-value
+    limit is 1024 characters, so a very long reason must still produce a
+    clean response -- never a hang (deferred response left spinning) or an
+    unhandled `discord.HTTPException` from an oversized embed."""
+    commands = _commands(store)
+    group = _group(commands)
+    case_id = await _seed_pending_case(commands._moderation_service)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    long_reason = "x" * 2000
+    interaction = _FakeInteraction(_FakeMember(STAFF_ID, can_manage_guild=True))
+    await _subcommand(group, "reject").callback(group, interaction, case_id, long_reason)
+
+    assert interaction.edited_embed is not None
+    assert interaction.edited_content is None
+    stored = await store.get_moderation_case(case_id)
+    assert stored is not None
+    assert stored.status is ModerationStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_reject_caps_persisted_card_reason_field_at_1024_chars(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = _commands(store)
+    group = _group(commands)
+    case_id = await _seed_pending_case(commands._moderation_service)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    long_reason = "x" * 2000
+    interaction = _FakeInteraction(_FakeMember(STAFF_ID, can_manage_guild=True))
+    await _subcommand(group, "reject").callback(group, interaction, case_id, long_reason)
+
+    assert interaction.edited_embed is not None
+    reason_field = next(
+        field for field in interaction.edited_embed.fields if field.name == "Reason"
+    )
+    assert len(reason_field.value) == 1024
+    assert reason_field.value == long_reason[:1024]
+
+
+@pytest.mark.asyncio
+async def test_reject_still_answers_when_finish_raises(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_approve_still_answers_when_notify_outcome_raises` for
+    `reject`'s own post-decision guard: a `finish()` failure (embed build,
+    receipt write, or response edit) must not leave the deferred ephemeral
+    response spinning on "thinking" forever."""
+    commands = _commands(store)
+    group = _group(commands)
+    case_id = await _seed_pending_case(commands._moderation_service)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("krubit.discord.bot.discord.Member", _FakeMember)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("finish exploded past its own guard")
+
+    monkeypatch.setattr(commands, "finish", boom)
+
+    interaction = _FakeInteraction(_FakeMember(STAFF_ID, can_manage_guild=True))
+    await _subcommand(group, "reject").callback(group, interaction, case_id, "false positive")
+
+    assert interaction.edited_embed is None
+    assert interaction.edited_content is not None
+    assert case_id in interaction.edited_content
+    assert "finish exploded past its own guard" in interaction.edited_content
+    # The decision itself was already recorded before the failure.
+    stored = await store.get_moderation_case(case_id)
+    assert stored is not None
+    assert stored.status is ModerationStatus.REJECTED
+
+
+@pytest.mark.asyncio
 async def test_history_returns_the_members_cases(
     store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

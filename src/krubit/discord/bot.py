@@ -1217,19 +1217,41 @@ class ModerationCommands(app_commands.Group):
         except ValueError as exc:
             await interaction.edit_original_response(content=str(exc))
             return
-        card = Card(
-            kind="fetched",
-            title="Moderation Case Rejected",
-            description=f"Case `{case_id}` rejected.",
-            fields=(CardField("Reason", reason, inline=False),),
-        )
-        await self._parent.finish(
-            interaction,
-            action="fetch_moderation_reject",
-            actor_id=actor_id,
-            embed=render_card(card),
-            detail={"case_id": case_id, "reason": reason},
-        )
+        # Same blanket-guard reasoning as `approve` immediately above: past this
+        # point the case is already REJECTED, so an unhandled exception here
+        # (e.g. an oversized embed field, before the truncation below existed)
+        # would leave the deferred ephemeral response spinning on "thinking"
+        # forever with no receipt written.
+        try:
+            # `discord.py`'s embed field-value limit is 1024 characters; `reason`
+            # is unbounded free text, matching `render_health_card`'s own
+            # `finding.detail[:1024]` truncation pattern.
+            truncated_reason = reason[:1024]
+            card = Card(
+                kind="fetched",
+                title="Moderation Case Rejected",
+                description=f"Case `{case_id}` rejected.",
+                fields=(CardField("Reason", truncated_reason, inline=False),),
+            )
+            await self._parent.finish(
+                interaction,
+                action="fetch_moderation_reject",
+                actor_id=actor_id,
+                embed=render_card(card),
+                detail={"case_id": case_id, "reason": truncated_reason},
+            )
+        except Exception as exc:
+            _logger.exception(
+                "fetch_moderation_reject: post-decision failure for case %s in guild %s",
+                case_id,
+                guild.id,
+            )
+            await interaction.edit_original_response(
+                content=(
+                    f"Case `{case_id}` was rejected, but completing the response failed: "
+                    f"{type(exc).__name__}: {exc}."
+                )
+            )
 
     @app_commands.command(name="history", description="Fetch a member's moderation history")
     @app_commands.guild_only()

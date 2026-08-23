@@ -60,25 +60,10 @@ _UNREAD_FIELD_EXEMPTIONS: dict[str, str] = {
         "pre-existing forward declaration for a not-yet-built Watchdog-to-Zariya "
         "escalation bridge integration."
     ),
-    "moderation_adapter_secret": (
-        "forward declaration for the not-yet-wired moderation HTTP transport "
-        "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
-        "HTTP handler that reads it lands in a later task of this slice."
-    ),
     "moderation_test_mode": (
         "forward declaration for the not-yet-wired moderation HTTP transport "
         "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
         "HTTP handler that reads it lands in a later task of this slice."
-    ),
-    "moderation_test_mode_secret": (
-        "forward declaration for the not-yet-wired moderation HTTP transport "
-        "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
-        "HTTP handler that reads it lands in a later task of this slice."
-    ),
-    "moderation_channel_id": (
-        "forward declaration for the not-yet-wired Discord moderation channel "
-        "integration (slice 4, task 6 of 2026-08-22-moderation-discord-integration); "
-        "the moderation event handler that reads it lands in task 6 of this slice."
     ),
 }
 

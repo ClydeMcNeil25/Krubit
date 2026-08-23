@@ -779,6 +779,22 @@ class _FakeApprovingExecutor:
         )
 
 
+class _FakeNotifier:
+    """A distinctive fake `PendingReviewNotifier` -- records whether and with
+    which case it was invoked, unlike `build_callback_routes`'s default of
+    `notifier=None` (silently no notification is ever sent). Proving the
+    moderation route's `_notify_pending_review` call actually reached *this*
+    instance, not a dropped/`None` notifier, is the whole point of the test
+    below.
+    """
+
+    def __init__(self) -> None:
+        self.notified_cases: list[str] = []
+
+    async def notify_pending_review(self, case: object) -> None:
+        self.notified_cases.append(case.case_id)  # type: ignore[attr-defined]
+
+
 def _sign_moderation_body(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
@@ -914,6 +930,101 @@ async def test_build_callback_routes_uses_supplied_executor_for_moderation_route
         assert execute_response.status == 200
         payload = await execute_response.json()
         assert payload["status"] == "executed"
+
+    await store.close()
+
+
+async def test_build_callback_routes_uses_supplied_notifier_for_moderation_route(tmp_path):
+    """`build_callback_routes(..., notifier=...)` must thread the supplied
+    notifier into the moderation route, instead of silently dropping it (the
+    behavior when `notifier` is omitted -- `notifier=None` reaches
+    `build_moderation_adapter_route` and `_notify_pending_review` is simply
+    never called).
+
+    Mirrors `test_build_callback_routes_uses_supplied_executor_for_moderation_
+    route`'s exact HTTP round-trip shape: drive a case from `record_incident`
+    through `submit_action_recommendation` up to `request_human_approval`,
+    the one operation that triggers a pending-review notification (see
+    `moderation_adapter._handle`). The fake notifier records the case_id it
+    was invoked with; asserting that list is non-empty is only possible if
+    `notifier` actually reached the route's closure rather than being
+    dropped.
+    """
+    store = await _store(tmp_path)
+    vault = CredentialVault.from_env_key("a" * 32)
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    await store.record_incident(
+        Incident(
+            guild_id=100,
+            incident_id="incident:1",
+            kind=IncidentKind.MEMBER,
+            band=RiskBand.INCIDENT,
+            opened_at=now,
+            evidence_packet_id="incident:1",
+            recommended_action="review",
+            acknowledged_by=None,
+        )
+    )
+
+    secret = "moderation-secret"
+    notifier = _FakeNotifier()
+    routes = build_callback_routes(
+        _settings(creator_signals_enabled=False, moderation_adapter_secret=secret),
+        store, vault, object(),
+        notifier=notifier,
+    )
+    assert len(routes) == 1
+    assert routes[0].path == "/moderation/adapter"
+
+    server = CallbackServer(
+        public_base_url="https://example.test", port=0, routes=routes
+    )
+    app = server.build_app()
+    async with TestServer(app) as test_server, TestClient(test_server) as client:
+        record_response = await _post_moderation(
+            client, secret,
+            {
+                "operation": "record_incident",
+                "schema_version": "krubit.moderation-contract.v1",
+                "incident_id": "incident:1",
+                "guild_id": "100",
+                "member_id": "200",
+                "report_timestamp": "2026-01-01T00:00:00+00:00",
+                "idempotency_key": "idem:1",
+            },
+        )
+        assert record_response.status == 200
+        case_id = (await record_response.json())["case_id"]
+
+        recommend_response = await _post_moderation(
+            client, secret,
+            {
+                "operation": "submit_action_recommendation",
+                "schema_version": "krubit.moderation-contract.v1",
+                "case_id": case_id,
+                "guild_id": "100",
+                "recommended_action": "24h timeout",
+                "idempotency_key": "idem:2",
+            },
+        )
+        assert recommend_response.status == 200
+
+        assert notifier.notified_cases == []
+
+        approval_response = await _post_moderation(
+            client, secret,
+            {
+                "operation": "request_human_approval",
+                "schema_version": "krubit.moderation-contract.v1",
+                "case_id": case_id,
+                "guild_id": "100",
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:3",
+            },
+        )
+        assert approval_response.status == 200
+        assert notifier.notified_cases == [case_id]
 
     await store.close()
 

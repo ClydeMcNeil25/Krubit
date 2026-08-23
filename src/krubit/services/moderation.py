@@ -305,7 +305,18 @@ class ModerationService:
                 if raw_receipt.succeeded
                 else ModerationStatus.EXECUTION_FAILED
             )
-            executed_action = case.recommended_action if raw_receipt.succeeded else None
+            # `case.recommended_action` is untrusted free text submitted over
+            # HTTP by Zariya (e.g. it could say "permanent ban" while staff
+            # actually approved a 1-hour timeout) -- it must never become the
+            # audit record of what was actually done. `case.action_expiration`
+            # is the real, staff-approved timeout end time already set by
+            # `record_human_decision`, so it -- not the recommendation -- is
+            # what `executed_action` records.
+            executed_action = (
+                f"timeout until {case.action_expiration.isoformat()}"
+                if raw_receipt.succeeded and case.action_expiration is not None
+                else None
+            )
             receipt = ActionReceipt(
                 receipt_id=self._receipt_id_factory(),
                 succeeded=raw_receipt.succeeded,
