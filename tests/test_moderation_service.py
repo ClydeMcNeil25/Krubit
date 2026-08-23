@@ -981,7 +981,10 @@ async def test_close_incident_uses_injected_clock(store: SQLiteStore) -> None:
     service = ModerationService(store, FakeExecutor(succeed=True), clock=lambda: fixed_time)
     case_id = await _approved_case(store, service)
     await service.execute_approved_action(
-        100, ExecuteApprovedActionRequest.from_dict({"case_id": case_id, "idempotency_key": "idem:4"})
+        100,
+        ExecuteApprovedActionRequest.from_dict(
+            {"case_id": case_id, "idempotency_key": "idem:4"}
+        ),
     )
     await service.close_incident(
         100,

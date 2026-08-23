@@ -62,7 +62,7 @@ def build_callback_routes(
 
     routes: list[CallbackRoute] = []
 
-    if settings.moderation_adapter_secret is not None:
+    if settings.moderation_adapter_secret:
         moderation_service = ModerationService(store, NoOpActionExecutor())
         routes.append(
             build_moderation_adapter_route(

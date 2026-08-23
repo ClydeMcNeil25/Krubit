@@ -17,10 +17,8 @@ import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from aiohttp import web
 
@@ -40,7 +38,7 @@ from krubit.contracts.moderation import (
     SubmitAppealRequest,
 )
 from krubit.domain.moderation import ActionReceipt, IllegalTransitionError, UnknownIncidentError
-from krubit.services.moderation import ActionExecutor, ModerationService
+from krubit.services.moderation import ModerationService
 from krubit.storage.sqlite import SQLiteStore
 from krubit.web.callbacks import CallbackRoute
 
@@ -157,10 +155,13 @@ async def _handle(
     try:
         if operation in _WRITE_OPERATIONS:
             guild_id = int(body_fields.get("guild_id", 0))
-            result = await method(guild_id, parsed_request)
         else:
             guild_id = int(getattr(parsed_request, "guild_id", "0"))
-            result = await method(guild_id, parsed_request)
+    except (TypeError, ValueError):
+        return _error_response(400, "guild_id is missing or invalid")
+
+    try:
+        result = await method(guild_id, parsed_request)
     except UnknownIncidentError as exc:
         return _error_response(404, str(exc))
     except IllegalTransitionError as exc:
@@ -169,7 +170,14 @@ async def _handle(
         return _error_response(400, str(exc))
     except ValueError as exc:
         message = str(exc)
-        status = 404 if ("unknown" in message or "no case found" in message or "no receipt found" in message) else 400
+        is_not_found = (
+            "unknown" in message
+            or "no case found" in message
+            or "no receipt found" in message
+            or "does not belong" in message
+            or "does not match the authenticated" in message
+        )
+        status = 404 if is_not_found else 400
         return _error_response(status, message)
 
     response_payload = dict(result.to_dict())
@@ -191,7 +199,8 @@ def build_moderation_adapter_route(
         test_mode_requested = request.headers.get(test_header_name) == "1"
         if test_mode_enabled and test_mode_requested and test_secret is not None:
             active_secret = test_secret
-            active_service = await _build_test_mode_service()
+            session_id = request.headers.get("X-Krubit-Test-Session-Id", "default")
+            active_service = await _get_or_build_test_mode_service(session_id)
         else:
             active_secret = secret
             active_service = service
@@ -200,6 +209,29 @@ def build_moderation_adapter_route(
         )
 
     return CallbackRoute(path=path, method="POST", handler=handler)
+
+
+# Test-mode services are session-scoped (keyed by the caller-supplied
+# X-Krubit-Test-Session-Id header, or "default" when absent) rather than
+# built fresh per request, so a caller can run a full multi-step lifecycle
+# (record_incident -> submit_action_recommendation -> ...) against the same
+# isolated store within one test session. Bounded by _MAX_TEST_MODE_SESSIONS
+# with oldest-entry eviction (and store closure) to prevent unbounded growth
+# of temp-file DB connections/threads under sustained test-mode traffic.
+_TEST_MODE_SESSIONS: dict[str, ModerationService] = {}
+_MAX_TEST_MODE_SESSIONS = 32
+
+
+async def _get_or_build_test_mode_service(session_id: str) -> ModerationService:
+    if session_id in _TEST_MODE_SESSIONS:
+        return _TEST_MODE_SESSIONS[session_id]
+    if len(_TEST_MODE_SESSIONS) >= _MAX_TEST_MODE_SESSIONS:
+        oldest_key = next(iter(_TEST_MODE_SESSIONS))
+        oldest_service = _TEST_MODE_SESSIONS.pop(oldest_key)
+        await oldest_service._store.close()
+    service = await _build_test_mode_service()
+    _TEST_MODE_SESSIONS[session_id] = service
+    return service
 
 
 async def _build_test_mode_service() -> ModerationService:
