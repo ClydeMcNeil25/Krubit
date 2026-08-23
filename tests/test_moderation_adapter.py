@@ -332,3 +332,61 @@ async def test_test_mode_produces_deterministic_case_ids_across_requests(
             )
     assert len(paths) == 2
     assert paths[0] != paths[1]
+
+
+async def test_full_lifecycle_through_http(
+    client: TestClient[web.Request, web.Application],
+) -> None:
+    record_response = await _post(
+        client,
+        {
+            "operation": "record_incident",
+            "schema_version": "krubit.moderation-contract.v1",
+            "incident_id": "incident:1",
+            "guild_id": "100",
+            "member_id": "200",
+            "report_timestamp": "2026-01-01T00:00:00+00:00",
+            "idempotency_key": "idem:1",
+        },
+    )
+    assert record_response.status == 200
+    case_id = (await record_response.json())["case_id"]
+
+    recommend_response = await _post(
+        client,
+        {
+            "operation": "submit_action_recommendation",
+            "schema_version": "krubit.moderation-contract.v1",
+            "case_id": case_id,
+            "guild_id": "100",
+            "recommended_action": "24h timeout",
+            "idempotency_key": "idem:2",
+        },
+    )
+    assert recommend_response.status == 200
+
+    approval_response = await _post(
+        client,
+        {
+            "operation": "request_human_approval",
+            "schema_version": "krubit.moderation-contract.v1",
+            "case_id": case_id,
+            "guild_id": "100",
+            "review_deadline": "2026-01-02T00:00:00+00:00",
+            "idempotency_key": "idem:3",
+        },
+    )
+    assert approval_response.status == 200
+    assert (await approval_response.json())["status"] == "approval_required"
+
+    status_response = await _post(
+        client,
+        {
+            "operation": "get_incident_status",
+            "schema_version": "krubit.moderation-contract.v1",
+            "guild_id": "100",
+            "incident_id": "incident:1",
+        },
+    )
+    assert status_response.status == 200
+    assert (await status_response.json())["status"] == "approval_required"
