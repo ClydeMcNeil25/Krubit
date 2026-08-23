@@ -149,6 +149,12 @@ _NON_ACTIVITY_LEDGER_TABLES: frozenset[str] = frozenset(
         "incidents",
         "guild_allow_block_lists",
         "sniff_receipts",
+        # Phase 5+6 (Zariya-Krubit moderation adapter, slices 2-4) tables --
+        # added after this file's original Phase 4 audit, not activity-ledger
+        # tables. See docs/superpowers/specs/2026-08-22-moderation-storage-service-design.md.
+        "moderation_cases",
+        "moderation_action_receipts",
+        "moderation_idempotency_keys",
     }
 )
 
