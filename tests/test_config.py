@@ -75,6 +75,11 @@ _UNREAD_FIELD_EXEMPTIONS: dict[str, str] = {
         "adapter (slice 3, task 1 of 2026-08-22-moderation-http-transport); the "
         "HTTP handler that reads it lands in a later task of this slice."
     ),
+    "moderation_channel_id": (
+        "forward declaration for the not-yet-wired Discord moderation channel "
+        "integration (slice 4, task 6 of 2026-08-22-moderation-discord-integration); "
+        "the moderation event handler that reads it lands in task 6 of this slice."
+    ),
 }
 
 
@@ -481,3 +486,18 @@ def test_moderation_test_mode_secret_can_be_set() -> None:
         {**base_env(), "KRUBIT_MODERATION_TEST_MODE_SECRET": "test-mode-secret-value"}
     )
     assert settings.moderation_test_mode_secret == "test-mode-secret-value"
+
+
+def test_moderation_channel_id_defaults_to_none():
+    settings = Settings.from_env(base_env())
+    assert settings.moderation_channel_id is None
+
+
+def test_moderation_channel_id_can_be_set():
+    settings = Settings.from_env({**base_env(), "KRUBIT_MODERATION_CHANNEL_ID": "123456789"})
+    assert settings.moderation_channel_id == 123456789
+
+
+def test_moderation_channel_id_rejects_non_numeric():
+    with pytest.raises(SettingsError, match="KRUBIT_MODERATION_CHANNEL_ID"):
+        Settings.from_env({**base_env(), "KRUBIT_MODERATION_CHANNEL_ID": "not-a-number"})

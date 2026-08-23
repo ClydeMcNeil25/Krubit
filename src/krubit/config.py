@@ -35,6 +35,7 @@ class Settings:
     database_path: Path
     bot_token: str | None = field(default=None, repr=False)
     staff_channel_id: int | None = None
+    moderation_channel_id: int | None = None
     twitch_client_id: str | None = None
     twitch_client_secret: str | None = field(default=None, repr=False)
     live_signals_enabled: bool = False
@@ -104,6 +105,7 @@ class Settings:
             raise SettingsError("KRUBIT_DATABASE_PATH must not be blank")
         raw_token = values.get("DISCORD_KRUBIT_BOT_TOKEN", "").strip()
         raw_staff_channel = values.get("KRUBIT_STAFF_CHANNEL_ID", "").strip()
+        raw_moderation_channel_id = values.get("KRUBIT_MODERATION_CHANNEL_ID", "").strip()
         raw_twitch_client_id = values.get("TWITCH_KRUBIT_CLIENT_ID", "").strip()
         raw_twitch_client_secret = values.get("TWITCH_KRUBIT_CLIENT_SECRET", "").strip()
         raw_live_signals_enabled = values.get("KRUBIT_LIVE_SIGNALS_ENABLED", "false").strip()
@@ -112,6 +114,12 @@ class Settings:
         ):
             raise SettingsError(
                 "KRUBIT_STAFF_CHANNEL_ID must be a positive numeric Discord snowflake"
+            )
+        if raw_moderation_channel_id and (
+            not raw_moderation_channel_id.isdigit() or int(raw_moderation_channel_id) <= 0
+        ):
+            raise SettingsError(
+                "KRUBIT_MODERATION_CHANNEL_ID must be a positive numeric Discord snowflake"
             )
         live_signals_enabled = _parse_bool("KRUBIT_LIVE_SIGNALS_ENABLED", raw_live_signals_enabled)
 
@@ -261,6 +269,7 @@ class Settings:
             database_path=Path(raw_path),
             bot_token=raw_token or None,
             staff_channel_id=int(raw_staff_channel) if raw_staff_channel else None,
+            moderation_channel_id=int(raw_moderation_channel_id) if raw_moderation_channel_id else None,
             twitch_client_id=raw_twitch_client_id or None,
             twitch_client_secret=raw_twitch_client_secret or None,
             live_signals_enabled=live_signals_enabled,
