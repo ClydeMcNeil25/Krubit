@@ -17,6 +17,7 @@ from krubit.config import Settings, SettingsError
 from krubit.discord.bot import KrubitBot
 from krubit.discord.install import install_url
 from krubit.discord.moderation_executor import LazyDiscordActionExecutor
+from krubit.discord.moderation_notifier import ModerationNotifier
 from krubit.domain.creator_signals import Platform
 from krubit.integrations.base import Connector
 from krubit.integrations.bluesky import BlueskyConnector
@@ -195,9 +196,20 @@ async def _run_bot(settings: Settings) -> int:
 
         oauth_tcp_connector = aiohttp.TCPConnector(ssl=system_ssl_context())
         oauth_session = aiohttp.ClientSession(connector=oauth_tcp_connector)
+        # One executor and one notifier instance, shared by the HTTP moderation
+        # adapter and the `/fetch moderation` commands alike. Both are constructed
+        # here, before `KrubitBot` exists (the callback server must be built
+        # first), and are `bind(...)`-ed to the live bot immediately after each
+        # `KrubitBot(...)` below -- including the privileged-intent fallback path.
         moderation_executor = LazyDiscordActionExecutor()
+        moderation_notifier = ModerationNotifier(settings.moderation_channel_id)
         callback_routes = build_callback_routes(
-            settings, store, vault, oauth_session, executor=moderation_executor
+            settings,
+            store,
+            vault,
+            oauth_session,
+            executor=moderation_executor,
+            notifier=moderation_notifier,
         )
         callback_server = CallbackServer(
             public_base_url=settings.callback_public_base_url,
@@ -228,8 +240,11 @@ async def _run_bot(settings: Settings) -> int:
             connector=connector,
             twitch=twitch,
             content_connectors=content_connectors,
+            moderation_executor=moderation_executor,
+            moderation_notifier=moderation_notifier,
         )
         moderation_executor.bind(bot)
+        moderation_notifier.bind(bot.get_guild)
         try:
             await bot.start(settings.require_token())
         except discord.PrivilegedIntentsRequired:
@@ -265,8 +280,11 @@ async def _run_bot(settings: Settings) -> int:
                 twitch=twitch,
                 content_connectors=content_connectors,
                 request_message_content_intent=False,
+                moderation_executor=moderation_executor,
+                moderation_notifier=moderation_notifier,
             )
             moderation_executor.bind(bot)
+            moderation_notifier.bind(bot.get_guild)
             await bot.start(settings.require_token())
     except BaseException as exc:
         primary_error = exc

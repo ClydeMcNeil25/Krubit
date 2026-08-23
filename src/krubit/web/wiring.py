@@ -32,7 +32,11 @@ from krubit.web.callbacks import (
     build_oauth_redirect_route,
     build_signed_form_route,
 )
-from krubit.web.moderation_adapter import NoOpActionExecutor, build_moderation_adapter_route
+from krubit.web.moderation_adapter import (
+    NoOpActionExecutor,
+    PendingReviewNotifier,
+    build_moderation_adapter_route,
+)
 
 # The data_deletion_requests freshness window: a repeat request for the same
 # authorization_subject_id within this window reuses the existing confirmation
@@ -58,6 +62,7 @@ def build_callback_routes(
     oauth_session: object,
     *,
     executor: ActionExecutor | None = None,
+    notifier: PendingReviewNotifier | None = None,
 ) -> tuple[CallbackRoute, ...]:
     if settings.callback_public_base_url is None or settings.callback_port is None:
         return ()
@@ -72,6 +77,7 @@ def build_callback_routes(
                 header_name="X-Krubit-Moderation-Signature",
                 secret=settings.moderation_adapter_secret,
                 service=moderation_service,
+                notifier=notifier,
                 test_mode_enabled=settings.moderation_test_mode,
                 test_secret=settings.moderation_test_mode_secret,
             )

@@ -98,6 +98,18 @@ async def test_bot_registers_phase_one_fetch_commands(tmp_path: Path) -> None:
             "milestones",
             "admin",
             "member-export",
+            "moderation",
+        }
+        moderation = cast(
+            app_commands.Group,
+            next(command for command in fetch.commands if command.name == "moderation"),
+        )
+        assert {command.name for command in moderation.commands} == {
+            "pending",
+            "approve",
+            "reject",
+            "history",
+            "case",
         }
         sniff = cast(
             app_commands.Group,
@@ -175,16 +187,20 @@ def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
 
     `retention` and `community-pulse` are folded into `/fetch admin`, exactly
     like the other 14 staff-facing commands consolidated there in Task 2.
-    `FetchCommands` ends at 11 direct children: the 6 sub-groups (`sniff`,
-    `admin`, `backup`, `live`, `creator`, `notifications`) plus 5 flat
-    commands (`activity`, `milestones`, `member-export`, `latest`,
+    `FetchCommands` ends at 12 direct children: the 7 sub-groups (`sniff`,
+    `admin`, `backup`, `live`, `creator`, `notifications`, `moderation`) plus 5
+    flat commands (`activity`, `milestones`, `member-export`, `latest`,
     `schedule`). `AdminCommands` grows from 14 to 16 children.
+
+    Phase 5+6 slice 4 added `moderation` as a *sibling* group rather than
+    nesting its five commands under `admin`, which is already at 17 of
+    Discord's 25 subcommands-per-group slots.
     """
     store = asyncio.run(SQLiteStore.open(tmp_path / "krubit.db"))
     try:
         fetch_commands = FetchCommands(FoundationService(store))
 
-        assert len(fetch_commands.commands) == 11
+        assert len(fetch_commands.commands) == 12
         assert {command.name for command in fetch_commands.commands} == {
             "sniff",
             "admin",
@@ -197,6 +213,7 @@ def test_fetch_commands_direct_children_match_the_reorg_plans_actual_structure(
             "member-export",
             "latest",
             "schedule",
+            "moderation",
         }
 
         admin_commands = AdminCommands(fetch_commands)
@@ -471,6 +488,11 @@ async def test_run_bot_preserves_start_error_and_closes_every_owned_resource(
         def __init__(self, *args: object, connector: FakeConnector, **kwargs: object) -> None:
             self.connector = connector
 
+        # `_run_bot` binds the moderation notifier to `bot.get_guild` right
+        # after construction (slice 4), so every bot stand-in must expose it.
+        def get_guild(self, guild_id: int) -> None:
+            return None
+
         async def start(self, token: str) -> None:
             raise RuntimeError("start failure")
 
@@ -550,6 +572,9 @@ async def test_run_bot_degrades_honestly_when_message_content_intent_is_not_gran
             self.request_message_content_intent = request_message_content_intent
             constructions.append(request_message_content_intent)
 
+        def get_guild(self, guild_id: int) -> None:
+            return None
+
         async def start(self, token: str) -> None:
             # The first construction (no override -> defaults to
             # `settings.watchdog_enabled`, i.e. True here) simulates the privileged
@@ -621,6 +646,9 @@ async def test_run_bot_reraises_privileged_intents_error_when_watchdog_disabled(
     class FakeBot:
         def __init__(self, *args: object, connector: FakeConnector, **kwargs: object) -> None:
             self.connector = connector
+
+        def get_guild(self, guild_id: int) -> None:
+            return None
 
         async def start(self, token: str) -> None:
             raise discord.PrivilegedIntentsRequired(shard_id=None)
@@ -884,6 +912,9 @@ async def test_run_bot_never_builds_content_connectors_when_creator_signals_disa
         def __init__(self, *args: object, content_connectors: object, **kwargs: object) -> None:
             nonlocal received_connectors
             received_connectors = cast(dict[object, object], content_connectors)
+
+        def get_guild(self, guild_id: int) -> None:
+            return None
 
         async def start(self, token: str) -> None:
             raise RuntimeError("stop before real Discord connect")

@@ -14,6 +14,11 @@ from discord import app_commands
 from discord.ext import tasks
 
 from krubit.config import Settings
+from krubit.contracts.moderation import (
+    ExecuteApprovedActionRequest,
+    GetMemberModerationHistoryQuery,
+    GetPendingReviewsQuery,
+)
 from krubit.discord.activity_commands import ActivityActorContext, ActivityCommandService
 from krubit.discord.activity_runtime import ActivityRuntime
 from krubit.discord.cards import render_card, render_diff_card, render_health_card
@@ -31,11 +36,14 @@ from krubit.discord.inventory import InventoryCapture, capture_inventory
 from krubit.discord.live_commands import LiveCommands, ReconcileCallback
 from krubit.discord.live_runtime import LiveSignalRuntime
 from krubit.discord.membership_announcements import MembershipAnnouncementRuntime
+from krubit.discord.moderation_executor import LazyDiscordActionExecutor
+from krubit.discord.moderation_notifier import ModerationNotifier
 from krubit.discord.watchdog_commands import WatchdogActorContext, WatchdogCommandService
 from krubit.discord.watchdog_runtime import WatchdogRuntime
 from krubit.domain.companion import SnapshotRecord
 from krubit.domain.creator_signals import ContentPlan, Platform
 from krubit.domain.models import Card, CardField, GuildEvent, JSONValue
+from krubit.domain.moderation import ApprovalDecision, ModerationStatus
 from krubit.integrations.base import Connector
 from krubit.integrations.twitch import TwitchClient, UnavailableTwitchClient
 from krubit.services.daily_summary import DailySummaryResult, DailySummaryService
@@ -47,6 +55,7 @@ from krubit.services.foundation import (
 from krubit.services.health import ActivityLedgerHealthFacts, HealthService, WatchdogHealthFacts
 from krubit.services.incident_evidence import correlate_automod_action
 from krubit.services.live_signals import LiveSignalService
+from krubit.services.moderation import ActionExecutor, ModerationService
 from krubit.services.snapshots import SnapshotService, compare_inventory
 from krubit.services.watch_window import WATCH_WINDOW_DURATION, WatchWindowService
 
@@ -90,6 +99,8 @@ class FetchCommands(app_commands.Group):
         meta_app_id: str | None = None,
         tiktok_client_key: str | None = None,
         callback_public_base_url: str | None = None,
+        moderation_executor: ActionExecutor | None = None,
+        moderation_notifier: ModerationNotifier | None = None,
     ) -> None:
         super().__init__(name="fetch", description="Ask Krubit to fetch a system result")
         self._service = service
@@ -136,9 +147,25 @@ class FetchCommands(app_commands.Group):
             if activity_ledger_inactivity_threshold_days is not None
             else _DEFAULT_ACTIVITY_LEDGER_INACTIVITY_THRESHOLD_DAYS
         )
+        # Phase 5+6 slice 4. Both dependencies default to inert stand-ins rather
+        # than being required, so the pre-existing `FetchCommands(FoundationService
+        # (store))` construction sites keep working unchanged; `__main__.py`
+        # supplies the real, bound instances in production. The default executor is
+        # an *unbound* `LazyDiscordActionExecutor`, which raises when actually
+        # asked to execute -- `ModerationService.execute_approved_action` converts
+        # that into an honest `execution_failed` receipt rather than a silent
+        # success, matching `NoOpActionExecutor`'s "fail honestly" contract without
+        # making `krubit.discord` import from `krubit.web`. The default notifier
+        # has no channel and no guild lookup, so every notification is a clean
+        # no-op (see `ModerationNotifier._send`).
+        self._moderation_service = ModerationService(
+            service.store, moderation_executor or LazyDiscordActionExecutor()
+        )
+        self._moderation_notifier = moderation_notifier or ModerationNotifier(None)
         self.add_command(BackupCommands(self))
         self.add_command(AdminCommands(self))
         self.add_command(SniffCommands(self))
+        self.add_command(ModerationCommands(self))
         self.add_command(LiveCommands(self, live_service, reconcile_callback))
         self.add_command(CreatorCommands(self, self._content_commands))
         self.add_command(NotificationCommands(self, self._content_commands))
@@ -1032,6 +1059,210 @@ class SniffCommands(app_commands.Group):
         )
 
 
+# Discord's own member-timeout API tops out at 28 days; `duration_hours` is a
+# bounded, typed integer parameter rather than a free-text duration string so
+# Discord itself rejects an out-of-range value before the command ever runs.
+_MAX_TIMEOUT_HOURS = 672
+
+
+class ModerationCommands(app_commands.Group):
+    """`/fetch moderation` -- staff approval and review commands for the
+    Zariya-Krubit moderation adapter (Phase 5+6 slice 4).
+
+    A *sibling* of `AdminCommands`/`SniffCommands`, deliberately not nested
+    inside either: `AdminCommands` already holds 17 of Discord's 25
+    subcommands-per-group slots, and these five would leave almost no room
+    for the phases still to come.
+    """
+
+    def __init__(self, parent: FetchCommands) -> None:
+        super().__init__(
+            name="moderation", description="Moderation approval and review commands"
+        )
+        self._parent = parent
+
+    @app_commands.command(name="pending", description="List cases awaiting review")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def pending(self, interaction: discord.Interaction) -> None:
+        context = await self._parent.authorize(interaction, "fetch_moderation_pending")
+        if context is None:
+            return
+        guild, actor_id = context
+        result = await self._parent._moderation_service.get_pending_reviews(
+            guild.id, GetPendingReviewsQuery.from_dict({"guild_id": str(guild.id)})
+        )
+        card = Card(
+            kind="fetched",
+            title="Fetched: Pending Moderation Reviews",
+            description=f"{len(result.cases)} case(s) awaiting review.",
+            fields=tuple(
+                CardField(f"Case {index + 1}", case_id, inline=False)
+                for index, case_id in enumerate(result.cases[:25])
+            ),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_moderation_pending",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"count": len(result.cases)},
+        )
+
+    @app_commands.command(name="approve", description="Approve a moderation case with a timeout")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def approve(
+        self,
+        interaction: discord.Interaction,
+        case_id: str,
+        duration_hours: app_commands.Range[int, 1, _MAX_TIMEOUT_HOURS],
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_moderation_approve")
+        if context is None:
+            return
+        guild, actor_id = context
+        try:
+            case = await self._parent._moderation_service.record_human_decision(
+                guild.id,
+                case_id,
+                reviewer_id=actor_id,
+                decision=ApprovalDecision.APPROVED,
+                timeout_duration=timedelta(hours=duration_hours),
+            )
+        except ValueError as exc:
+            await interaction.edit_original_response(content=str(exc))
+            return
+        # A fresh idempotency key per invocation: two deliberate staff approvals
+        # of the same case must each be attempted, not silently collapsed into
+        # one cached response by the service's replay cache.
+        execute_response = await self._parent._moderation_service.execute_approved_action(
+            guild.id,
+            ExecuteApprovedActionRequest.from_dict(
+                {"case_id": case_id, "idempotency_key": f"admin-approve:{case_id}:{uuid4().hex}"}
+            ),
+        )
+        succeeded = execute_response.status is ModerationStatus.EXECUTED
+        # Re-read rather than reusing the pre-execution `case`, so the announced
+        # status is the post-execution one staff actually need to see.
+        executed_case = await self._parent._moderation_service.get_case(guild.id, case_id) or case
+        await self._parent._moderation_notifier.notify_outcome(executed_case, succeeded=succeeded)
+        card = Card(
+            kind="fetched" if succeeded else "failed",
+            title="Moderation Case Approved",
+            description=(
+                f"Case `{case_id}` executed with status `{execute_response.status.value}`."
+            ),
+            fields=(CardField("Duration", f"{duration_hours}h", inline=True),),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_moderation_approve",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"case_id": case_id, "status": execute_response.status.value},
+        )
+
+    @app_commands.command(name="reject", description="Reject a moderation case")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def reject(
+        self, interaction: discord.Interaction, case_id: str, reason: str
+    ) -> None:
+        context = await self._parent.authorize(interaction, "fetch_moderation_reject")
+        if context is None:
+            return
+        guild, actor_id = context
+        try:
+            await self._parent._moderation_service.record_human_decision(
+                guild.id,
+                case_id,
+                reviewer_id=actor_id,
+                decision=ApprovalDecision.REJECTED,
+            )
+        except ValueError as exc:
+            await interaction.edit_original_response(content=str(exc))
+            return
+        card = Card(
+            kind="fetched",
+            title="Moderation Case Rejected",
+            description=f"Case `{case_id}` rejected.",
+            fields=(CardField("Reason", reason, inline=False),),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_moderation_reject",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"case_id": case_id, "reason": reason},
+        )
+
+    @app_commands.command(name="history", description="Fetch a member's moderation history")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def history(self, interaction: discord.Interaction, member: discord.Member) -> None:
+        context = await self._parent.authorize(interaction, "fetch_moderation_history")
+        if context is None:
+            return
+        guild, actor_id = context
+        result = await self._parent._moderation_service.get_member_moderation_history(
+            guild.id,
+            GetMemberModerationHistoryQuery.from_dict(
+                {"guild_id": str(guild.id), "member_id": str(member.id)}
+            ),
+        )
+        card = Card(
+            kind="fetched",
+            title="Fetched: Member Moderation History",
+            description=f"{len(result.cases)} case(s) for {member.mention}.",
+            fields=tuple(
+                CardField(f"Case {index + 1}", case_id, inline=False)
+                for index, case_id in enumerate(result.cases[:25])
+            ),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_moderation_history",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"member_id": member.id, "count": len(result.cases)},
+        )
+
+    @app_commands.command(name="case", description="Inspect one moderation case")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def case(self, interaction: discord.Interaction, case_id: str) -> None:
+        context = await self._parent.authorize(interaction, "fetch_moderation_case")
+        if context is None:
+            return
+        guild, actor_id = context
+        # `get_case` (not `get_incident`/`get_incident_status`, which are keyed by
+        # `incident_id`) is the only read keyed by `case_id`, and the only one that
+        # exposes `member_id`/`recommended_action`. It returns `None` for both
+        # "no such case" and a cross-tenant mismatch, never raising.
+        found = await self._parent._moderation_service.get_case(guild.id, case_id)
+        if found is None:
+            await interaction.edit_original_response(content=f"No case found for `{case_id}`.")
+            return
+        card = Card(
+            kind="fetched",
+            title="Fetched: Moderation Case",
+            description=f"Case `{found.case_id}`.",
+            fields=(
+                CardField("Status", found.status.value, inline=True),
+                CardField("Member", str(found.member_id), inline=True),
+                CardField("Recommended action", found.recommended_action or "—", inline=False),
+            ),
+        )
+        await self._parent.finish(
+            interaction,
+            action="fetch_moderation_case",
+            actor_id=actor_id,
+            embed=render_card(card),
+            detail={"case_id": found.case_id, "status": found.status.value},
+        )
+
+
 class KrubitBot(discord.Client):
     """Discord transport; community judgment remains outside this class."""
 
@@ -1044,6 +1275,8 @@ class KrubitBot(discord.Client):
         twitch: TwitchClient | None = None,
         content_connectors: Mapping[Platform, Connector] | None = None,
         request_message_content_intent: bool | None = None,
+        moderation_executor: ActionExecutor | None = None,
+        moderation_notifier: ModerationNotifier | None = None,
     ) -> None:
         # `phase_three_intents()`'s new `message_content`/`messages` flags are only
         # requested when `watchdog_enabled` is explicitly on: requesting a privileged
@@ -1170,6 +1403,11 @@ class KrubitBot(discord.Client):
                 meta_app_id=settings.meta_app_id,
                 tiktok_client_key=settings.tiktok_client_key,
                 callback_public_base_url=settings.callback_public_base_url,
+                # Both are the same bound-later instances `__main__.py` also hands
+                # to `build_callback_routes`, so an HTTP-side and a Discord-side
+                # moderation flow share one executor and one #mod-room notifier.
+                moderation_executor=moderation_executor,
+                moderation_notifier=moderation_notifier,
             )
         )
 

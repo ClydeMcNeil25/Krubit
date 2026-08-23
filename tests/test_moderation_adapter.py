@@ -16,7 +16,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from krubit.contracts.moderation import RecordIncidentRequest
-from krubit.domain.moderation import ActionReceipt, ApprovalDecision
+from krubit.domain.moderation import (
+    ActionReceipt,
+    ApprovalDecision,
+    ModerationCase,
+    ModerationStatus,
+)
 from krubit.domain.watchdog import Incident, IncidentKind, RiskBand
 from krubit.services.moderation import ModerationService
 from krubit.storage.sqlite import SQLiteStore
@@ -915,3 +920,152 @@ async def test_non_numeric_guild_id_returns_400_not_crash(
         },
     )
     assert response.status == 400
+
+
+# -- Pending-review notification hook (slice 4) ---------------------------------
+#
+# `request_human_approval` is only ever invoked over HTTP (no Discord command
+# calls it), so the `#mod-room` notification trigger lives here -- the single
+# place every such call passes through -- rather than in the
+# framework-independent `services/moderation.py` or in `ModerationCommands`.
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.cases: list[ModerationCase] = []
+
+    async def notify_pending_review(self, case: ModerationCase) -> None:
+        self.cases.append(case)
+
+
+class ExplodingNotifier:
+    async def notify_pending_review(self, case: ModerationCase) -> None:
+        raise RuntimeError("notifier exploded")
+
+
+async def _notifying_client(
+    store: SQLiteStore, notifier: object
+) -> TestClient[web.Request, web.Application]:
+    service = ModerationService(store, FakeExecutor())
+    route = build_moderation_adapter_route(
+        path="/moderation/adapter",
+        header_name="X-Krubit-Moderation-Signature",
+        secret=SECRET,
+        service=service,
+        notifier=notifier,  # type: ignore[arg-type]
+    )
+    server = CallbackServer(
+        public_base_url="https://callbacks.example.com", port=8443, routes=(route,)
+    )
+    test_client = TestClient[web.Request, web.Application](TestServer(server.build_app()))
+    await test_client.start_server()
+    return test_client
+
+
+async def _drive_to_approval_required(
+    client: TestClient[web.Request, web.Application], *, nonce: str
+) -> str:
+    record_response = await _post(
+        client,
+        {
+            "operation": "record_incident",
+            "schema_version": "krubit.moderation-contract.v1",
+            "incident_id": "incident:1",
+            "guild_id": "100",
+            "member_id": "200",
+            "report_timestamp": "2026-01-01T00:00:00+00:00",
+            "idempotency_key": f"idem:{nonce}:1",
+        },
+    )
+    case_id = (await record_response.json())["case_id"]
+    await _post(
+        client,
+        {
+            "operation": "submit_action_recommendation",
+            "schema_version": "krubit.moderation-contract.v1",
+            "case_id": case_id,
+            "guild_id": "100",
+            "recommended_action": "24h timeout",
+            "idempotency_key": f"idem:{nonce}:2",
+        },
+    )
+    return str(case_id)
+
+
+async def test_request_human_approval_notifies_the_mod_room(store: SQLiteStore) -> None:
+    notifier = RecordingNotifier()
+    client = await _notifying_client(store, notifier)
+    try:
+        case_id = await _drive_to_approval_required(client, nonce="notify")
+        response = await _post(
+            client,
+            {
+                "operation": "request_human_approval",
+                "schema_version": "krubit.moderation-contract.v1",
+                "case_id": case_id,
+                "guild_id": "100",
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:notify:3",
+            },
+        )
+        assert response.status == 200
+    finally:
+        await client.close()
+
+    assert [case.case_id for case in notifier.cases] == [case_id]
+    assert notifier.cases[0].status is ModerationStatus.APPROVAL_REQUIRED
+
+
+async def test_other_operations_do_not_notify_the_mod_room(store: SQLiteStore) -> None:
+    notifier = RecordingNotifier()
+    client = await _notifying_client(store, notifier)
+    try:
+        await _drive_to_approval_required(client, nonce="quiet")
+    finally:
+        await client.close()
+
+    assert notifier.cases == []
+
+
+async def test_duplicate_request_human_approval_does_not_re_notify(store: SQLiteStore) -> None:
+    notifier = RecordingNotifier()
+    client = await _notifying_client(store, notifier)
+    try:
+        case_id = await _drive_to_approval_required(client, nonce="dupe")
+        payload: dict[str, object] = {
+            "operation": "request_human_approval",
+            "schema_version": "krubit.moderation-contract.v1",
+            "case_id": case_id,
+            "guild_id": "100",
+            "review_deadline": "2026-01-02T00:00:00+00:00",
+            "idempotency_key": "idem:dupe:3",
+        }
+        assert (await _post(client, payload)).status == 200
+        replayed = await _post(client, payload)
+        assert replayed.status == 200
+        assert (await replayed.json())["duplicate"] is True
+    finally:
+        await client.close()
+
+    assert len(notifier.cases) == 1
+
+
+async def test_notifier_failure_never_affects_the_http_response(store: SQLiteStore) -> None:
+    client = await _notifying_client(store, ExplodingNotifier())
+    try:
+        case_id = await _drive_to_approval_required(client, nonce="boom")
+        response = await _post(
+            client,
+            {
+                "operation": "request_human_approval",
+                "schema_version": "krubit.moderation-contract.v1",
+                "case_id": case_id,
+                "guild_id": "100",
+                "review_deadline": "2026-01-02T00:00:00+00:00",
+                "idempotency_key": "idem:boom:3",
+            },
+        )
+        assert response.status == 200
+        assert (await response.json())["status"] == "approval_required"
+    finally:
+        await client.close()

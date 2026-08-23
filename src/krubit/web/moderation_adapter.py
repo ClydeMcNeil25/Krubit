@@ -19,6 +19,7 @@ import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from aiohttp import web
 
@@ -37,12 +38,31 @@ from krubit.contracts.moderation import (
     SubmitActionRecommendationRequest,
     SubmitAppealRequest,
 )
-from krubit.domain.moderation import ActionReceipt, IllegalTransitionError, UnknownIncidentError
+from krubit.domain.moderation import (
+    ActionReceipt,
+    IllegalTransitionError,
+    ModerationCase,
+    UnknownIncidentError,
+)
 from krubit.services.moderation import ModerationService
 from krubit.storage.sqlite import SQLiteStore
 from krubit.web.callbacks import CallbackRoute
 
 _logger = logging.getLogger(__name__)
+
+
+class PendingReviewNotifier(Protocol):
+    """The one notifier capability this HTTP layer needs.
+
+    Declared structurally rather than importing
+    `krubit.discord.moderation_notifier.ModerationNotifier` directly, so the
+    `krubit.web` package keeps its existing property of never importing
+    `discord` -- exactly the reason `ActionExecutor` is a Protocol in
+    `krubit.services.moderation` too. The real `ModerationNotifier` satisfies
+    this structurally with no registration or subclassing.
+    """
+
+    async def notify_pending_review(self, case: ModerationCase) -> None: ...
 
 
 class NoOpActionExecutor:
@@ -120,8 +140,42 @@ def _verify_signature(body: bytes, provided: str | None, secret: str) -> bool:
     return hmac.compare_digest(expected, provided)
 
 
+async def _notify_pending_review(
+    service: ModerationService,
+    notifier: PendingReviewNotifier,
+    guild_id: int,
+    response_payload: dict[str, object],
+) -> None:
+    """Best-effort `#mod-room` announcement for a freshly requested review.
+
+    Fully isolated from the HTTP response that is already about to be
+    returned: nothing raised in here -- including a store read failing, or a
+    notifier implementation that raises rather than swallowing as
+    `ModerationNotifier._send` does -- may turn a successful 200 into an
+    error. Matches `WatchdogRuntime.notify_staff`'s "never block the state
+    change it follows" contract.
+    """
+    try:
+        case_id = response_payload.get("case_id")
+        if not isinstance(case_id, str):
+            return
+        case = await service.get_case(guild_id, case_id)
+        if case is None:
+            return
+        await notifier.notify_pending_review(case)
+    except Exception:
+        _logger.exception(
+            "moderation adapter: pending-review notification failed for guild %s", guild_id
+        )
+
+
 async def _handle(
-    request: web.Request, *, header_name: str, secret: str, service: ModerationService
+    request: web.Request,
+    *,
+    header_name: str,
+    secret: str,
+    service: ModerationService,
+    notifier: PendingReviewNotifier | None = None,
 ) -> web.StreamResponse:
     body = await request.read()
     signature = request.headers.get(header_name)
@@ -181,6 +235,15 @@ async def _handle(
         return _error_response(status, message)
 
     response_payload = dict(result.to_dict())
+    # A replayed request (same idempotency key) returns the cached response
+    # rather than re-transitioning the case, so re-announcing it would spam
+    # #mod-room with a duplicate of a review staff were already told about.
+    if (
+        operation == "request_human_approval"
+        and notifier is not None
+        and response_payload.get("duplicate") is not True
+    ):
+        await _notify_pending_review(service, notifier, guild_id, response_payload)
     response_payload["correlation_id"] = correlation_id
     return web.json_response(response_payload, status=200)
 
@@ -191,6 +254,7 @@ def build_moderation_adapter_route(
     header_name: str,
     secret: str,
     service: ModerationService,
+    notifier: PendingReviewNotifier | None = None,
     test_header_name: str = "X-Krubit-Test-Mode",
     test_mode_enabled: bool = False,
     test_secret: str | None = None,
@@ -201,11 +265,20 @@ def build_moderation_adapter_route(
             active_secret = test_secret
             session_id = request.headers.get("X-Krubit-Test-Session-Id", "default")
             active_service = await _get_or_build_test_mode_service(session_id)
+            # Test-mode traffic runs against a throwaway store and must never
+            # reach a real #mod-room, so the notifier is deliberately dropped
+            # on this branch -- matching the isolated-store decision above.
+            active_notifier: PendingReviewNotifier | None = None
         else:
             active_secret = secret
             active_service = service
+            active_notifier = notifier
         return await _handle(
-            request, header_name=header_name, secret=active_secret, service=active_service
+            request,
+            header_name=header_name,
+            secret=active_secret,
+            service=active_service,
+            notifier=active_notifier,
         )
 
     return CallbackRoute(path=path, method="POST", handler=handler)
